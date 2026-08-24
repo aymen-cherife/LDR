@@ -1,0 +1,42 @@
+name: Core tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: core-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  core-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install LDR and test dependencies
+        run: python -m pip install -e ".[test]"
+
+      - name: Run core behavioral contract
+        run: |
+          python -m pytest -q \
+            tests/test_agent_contract.py::test_failed_test_preserves_exit_and_writes_machine_result \
+            tests/test_agent_contract.py::test_late_exception_survives_node_budget \
+            tests/test_agent_contract.py::test_caught_overflow_exception_does_not_outrank_later_failure \
+            tests/test_agent_contract.py::test_varargs_kwargs_locations_and_secret_redaction \
+            tests/test_agent_contract.py::test_named_snapshot_compares_across_checkout_directories \
+            tests/test_ldr.py::test_cli_pytest_mode_traces_the_code_under_test \
+            tests/test_ldr.py::test_verify_snapshots_then_diffs \
+            tests/test_ldr.py::test_run_mode_survives_a_real_crash \
+            tests/test_ldr.py::test_collection_failure_gets_an_honest_note_not_a_silent_pass
