@@ -91,6 +91,19 @@ def capture(value: Any, name: str | None = None) -> str:
     """
     if name is not None and is_secret_name(name):
         return "<redacted>"
+    # Preserve exact numeric representations for Decimal and other precise numerics.
+    # reprlib truncates at maxother=80; a Decimal with 50 digits must not lose precision.
+    try:
+        type_name = type(value).__name__
+        type_mod = type(value).__module__
+        if type_name == "Decimal" and type_mod == "decimal":
+            return _redact_text(repr(value))
+        if isinstance(value, (int, float, complex)) and not isinstance(value, bool):
+            direct = repr(value)
+            if len(direct) < 500:
+                return _redact_text(direct)
+    except Exception:
+        pass
     try:
         return _redact_text(_repr.repr(_redact_value(value)))
     except Exception:

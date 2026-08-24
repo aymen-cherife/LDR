@@ -581,7 +581,23 @@ def main(argv=None) -> int:
                 else node.frame_id == args.frame
             )
         ]
-        text = render_inspection(inspected, args.frame, args.max_lines)
+        frame_index_payload = _frame_index(recorder.roots)
+        # Scope display for copyable commands
+        display_scope = scope
+        try:
+            display_scope = [os.path.relpath(s, initial_cwd) if os.path.commonpath((os.path.realpath(s), initial_cwd)) == initial_cwd else s for s in scope]
+        except Exception:
+            display_scope = scope
+        text = render_inspection(
+            inspected,
+            args.frame,
+            args.max_lines,
+            invocation=invocation,
+            scope=display_scope,
+            frame_index=frame_index_payload,
+            status=status,
+            max_state_steps=args.max_state_steps,
+        )
         run_note = (
             f"RUN STATUS: {'PASSED' if recorder.exit_code == 0 else 'FAILED'} "
             f"(exit {recorder.exit_code})\n\n"
@@ -597,7 +613,7 @@ def main(argv=None) -> int:
                 "match_count": len(inspected),
                 "frames": [node.to_dict() for node in inspected],
             },
-            "frame_index": _frame_index(recorder.roots),
+            "frame_index": frame_index_payload,
             "findings": [],
             "failures": _failure_payload(recorder.roots),
         }
@@ -614,6 +630,13 @@ def main(argv=None) -> int:
 
     changes = []
     snapshot_action = "none"
+    # Precompute frame_index and display scope for navigational rendering
+    frame_index_payload = _frame_index(recorder.roots)
+    display_scope = scope
+    try:
+        display_scope = [os.path.relpath(s, initial_cwd) if os.path.commonpath((os.path.realpath(s), initial_cwd)) == initial_cwd else s for s in scope]
+    except Exception:
+        display_scope = scope
     try:
         if args.golden:
             if args.learn_volatility:
@@ -631,6 +654,12 @@ def main(argv=None) -> int:
                 args.max_lines,
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,
+                frame_index=frame_index_payload,
+                invocation=invocation,
+                scope=display_scope,
+                status=status,
+                max_nodes=args.max_nodes,
+                max_calls_per_function=args.max_calls_per_function,
             )
             volatility = sum(bool(node.volatile) for root in recorder.roots for node in root.walk())
             text += f"\n\nSnapshot saved for this invocation: {os.path.relpath(golden_path, initial_cwd)}"
@@ -661,6 +690,12 @@ def main(argv=None) -> int:
                 args.max_lines,
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,
+                frame_index=frame_index_payload,
+                invocation=invocation,
+                scope=display_scope,
+                status=status,
+                max_nodes=args.max_nodes,
+                max_calls_per_function=args.max_calls_per_function,
             )
     except (OSError, ValueError, RuntimeError) as exc:
         text = f"LDR snapshot error: {exc}"
@@ -699,7 +734,7 @@ def main(argv=None) -> int:
             "changed": bool(changes),
             "finding_count": len(changes),
         },
-        "frame_index": _frame_index(recorder.roots),
+        "frame_index": frame_index_payload,
         "findings": _finding_payload(changes),
         "failures": _failure_payload(recorder.roots),
     }
