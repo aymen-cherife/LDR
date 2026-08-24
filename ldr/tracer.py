@@ -87,8 +87,6 @@ class Recorder:
         self._synthetic_objects: dict[int, BaseException] = {}
         self._synthetic_order: list[int] = []
         self._invocation_counts: dict[str, int] = {}
-        self._seen_patterns: dict[str, set[str]] = {}
-        self._pattern_counts: dict[str, dict[str, int]] = {}
         self._registered_events: list[int] = []
 
     _NOISE = ("<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>", "<lambda>", "<module>")
@@ -278,36 +276,7 @@ class Recorder:
             and stack
             and self._focus_matches(self._entry_frame_id(stack[-1]))
         )
-        # Preserve rare differing input patterns despite sampling.
-        is_novel = False
-        pat_key = None
-        seen = None
-        token = None
-        if not (focused or direct_focus):
-            try:
-                raw_args = self._arguments(code, frame, detailed=False)
-                token = ",".join(f"{k}={v}" for k, v in sorted(raw_args.items()))
-                source_id_tmp = self._source_id(code.co_filename)
-                pat_key = f"{source_id_tmp}:{code.co_firstlineno}:{code.co_qualname}"
-                seen = self._seen_patterns.get(pat_key)
-                if seen is None:
-                    seen = set()
-                    self._seen_patterns[pat_key] = seen
-                    self._pattern_counts[pat_key] = {}
-                counts = self._pattern_counts[pat_key]
-                if ordinal > self.max_calls_per_function and token not in seen:
-                    # Only treat as novel if some existing pattern is already common
-                    # (appears >1) – avoids retaining every distinct numeric value
-                    # when all inputs are unique (hot loop) while preserving a true
-                    # rare minority (e.g., x=2 among many x=1).
-                    max_cnt = max(counts.values(), default=0)
-                    if max_cnt > 1:
-                        is_novel = True
-            except Exception:
-                token = None
-                pat_key = None
-                seen = None
-        sampled_repeat = self._sample_repeated_call(ordinal) and not (focused or direct_focus) and not is_novel
+        sampled_repeat = self._sample_repeated_call(ordinal) and not (focused or direct_focus)
         if sampled_repeat:
             # Preserve budget without disabling the code object: later
             # power-of-two samples can still expose an anomalous invocation.
@@ -329,13 +298,6 @@ class Recorder:
             self.n_nodes += 1
             if focused:
                 self.inspection_matches += 1
-            # Record distinct input pattern for future novelty checks.
-            if pat_key is not None and token is not None and seen is not None:
-                counts = self._pattern_counts.get(pat_key, {})
-                counts[token] = counts.get(token, 0) + 1
-                self._pattern_counts[pat_key] = counts
-                if len(seen) < 64:
-                    seen.add(token)
         else:
             self.dropped_nodes += 1
             self.truncated = True

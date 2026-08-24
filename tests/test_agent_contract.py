@@ -71,11 +71,8 @@ def test_late_exception_survives_node_budget(tmp_path):
     assert result.returncode == 1
     output = (tmp_path / ".ldr" / "last.txt").read_text()
     assert "fail() ! RuntimeError: late" in output
-    # Output is now richer (index, limits, inspections) but must remain bounded.
-    assert len(output.splitlines()) < 120
+    assert len(output.splitlines()) < 30
     assert "CAPTURE LIMITS" in output
-    assert "INVOCATION INDEX" in output
-    assert "AVAILABLE INSPECTIONS" in output
 
 
 def test_caught_overflow_exception_does_not_outrank_later_failure(tmp_path):

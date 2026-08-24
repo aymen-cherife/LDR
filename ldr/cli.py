@@ -168,6 +168,22 @@ def _infer_project_root(mode: str, target: str, rest: list[str], cwd: str) -> st
         current = parent
 
 
+def _display_scope(paths: list[str], cwd: str) -> list[str]:
+    """Return stable, deduplicated scope arguments for a command rerun from cwd."""
+    displayed: list[str] = []
+    for path in paths:
+        value = path
+        try:
+            resolved = os.path.realpath(path)
+            if os.path.commonpath((resolved, cwd)) == cwd:
+                value = os.path.relpath(resolved, cwd)
+        except (OSError, ValueError):
+            pass
+        if value not in displayed:
+            displayed.append(value)
+    return displayed
+
+
 def _status(recorder: Recorder) -> dict[str, Any]:
     return {
         "ok": recorder.exit_code == 0 and not recorder.crashed,
@@ -582,21 +598,14 @@ def main(argv=None) -> int:
             )
         ]
         frame_index_payload = _frame_index(recorder.roots)
-        # Scope display for copyable commands
-        display_scope = scope
-        try:
-            display_scope = [os.path.relpath(s, initial_cwd) if os.path.commonpath((os.path.realpath(s), initial_cwd)) == initial_cwd else s for s in scope]
-        except Exception:
-            display_scope = scope
+        display_scope = _display_scope(scope, initial_cwd)
         text = render_inspection(
             inspected,
             args.frame,
             args.max_lines,
-            invocation=invocation,
+            command_target=args.target,
             scope=display_scope,
             frame_index=frame_index_payload,
-            status=status,
-            max_state_steps=args.max_state_steps,
         )
         run_note = (
             f"RUN STATUS: {'PASSED' if recorder.exit_code == 0 else 'FAILED'} "
@@ -630,13 +639,8 @@ def main(argv=None) -> int:
 
     changes = []
     snapshot_action = "none"
-    # Precompute frame_index and display scope for navigational rendering
     frame_index_payload = _frame_index(recorder.roots)
-    display_scope = scope
-    try:
-        display_scope = [os.path.relpath(s, initial_cwd) if os.path.commonpath((os.path.realpath(s), initial_cwd)) == initial_cwd else s for s in scope]
-    except Exception:
-        display_scope = scope
+    display_scope = _display_scope(scope, initial_cwd)
     try:
         if args.golden:
             if args.learn_volatility:
@@ -655,11 +659,10 @@ def main(argv=None) -> int:
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,
                 frame_index=frame_index_payload,
-                invocation=invocation,
+                command_target=args.target,
                 scope=display_scope,
                 status=status,
                 max_nodes=args.max_nodes,
-                max_calls_per_function=args.max_calls_per_function,
             )
             volatility = sum(bool(node.volatile) for root in recorder.roots for node in root.walk())
             text += f"\n\nSnapshot saved for this invocation: {os.path.relpath(golden_path, initial_cwd)}"
@@ -691,11 +694,10 @@ def main(argv=None) -> int:
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,
                 frame_index=frame_index_payload,
-                invocation=invocation,
+                command_target=args.target,
                 scope=display_scope,
                 status=status,
                 max_nodes=args.max_nodes,
-                max_calls_per_function=args.max_calls_per_function,
             )
     except (OSError, ValueError, RuntimeError) as exc:
         text = f"LDR snapshot error: {exc}"
