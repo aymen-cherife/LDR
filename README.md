@@ -1,5 +1,7 @@
 # LDR
 
+[![Core tests](https://github.com/aymen-cherife/LDR/actions/workflows/ci.yml/badge.svg)](https://github.com/aymen-cherife/LDR/actions/workflows/ci.yml)
+
 **Runtime evidence for Python coding agents.**
 
 LDR records function-boundary execution without changing the target source, then produces a bounded trace or a behavioral diff between runs. It is built on Python's `sys.monitoring` API.
