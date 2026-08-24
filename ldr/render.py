@@ -142,6 +142,7 @@ def render_run(
     full: bool = False,
     max_lines: int = 200,
     dropped_nodes: int = 0,
+    sampled_nodes: int = 0,
 ) -> str:
     blocks: list[str] = []
     failed = [root for root in roots if _failing(root)]
@@ -165,6 +166,11 @@ def render_run(
             else ""
         )
         blocks.extend(("", f"[trace budget reached{detail}; late exceptions remain visible]"))
+    if sampled_nodes:
+        blocks.extend((
+            "",
+            f"[{sampled_nodes} repetitive call(s) sampled; early and power-of-two calls retained]",
+        ))
     return "\n".join(_bounded(blocks, max_lines))
 
 
@@ -260,6 +266,14 @@ def render_inspection(nodes: list[Node], requested_frame: str, max_lines: int = 
     for node in nodes:
         lines.append(f"{node.frame_id}")
         lines.append(_sig(node, False))
+        lines.append("")
+        lines.append("CALLS IN FRAME")
+        if not node.children:
+            lines.append("(no traced Python calls in this frame)")
+        for child in node.children[-30:]:
+            lines.append(f"    {_sig(child, False)}")
+        if len(node.children) > 30:
+            lines.append(f"[{len(node.children) - 30} earlier calls omitted]")
         lines.append("")
         lines.append("STATE TRANSITIONS")
         if not node.state_steps:

@@ -37,6 +37,16 @@ LDR preserves the test runner's exit status and writes:
 - `.ldr/last.json` — structured output for agents and tooling
 - `.ldr/last.txt` — a compact human-readable trace
 
+For a stateful function called many times, use the function's
+`inspect_selector` from `.ldr/last.json` to inspect every invocation in one
+rerun:
+
+```bash
+ldr inspect tests/test_orders.py::test_refund \
+  --frame 'src/orders.py:42:calculate_refund#*' \
+  --only src tests
+```
+
 ## Compare behavior before and after a change
 
 ```bash
@@ -55,8 +65,9 @@ The second run reports what changed in the execution tree. Snapshots are scoped 
 --runner pytest|run|module   Select the runner explicitly
 --timeout 300               Stop a hung in-process run
 --max-nodes 5000            Bound the full trace
+--max-calls-per-function 8  Sample repetitive hot calls after the first eight
 --max-lines 200             Bound the prose output
---frame FRAME_ID            Inspect one invocation selected from a prior run
+--frame FRAME_ID            Inspect one invocation or a function selector ending #*
 --max-state-steps 200       Bound focused local-state history
 --learn-volatility          Mask fields that vary across repeated runs
 --fail-on-change            Exit with code 3 when behavior changes
@@ -70,6 +81,7 @@ Values and output are bounded, common credential fields are redacted, and result
 - [Agent skill](agents/ldr-debug-runtime/SKILL.md)
 - [Paired evaluation harness](evaluation/README.md)
 - [Latest SWE-bench-Live smoke test](evaluation/results/hypothesis-4532.md)
+- [Hard random benchmark sample](evaluation/results/hard-random-sample-20260824.md)
 - [Competitive analysis](docs/competitive-analysis.md)
 
 LDR 0.5 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.

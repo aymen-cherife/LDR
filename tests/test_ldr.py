@@ -314,7 +314,7 @@ def test_repeated_siblings_collapse():
     rec = record(lambda: [b.double(2) for _ in range(30)])
     out = render_run(rec.roots, full=False)
     assert out.count("double") <= 3, out
-    assert "x30" in out or "x3" in out
+    assert "x9" in out
 
 
 def test_uninformative_leaves_are_pruned():

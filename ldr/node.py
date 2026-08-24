@@ -35,6 +35,7 @@ _SECRET_VALUES = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\b(?:sk|pk)-[A-Za-z0-9_-]{16,}\b"),
 )
+_STATE_SIGNAL = re.compile(r"(?:visible|layout|enabled|active|valid|closed|dirty)$")
 
 
 def _redact_text(rendered: str) -> str:
@@ -97,6 +98,53 @@ def capture(value: Any, name: str | None = None) -> str:
             return f"<{type(value).__name__} repr-failed>"
         except Exception:
             return "<unrepresentable>"
+
+
+def capture_state(value: Any, name: str | None = None) -> str:
+    """Capture a focused local plus bounded, side-effect-free boolean object state."""
+    rendered = capture(value, name)
+    if name is not None and is_secret_name(name):
+        return rendered
+    try:
+        attributes = vars(value)
+    except Exception:
+        return rendered
+    if type(attributes) is not dict:
+        return rendered
+
+    state: list[tuple[str, bool]] = []
+    nested: list[tuple[str, bool]] = []
+    for key, item in attributes.items():
+        if is_secret_name(key):
+            continue
+        normalized = key.lstrip("_").lower()
+        if type(item) is bool and (_STATE_SIGNAL.search(normalized) or len(state) < 4):
+            state.append((key, item))
+        if len(nested) >= 128:
+            continue
+        try:
+            child_attributes = vars(item)
+        except Exception:
+            continue
+        if type(child_attributes) is not dict:
+            continue
+        for child_key in ("_visible", "_in_layout", "visible", "in_layout"):
+            child_value = child_attributes.get(child_key)
+            if type(child_value) is bool:
+                nested.append((f"{key}.{child_key}", child_value))
+
+    nested.sort(
+        key=lambda item: (
+            item[1] is not False,
+            not any(token in item[0].lower() for token in ("label", "text")),
+            item[0],
+        )
+    )
+    selected = state[:8] + nested[:8]
+    if not selected:
+        return rendered
+    detail = ", ".join(f"{key}={item}" for key, item in selected)
+    return f"{rendered} {{{detail}}}"
 
 
 def capture_error(error: BaseException) -> str:

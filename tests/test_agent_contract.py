@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 from ldr.diff import diff_tree, mark_unstable
-from ldr.node import Node, capture
+from ldr.node import Node, capture, capture_state
 from ldr.tracer import Recorder
 
 
@@ -174,6 +174,24 @@ def test_capture_redacts_named_and_nested_secrets():
     assert "shown" in rendered
 
 
+def test_focused_capture_surfaces_nested_boolean_state_without_getters():
+    class Label:
+        def __init__(self):
+            self._visible = True
+            self._in_layout = False
+
+    class Tick:
+        def __init__(self):
+            self.label1 = Label()
+            self._visible = True
+            self.api_key = "never-render-this"
+
+    rendered = capture_state(Tick(), "tick")
+    assert "label1._visible=True" in rendered
+    assert "label1._in_layout=False" in rendered
+    assert "never-render-this" not in rendered
+
+
 def test_agent_can_select_a_frame_and_inspect_local_state(tmp_path):
     (tmp_path / "test_state.py").write_text(
         "def calculate(x):\n"
@@ -251,6 +269,115 @@ def test_pytest_collection_does_not_consume_runtime_budget(tmp_path):
     assert "identity" not in (tmp_path / ".ldr" / "last.txt").read_text()
 
 
+def test_pytest_report_selects_late_failure_over_runtime_attribute_probes(tmp_path):
+    (tmp_path / "test_overflow_report.py").write_text(
+        "def __getattr__(name):\n"
+        "    raise AttributeError(f'expected probe: {name}')\n"
+        "def hot(value):\n"
+        "    return value + 1\n"
+        "def actual_failure():\n"
+        "    raise RuntimeError('decisive late failure')\n"
+        "def test_overflow_report():\n"
+        "    for value in range(100):\n"
+        "        hot(value)\n"
+        "    actual_failure()\n"
+    )
+
+    result = invoke(
+        tmp_path,
+        "pytest",
+        "test_overflow_report.py::test_overflow_report",
+        "--only",
+        str(tmp_path),
+        "--max-nodes",
+        "10",
+    )
+    assert result.returncode == 1
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    unhandled = payload["failures"]
+    assert any(
+        failure["function"] == "actual_failure"
+        and "decisive late failure" in failure["error"]
+        for failure in unhandled
+    )
+    assert not any("expected probe" in failure["error"] for failure in unhandled)
+    output = (tmp_path / ".ldr" / "last.txt").read_text()
+    assert "actual_failure() ! RuntimeError: decisive late failure" in output
+
+
+def test_repeat_sampling_preserves_late_causal_success_before_assertion(tmp_path):
+    (tmp_path / "test_hot_then_cause.py").write_text(
+        "def hot(value):\n"
+        "    return value + 1\n"
+        "def calculate(value):\n"
+        "    return value * 2\n"
+        "def test_hot_then_cause():\n"
+        "    for value in range(1000):\n"
+        "        hot(value)\n"
+        "    assert calculate(3) == 7\n"
+    )
+
+    result = invoke(
+        tmp_path,
+        "pytest",
+        "test_hot_then_cause.py::test_hot_then_cause",
+        "--only",
+        str(tmp_path),
+        "--max-nodes",
+        "20",
+    )
+    assert result.returncode == 1
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    assert payload["status"]["trace_truncated"] is True
+    assert payload["status"]["overflow_transitions"] == 0
+    assert payload["status"]["sampled_repetitions"] > 900
+    calculate = next(
+        function
+        for function in payload["frame_index"]["functions"]
+        if function["function"] == "calculate"
+    )
+    assert calculate["sample_frame_ids"] == [
+        "test_hot_then_cause.py:3:calculate#1"
+    ]
+    assert "calculate(value=3) -> 6" in (tmp_path / ".ldr" / "last.txt").read_text()
+
+
+def test_sampled_hot_parent_does_not_discard_novel_causal_child(tmp_path):
+    (tmp_path / "test_sampled_parent.py").write_text(
+        "def noise(value):\n"
+        "    return value\n"
+        "def calculate(value):\n"
+        "    return value * 2\n"
+        "def wrapper(value, causal=False):\n"
+        "    if causal:\n"
+        "        return calculate(value)\n"
+        "    return noise(value)\n"
+        "def test_sampled_parent():\n"
+        "    for value in range(1000):\n"
+        "        wrapper(value)\n"
+        "    assert wrapper(3, causal=True) == 7\n"
+    )
+
+    result = invoke(
+        tmp_path,
+        "pytest",
+        "test_sampled_parent.py::test_sampled_parent",
+        "--only",
+        str(tmp_path),
+        "--max-nodes",
+        "30",
+    )
+    assert result.returncode == 1
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    calculate = next(
+        function
+        for function in payload["frame_index"]["functions"]
+        if function["function"] == "calculate"
+    )
+    assert calculate["sample_frame_ids"] == ["test_sampled_parent.py:3:calculate#1"]
+    assert "calculate(value=3) -> 6" in (tmp_path / ".ldr" / "last.txt").read_text()
+
+
 def test_focused_state_history_obeys_its_own_budget(tmp_path):
     (tmp_path / "state_loop.py").write_text(
         "def accumulate():\n"
@@ -281,3 +408,29 @@ def test_focused_state_history_obeys_its_own_budget(tmp_path):
     frame = json.loads((tmp_path / ".ldr" / "last.json").read_text())["inspection"]["frames"][0]
     assert len(frame["state_steps"]) == 3
     assert frame["state_truncated"] is True
+
+
+def test_wildcard_inspection_exposes_late_stateful_invocation(tmp_path):
+    (tmp_path / "stateful.py").write_text(
+        "class Item:\n"
+        "    def __init__(self, enabled):\n"
+        "        self.enabled = enabled\n"
+        "def evaluate(item):\n"
+        "    return item.enabled\n"
+        "for _ in range(12):\n"
+        "    evaluate(Item(True))\n"
+        "evaluate(Item(False))\n"
+    )
+    first = invoke(tmp_path, "run", "stateful.py")
+    assert first.returncode == 0
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    selector = next(
+        function["inspect_selector"]
+        for function in payload["frame_index"]["functions"]
+        if function["function"] == "evaluate"
+    )
+    second = invoke(tmp_path, "inspect", "stateful.py", "--frame", selector)
+    assert second.returncode == 0
+    inspected = json.loads((tmp_path / ".ldr" / "last.json").read_text())["inspection"]
+    assert inspected["match_count"] == 13
+    assert any("enabled=False" in frame["in"]["item"] for frame in inspected["frames"])

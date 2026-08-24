@@ -50,6 +50,7 @@ def _record(
     recorder.exit_code = 0
     recorder.crash_summary = ""
     recorder.escaped_exception = None
+    recorder.runner_exception = None
     previous_handler = None
     alarm_enabled = timeout > 0 and hasattr(signal, "SIGALRM")
 
@@ -84,6 +85,8 @@ def _record(
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
         recorder.stop()
+    if recorder.escaped_exception is None and recorder.runner_exception is not None:
+        recorder.escaped_exception = recorder.runner_exception
     recorder.finalize(
         success=recorder.exit_code == 0 and not recorder.crashed,
         escaped_exception=recorder.escaped_exception,
@@ -174,6 +177,7 @@ def _status(recorder: Recorder) -> dict[str, Any]:
         "trace_truncated": recorder.truncated,
         "recorded_nodes": recorder.n_nodes,
         "overflow_transitions": recorder.dropped_nodes,
+        "sampled_repetitions": recorder.sampled_nodes,
     }
 
 
@@ -258,27 +262,58 @@ def _failure_payload(roots: list[Node]) -> list[dict[str, Any]]:
 
 def _frame_index(roots: list[Node], limit: int = 500) -> dict[str, Any]:
     frames: list[dict[str, Any]] = []
+    functions: dict[tuple[str, str], dict[str, Any]] = {}
 
     def visit(node: Node, parent_id: str | None) -> None:
-        if len(frames) >= limit:
-            return
-        frames.append(
+        if len(frames) < limit:
+            frames.append(
+                {
+                    "frame_id": node.frame_id,
+                    "parent_id": parent_id,
+                    "function": node.name,
+                    "location": node.location,
+                    "error": node.error,
+                    "handled": node.handled,
+                }
+            )
+        key = (node.source_id, node.name)
+        summary = functions.setdefault(
+            key,
             {
-                "frame_id": node.frame_id,
-                "parent_id": parent_id,
                 "function": node.name,
+                "source_id": node.source_id,
                 "location": node.location,
-                "error": node.error,
-                "handled": node.handled,
-            }
+                "recorded_calls": 0,
+                "sample_frame_ids": [],
+                "inspect_selector": f"{node.code_id}#*",
+                "error_count": 0,
+            },
         )
+        summary["recorded_calls"] += 1
+        if node.error is not None:
+            summary["error_count"] += 1
+        samples = summary["sample_frame_ids"]
+        if node.frame_id and (not samples or node.frame_id != samples[-1]):
+            if len(samples) < 4:
+                samples.append(node.frame_id)
+            else:
+                samples[-1] = node.frame_id
         for child in node.children:
             visit(child, node.frame_id or parent_id)
 
     total = sum(root.count() for root in roots)
     for root in roots:
         visit(root, None)
-    return {"frames": frames, "total": total, "truncated": total > len(frames)}
+    ordered_functions = sorted(
+        functions.values(),
+        key=lambda item: (item["source_id"], item["location"], item["function"]),
+    )
+    return {
+        "frames": frames,
+        "functions": ordered_functions,
+        "total": total,
+        "truncated": total > len(frames),
+    }
 
 
 def _limit_text(text: str, max_lines: int, max_chars: int = 40_000) -> str:
@@ -329,6 +364,8 @@ def _probe(
         *scope,
         "--max-nodes",
         str(args.max_nodes),
+        "--max-calls-per-function",
+        str(args.max_calls_per_function),
         "--max-lines",
         str(args.max_lines),
         "--timeout",
@@ -393,8 +430,12 @@ def main(argv=None) -> int:
     parser.add_argument("--color", action="store_true")
     parser.add_argument("--full", action="store_true", help="disable trace pruning")
     parser.add_argument("--max-nodes", type=int, default=5000)
+    parser.add_argument("--max-calls-per-function", type=int, default=8)
     parser.add_argument("--max-lines", type=int, default=200)
-    parser.add_argument("--frame", help="portable frame id to inspect on a focused re-run")
+    parser.add_argument(
+        "--frame",
+        help="portable frame id, or a function selector ending in #*, for a focused re-run",
+    )
     parser.add_argument("--max-state-steps", type=int, default=200)
     parser.add_argument("--timeout", type=float, default=300)
     args, unknown = parser.parse_known_args(argv)
@@ -405,6 +446,8 @@ def main(argv=None) -> int:
         parser.error("--max-lines must be at least 20")
     if args.max_nodes < 1:
         parser.error("--max-nodes must be at least 1")
+    if args.max_calls_per_function < 1:
+        parser.error("--max-calls-per-function must be at least 1")
     if args.max_state_steps < 1:
         parser.error("--max-state-steps must be at least 1")
     if not math.isfinite(args.timeout) or args.timeout < 0:
@@ -484,6 +527,10 @@ def main(argv=None) -> int:
                     if not recorder._active:
                         recorder.start()
 
+                def pytest_runtest_makereport(self, item, call):
+                    if call.excinfo is not None:
+                        recorder.runner_exception = call.excinfo.value
+
             code = pytest.main(
                 [args.target, *args.rest, "-q", "-p", "no:cacheprovider"],
                 plugins=[RuntimeOnlyPlugin()],
@@ -502,6 +549,7 @@ def main(argv=None) -> int:
             display_root=initial_cwd,
             focus_frame=args.frame if requested_mode == "inspect" else None,
             max_state_steps=args.max_state_steps,
+            max_calls_per_function=args.max_calls_per_function,
         )
     except (RuntimeError, ValueError) as exc:
         message = f"LDR could not start tracing: {exc}"
@@ -527,7 +575,11 @@ def main(argv=None) -> int:
             node
             for root in recorder.roots
             for node in root.walk()
-            if node.frame_id == args.frame
+            if (
+                node.frame_id.startswith(args.frame[:-1])
+                if args.frame.endswith("#*")
+                else node.frame_id == args.frame
+            )
         ]
         text = render_inspection(inspected, args.frame, args.max_lines)
         run_note = (
@@ -574,10 +626,11 @@ def main(argv=None) -> int:
             text = render_run(
                 recorder.roots,
                 args.color,
-                recorder.truncated,
+                bool(recorder.dropped_nodes),
                 args.full,
                 args.max_lines,
                 recorder.dropped_nodes,
+                recorder.sampled_nodes,
             )
             volatility = sum(bool(node.volatile) for root in recorder.roots for node in root.walk())
             text += f"\n\nSnapshot saved for this invocation: {os.path.relpath(golden_path, initial_cwd)}"
@@ -603,10 +656,11 @@ def main(argv=None) -> int:
             text = render_run(
                 recorder.roots,
                 args.color,
-                recorder.truncated,
+                bool(recorder.dropped_nodes),
                 args.full,
                 args.max_lines,
                 recorder.dropped_nodes,
+                recorder.sampled_nodes,
             )
     except (OSError, ValueError, RuntimeError) as exc:
         text = f"LDR snapshot error: {exc}"

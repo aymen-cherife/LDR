@@ -25,6 +25,21 @@ ldr inspect tests/test_feature.py::test_case \
 
 Use the ordered state transitions to identify the statement that first violates the expected invariant. If the frame is missed, rerun the broad trace and select a fresh id; execution order changed.
 
+If a repeated function may behave differently across invocations, use its
+`frame_index.functions[].inspect_selector` to inspect every invocation in one
+focused rerun:
+
+```bash
+ldr inspect tests/test_feature.py::test_case \
+  --frame 'src/feature.py:42:calculate#*' \
+  --only src tests
+```
+
+Look for the first invocation whose inputs, nested boolean state, callee
+results, or ordered state transitions violate the expected invariant. Broad
+traces sample repetitive calls to protect useful late evidence; the JSON status
+reports both sampling and hard-budget overflow explicitly.
+
 For a behavioral regression, save the pre-edit behavior and compare after the patch:
 
 ```bash

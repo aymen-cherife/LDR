@@ -38,6 +38,11 @@ jobs:
             tests/test_agent_contract.py::test_named_snapshot_compares_across_checkout_directories \
             tests/test_agent_contract.py::test_agent_can_select_a_frame_and_inspect_local_state \
             tests/test_agent_contract.py::test_pytest_collection_does_not_consume_runtime_budget \
+            tests/test_agent_contract.py::test_pytest_report_selects_late_failure_over_runtime_attribute_probes \
+            tests/test_agent_contract.py::test_repeat_sampling_preserves_late_causal_success_before_assertion \
+            tests/test_agent_contract.py::test_sampled_hot_parent_does_not_discard_novel_causal_child \
+            tests/test_agent_contract.py::test_focused_capture_surfaces_nested_boolean_state_without_getters \
+            tests/test_agent_contract.py::test_wildcard_inspection_exposes_late_stateful_invocation \
             tests/test_ldr.py::test_cli_pytest_mode_traces_the_code_under_test \
             tests/test_ldr.py::test_verify_snapshots_then_diffs \
             tests/test_ldr.py::test_run_mode_survives_a_real_crash \

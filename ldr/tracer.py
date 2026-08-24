@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from .node import Node, capture, capture_error, redact_source_line
+from .node import Node, capture, capture_error, capture_state, redact_source_line
 
 
 @dataclass(slots=True)
@@ -24,6 +24,7 @@ class _Shadow:
     fid: int
     frame_id: str = ""
     children: list[Node] = field(default_factory=list)
+    preserve_children: bool = False
 
 
 _stack: contextvars.ContextVar[tuple[Node | _Shadow, ...]] = contextvars.ContextVar(
@@ -49,6 +50,7 @@ class Recorder:
         display_root: str | None = None,
         focus_frame: str | None = None,
         max_state_steps: int = 200,
+        max_calls_per_function: int = 8,
     ):
         if max_nodes < 1:
             raise ValueError("max_nodes must be at least 1")
@@ -56,6 +58,8 @@ class Recorder:
             raise ValueError("max_depth must be at least 1")
         if max_state_steps < 1:
             raise ValueError("max_state_steps must be at least 1")
+        if max_calls_per_function < 1:
+            raise ValueError("max_calls_per_function must be at least 1")
         self.scope = [os.path.realpath(p) for p in scope]
         self.project_root = os.path.realpath(project_root or os.getcwd())
         self.display_root = os.path.realpath(display_root or os.getcwd())
@@ -64,11 +68,13 @@ class Recorder:
         self.lines_for = lines_for or set()
         self.focus_frame = focus_frame
         self.max_state_steps = max_state_steps
+        self.max_calls_per_function = max_calls_per_function
         self.inspection_matches = 0
         self.roots: list[Node] = []
         self.suspended: dict[int, Node | _Shadow] = {}
         self.n_nodes = 0
         self.dropped_nodes = 0
+        self.sampled_nodes = 0
         self.truncated = False
         self._active = False
         self._tool_id: int | None = None
@@ -172,7 +178,7 @@ class Recorder:
             callsite = f"{self._display_path(caller.f_code.co_filename)}:{caller.f_lineno}"
         return source_id, module, line, file, callsite
 
-    def _arguments(self, code, frame) -> dict[str, str]:
+    def _arguments(self, code, frame, *, detailed: bool = False) -> dict[str, str]:
         names = list(code.co_varnames[: code.co_argcount + code.co_kwonlyargcount])
         index = code.co_argcount + code.co_kwonlyargcount
         if code.co_flags & inspect.CO_VARARGS:
@@ -181,22 +187,26 @@ class Recorder:
         if code.co_flags & inspect.CO_VARKEYWORDS:
             names.append(code.co_varnames[index])
         return {
-            name: capture(frame.f_locals[name], name)
+            name: (capture_state if detailed else capture)(frame.f_locals[name], name)
             for name in names
             if name in frame.f_locals and name not in ("self", "cls")
         }
 
-    def _next_frame_id(self, code) -> str:
+    def _next_frame_id(self, code) -> tuple[str, int]:
         source_id = self._source_id(code.co_filename)
         key = f"{source_id}:{code.co_firstlineno}:{code.co_qualname}"
         ordinal = self._invocation_counts.get(key, 0) + 1
         self._invocation_counts[key] = ordinal
-        return f"{key}#{ordinal}"
+        return f"{key}#{ordinal}", ordinal
 
-    def _new_node(self, code, frame, frame_id: str) -> Node:
+    def _sample_repeated_call(self, ordinal: int) -> bool:
+        """Keep early calls and exponentially spaced samples from hot functions."""
+        return ordinal > self.max_calls_per_function and ordinal & (ordinal - 1) != 0
+
+    def _new_node(self, code, frame, frame_id: str, *, detailed: bool = False) -> Node:
         source_id, module, line, file, callsite = self._metadata(code, frame)
         try:
-            arguments = self._arguments(code, frame)
+            arguments = self._arguments(code, frame, detailed=detailed)
         except Exception:
             arguments = {}
         node = Node(
@@ -214,8 +224,20 @@ class Recorder:
         node.__dict__["_code"] = code
         return node
 
-    def _new_shadow(self, code, frame, frame_id: str) -> _Shadow:
-        return _Shadow(code=code, fid=id(frame), frame_id=frame_id)
+    def _new_shadow(
+        self,
+        code,
+        frame,
+        frame_id: str,
+        *,
+        preserve_children: bool = False,
+    ) -> _Shadow:
+        return _Shadow(
+            code=code,
+            fid=id(frame),
+            frame_id=frame_id,
+            preserve_children=preserve_children,
+        )
 
     @staticmethod
     def _entry_fid(entry: Node | _Shadow) -> int:
@@ -231,6 +253,13 @@ class Recorder:
         else:
             stack[-1].children.append(node)
 
+    def _focus_matches(self, frame_id: str) -> bool:
+        if not self.focus_frame:
+            return False
+        if self.focus_frame.endswith("#*"):
+            return frame_id.startswith(self.focus_frame[:-1])
+        return frame_id == self.focus_frame
+
     def _on_start(self, code, offset):
         mon = sys.monitoring
         if not self._in_scope(code.co_filename) or self._skip(code):
@@ -240,10 +269,31 @@ class Recorder:
         except Exception:
             return
         stack = _stack.get()
-        frame_id = self._next_frame_id(code)
-        focused = bool(self.focus_frame and frame_id == self.focus_frame)
-        if (self.n_nodes < self.max_nodes and len(stack) < self.max_depth) or focused:
-            entry: Node | _Shadow = self._new_node(code, frame, frame_id)
+        frame_id, ordinal = self._next_frame_id(code)
+        focused = self._focus_matches(frame_id)
+        direct_focus = bool(
+            self.focus_frame
+            and stack
+            and self._focus_matches(self._entry_frame_id(stack[-1]))
+        )
+        sampled_repeat = self._sample_repeated_call(ordinal) and not (focused or direct_focus)
+        if sampled_repeat:
+            # Preserve budget without disabling the code object: later
+            # power-of-two samples can still expose an anomalous invocation.
+            self.sampled_nodes += 1
+            self.truncated = True
+            entry = self._new_shadow(code, frame, frame_id, preserve_children=True)
+        elif (
+            (self.n_nodes < self.max_nodes and len(stack) < self.max_depth)
+            or focused
+            or direct_focus
+        ):
+            entry: Node | _Shadow = self._new_node(
+                code,
+                frame,
+                frame_id,
+                detailed=focused,
+            )
             self._attach(entry, stack)
             self.n_nodes += 1
             if focused:
@@ -279,7 +329,7 @@ class Recorder:
         for name, value in list(frame.f_locals.items())[:64]:
             if name in ("self", "cls") or name.startswith("__"):
                 continue
-            captured[name] = capture(value, name)
+            captured[name] = capture_state(value, name)
         return captured
 
     @staticmethod
@@ -319,7 +369,7 @@ class Recorder:
         if matched is None:
             return
         _, entry = matched
-        if not isinstance(entry, Node) or entry.frame_id != self.focus_frame:
+        if not isinstance(entry, Node) or not self._focus_matches(entry.frame_id):
             return
         current = self._state_locals(frame)
         previous = entry.__dict__.get("_state_locals")
@@ -421,7 +471,7 @@ class Recorder:
         if matched is None:
             return
         parent_stack, entry = matched
-        if isinstance(entry, Node) and entry.frame_id == self.focus_frame:
+        if isinstance(entry, Node) and self._focus_matches(entry.frame_id):
             self._capture_state_transition(code, frame, None)
         self.suspended.pop(self._entry_fid(entry), None)
         _stack.set(parent_stack)
@@ -430,6 +480,8 @@ class Recorder:
             if error is None:
                 for child in entry.children:
                     _mark_handled(child)
+                    if entry.preserve_children:
+                        self._attach(child, parent_stack)
                 return
             try:
                 arguments = self._arguments(code, frame)
@@ -568,6 +620,16 @@ class Recorder:
                 _mark_handled(root)
             return
         exception_id = id(escaped_exception) if escaped_exception is not None else None
+        if exception_id in self._synthetic_exceptions:
+            # Pytest catches the test exception and reports failure via its
+            # exit status. Bind the final trace to that exact report object so
+            # expected module probes and other isolated AttributeErrors cannot
+            # outrank a late failure promoted after the node budget.
+            for root in self.roots:
+                _mark_handled(root)
+            for node in self._synthetic_exceptions[exception_id]:
+                node.handled = False
+            return
         has_regular_unhandled = any(
             node.error is not None and not node.handled
             for root in self.roots
