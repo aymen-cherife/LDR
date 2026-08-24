@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ldr"
+version = "0.4.1"
+description = "Execution tracing and behavioural diffing for Python, with zero source instrumentation."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+pytest = ["pytest>=7"]
+
+[project.scripts]
+ldr = "ldr.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ldr*"]
