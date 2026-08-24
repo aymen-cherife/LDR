@@ -4,7 +4,7 @@
 
 **Runtime evidence for Python coding agents.**
 
-LDR records function-boundary execution without changing the target source, then produces a bounded trace or a behavioral diff between runs. It is built on Python's `sys.monitoring` API.
+LDR records function-boundary execution without changing the target source, then produces a bounded failure trace, a focused local-state history, or a behavioral diff between runs. It is built on Python's `sys.monitoring` API.
 
 Instead of asking an agent to guess where execution diverged, LDR gives it structured evidence: calls, returns, exceptions, failure paths, source locations, and ranked changes.
 
@@ -16,10 +16,20 @@ LDR requires Python 3.12+.
 pip install -e .
 ```
 
-## Trace a failing test
+## Agent workflow
+
+Start with one failing test:
 
 ```bash
 ldr pytest tests/test_orders.py::test_refund --only src tests
+```
+
+Pytest collection is excluded from the trace, so imports do not consume the runtime budget. The result includes stable frame IDs. Select a suspicious invocation and inspect only its local-state transitions:
+
+```bash
+ldr inspect tests/test_orders.py::test_refund \
+  --frame 'src/orders.py:42:calculate_refund#1' \
+  --only src tests
 ```
 
 LDR preserves the test runner's exit status and writes:
@@ -46,11 +56,20 @@ The second run reports what changed in the execution tree. Snapshots are scoped 
 --timeout 300               Stop a hung in-process run
 --max-nodes 5000            Bound the full trace
 --max-lines 200             Bound the prose output
+--frame FRAME_ID            Inspect one invocation selected from a prior run
+--max-state-steps 200       Bound focused local-state history
 --learn-volatility          Mask fields that vary across repeated runs
 --fail-on-change            Exit with code 3 when behavior changes
 --golden                    Replace the current snapshot
 ```
 
-Values are bounded, common credential fields are redacted, and result files are written atomically with owner-only permissions.
+Values and output are bounded, common credential fields are redacted, and result files are written atomically with owner-only permissions.
 
-LDR is an early prototype. The immediate goal is to test whether structured runtime evidence helps coding agents diagnose real failures more reliably and with less wandering.
+## Evidence and integrations
+
+- [Agent skill](agents/ldr-debug-runtime/SKILL.md)
+- [Paired evaluation harness](evaluation/README.md)
+- [Latest SWE-bench-Live smoke test](evaluation/results/hypothesis-4532.md)
+- [Competitive analysis](docs/competitive-analysis.md)
+
+LDR 0.5 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.

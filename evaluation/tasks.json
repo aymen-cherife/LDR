@@ -1,0 +1,80 @@
+{
+  "benchmark": "SWE-bench-Live/SWE-bench-Live",
+  "split": "full",
+  "selected_at": "2026-08-24",
+  "selection": "Recent Python tasks with a reproducible failing test and runtime state likely to matter; setup-only and documentation tasks excluded.",
+  "tasks": [
+    {
+      "instance_id": "HypothesisWorks__hypothesis-4532",
+      "repo": "HypothesisWorks/hypothesis",
+      "base_commit": "34c02559e8d94dfbbffd07ceee9109505bc550cb",
+      "created_at": "2025-09-01T08:37:47",
+      "failure": "hypothesis-python/tests/cover/test_reflection.py::test_cache_key_size_is_bounded",
+      "category": "exception-after-state-conversion",
+      "reason": "Two long representations take adjacent branches; the first conversion changes the type used by the second branch."
+    },
+    {
+      "instance_id": "a2aproject__a2a-python-443",
+      "repo": "a2aproject/a2a-python",
+      "base_commit": "813f5cdf639099dcad1365202e1819b34dfb52e6",
+      "created_at": "2025-08-28T21:39:11",
+      "failure": "tests/server/request_handlers/test_default_request_handler.py::test_on_get_task_not_found",
+      "category": "context-propagation",
+      "reason": "A call-context value must propagate through several task-store interfaces and handlers."
+    },
+    {
+      "instance_id": "conan-io__conan-18832",
+      "repo": "conan-io/conan",
+      "base_commit": "5ec22cfb4784cfc6c9e09c44d0b11032cc3f155b",
+      "created_at": "2025-08-26T14:40:45",
+      "failure": "test/integration/toolchains/cmake/cmakedeps2/test_cmakedeps.py::test_cmakedeps_direct_deps_paths",
+      "category": "configuration-data-flow",
+      "reason": "The produced CMake state differs from the requested dependency behavior."
+    },
+    {
+      "instance_id": "octodns__octodns-1298",
+      "repo": "octodns/octodns",
+      "base_commit": "470df43b5a3631f72378a7d69c0091f2743eb0bc",
+      "created_at": "2025-08-25T21:11:54",
+      "failure": "tests/test_octodns_processor_ownership.py::TestOwnershipProcessor::test_should_replace",
+      "category": "mutation-and-duplicate-state",
+      "reason": "A processor mutates an alias zone and produces a duplicate record away from the source decision."
+    },
+    {
+      "instance_id": "matplotlib__matplotlib-30467",
+      "repo": "matplotlib/matplotlib",
+      "base_commit": "1f8ff336c84e15e648c5ce7379fc29c523d821a2",
+      "created_at": "2025-08-25T20:39:53",
+      "failure": "lib/matplotlib/tests/test_axis.py::test_tick_not_in_layout[png]",
+      "category": "silent-layout-logic",
+      "reason": "The failure is an incorrect geometry result rather than an exception, making intermediate selection state useful."
+    },
+    {
+      "instance_id": "authlib__authlib-802",
+      "repo": "authlib/authlib",
+      "base_commit": "0d03ee9dd758f95853356fa1eea3fbce37109eb0",
+      "created_at": "2025-08-25T14:49:37",
+      "failure": "tests/flask/test_oauth2/test_openid_code_grant.py::OpenIDCodeTest::test_client_metadata_alg_none",
+      "category": "metadata-driven-branching",
+      "reason": "Client metadata must select the signing path and propagate the chosen algorithm."
+    },
+    {
+      "instance_id": "quantumlib__Cirq-7595",
+      "repo": "quantumlib/Cirq",
+      "base_commit": "dc69fa11eda12f7a8abaa4db5af3720538320d49",
+      "created_at": "2025-08-21T19:55:05",
+      "failure": "cirq-core/cirq/protocols/unitary_protocol_test.py::test_unitary",
+      "category": "silent-invalid-return",
+      "reason": "A protocol returns an invalid matrix successfully; the responsible strategy must be localized from runtime values."
+    },
+    {
+      "instance_id": "llamastack__llama-stack-3224",
+      "repo": "llamastack/llama-stack",
+      "base_commit": "58e164b8bcbe6821b5a735ce52883ff7f27ff426",
+      "created_at": "2025-08-21T15:52:00",
+      "failure": "tests/unit/providers/agents/meta_reference/test_response_conversion_utils.py::TestConvertResponseInputToChatMessages::test_convert_function_call_ordering",
+      "category": "ordered-message-conversion",
+      "reason": "The output is structurally valid but tool-call messages are ordered incorrectly."
+    }
+  ]
+}

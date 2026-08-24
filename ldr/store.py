@@ -10,7 +10,7 @@ from typing import Any
 
 from .node import Node
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _portable_path(value: str, root: str) -> str:

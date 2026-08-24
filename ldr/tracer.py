@@ -9,18 +9,20 @@ from __future__ import annotations
 
 import contextvars
 import inspect
+import linecache
 import os
 import sys
 import time
 from dataclasses import dataclass, field
 
-from .node import Node, capture, capture_error
+from .node import Node, capture, capture_error, redact_source_line
 
 
 @dataclass(slots=True)
 class _Shadow:
     code: object
     fid: int
+    frame_id: str = ""
     children: list[Node] = field(default_factory=list)
 
 
@@ -45,19 +47,24 @@ class Recorder:
         lines_for: set[str] | None = None,
         project_root: str | None = None,
         display_root: str | None = None,
+        focus_frame: str | None = None,
+        max_state_steps: int = 200,
     ):
         if max_nodes < 1:
             raise ValueError("max_nodes must be at least 1")
         if max_depth < 1:
             raise ValueError("max_depth must be at least 1")
+        if max_state_steps < 1:
+            raise ValueError("max_state_steps must be at least 1")
         self.scope = [os.path.realpath(p) for p in scope]
         self.project_root = os.path.realpath(project_root or os.getcwd())
         self.display_root = os.path.realpath(display_root or os.getcwd())
         self.max_nodes = max_nodes
         self.max_depth = max_depth
-        # Retained for API compatibility. Line tracing was never implemented
-        # and is intentionally not advertised as a working feature.
         self.lines_for = lines_for or set()
+        self.focus_frame = focus_frame
+        self.max_state_steps = max_state_steps
+        self.inspection_matches = 0
         self.roots: list[Node] = []
         self.suspended: dict[int, Node | _Shadow] = {}
         self.n_nodes = 0
@@ -73,6 +80,8 @@ class Recorder:
         self._synthetic_exceptions: dict[int, list[Node]] = {}
         self._synthetic_objects: dict[int, BaseException] = {}
         self._synthetic_order: list[int] = []
+        self._invocation_counts: dict[str, int] = {}
+        self._registered_events: list[int] = []
 
     _NOISE = ("<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>", "<lambda>", "<module>")
 
@@ -177,7 +186,14 @@ class Recorder:
             if name in frame.f_locals and name not in ("self", "cls")
         }
 
-    def _new_node(self, code, frame) -> Node:
+    def _next_frame_id(self, code) -> str:
+        source_id = self._source_id(code.co_filename)
+        key = f"{source_id}:{code.co_firstlineno}:{code.co_qualname}"
+        ordinal = self._invocation_counts.get(key, 0) + 1
+        self._invocation_counts[key] = ordinal
+        return f"{key}#{ordinal}"
+
+    def _new_node(self, code, frame, frame_id: str) -> Node:
         source_id, module, line, file, callsite = self._metadata(code, frame)
         try:
             arguments = self._arguments(code, frame)
@@ -191,18 +207,23 @@ class Recorder:
             source_id=source_id,
             line=line,
             callsite=callsite,
+            frame_id=frame_id,
         )
         node.__dict__["_t0"] = time.perf_counter()
         node.__dict__["_fid"] = id(frame)
         node.__dict__["_code"] = code
         return node
 
-    def _new_shadow(self, code, frame) -> _Shadow:
-        return _Shadow(code=code, fid=id(frame))
+    def _new_shadow(self, code, frame, frame_id: str) -> _Shadow:
+        return _Shadow(code=code, fid=id(frame), frame_id=frame_id)
 
     @staticmethod
     def _entry_fid(entry: Node | _Shadow) -> int:
         return entry.fid if isinstance(entry, _Shadow) else entry.__dict__.get("_fid", -1)
+
+    @staticmethod
+    def _entry_frame_id(entry: Node | _Shadow) -> str:
+        return entry.frame_id
 
     def _attach(self, node: Node, stack: tuple[Node | _Shadow, ...]) -> None:
         if not stack:
@@ -219,10 +240,14 @@ class Recorder:
         except Exception:
             return
         stack = _stack.get()
-        if self.n_nodes < self.max_nodes and len(stack) < self.max_depth:
-            entry: Node | _Shadow = self._new_node(code, frame)
+        frame_id = self._next_frame_id(code)
+        focused = bool(self.focus_frame and frame_id == self.focus_frame)
+        if (self.n_nodes < self.max_nodes and len(stack) < self.max_depth) or focused:
+            entry: Node | _Shadow = self._new_node(code, frame, frame_id)
             self._attach(entry, stack)
             self.n_nodes += 1
+            if focused:
+                self.inspection_matches += 1
         else:
             self.dropped_nodes += 1
             self.truncated = True
@@ -245,8 +270,73 @@ class Recorder:
                 # scoped Python frame chain if a later invocation fails.
                 self._suppressed_codes.add(code)
                 return mon.DISABLE
-            entry = self._new_shadow(code, frame)
+            entry = self._new_shadow(code, frame, frame_id)
         _stack.set(stack + (entry,))
+
+    @staticmethod
+    def _state_locals(frame) -> dict[str, str]:
+        captured: dict[str, str] = {}
+        for name, value in list(frame.f_locals.items())[:64]:
+            if name in ("self", "cls") or name.startswith("__"):
+                continue
+            captured[name] = capture(value, name)
+        return captured
+
+    @staticmethod
+    def _state_changes(before: dict[str, str], after: dict[str, str]) -> list[dict[str, str]]:
+        changes = []
+        for name in sorted(set(before) | set(after)):
+            left = before.get(name, "<unset>")
+            right = after.get(name, "<deleted>")
+            if left != right:
+                changes.append({"name": name, "before": left, "after": right})
+        return changes
+
+    def _append_state_step(
+        self,
+        entry: Node,
+        code,
+        line: int,
+        before: dict[str, str],
+        after: dict[str, str],
+    ) -> None:
+        if len(entry.state_steps) >= self.max_state_steps:
+            entry.state_truncated = True
+            return
+        statement = redact_source_line(linecache.getline(code.co_filename, line).strip())
+        entry.state_steps.append(
+            {
+                "line": line,
+                "statement": statement,
+                "changes": self._state_changes(before, after),
+            }
+        )
+
+    def _capture_state_transition(self, code, frame, next_line: int | None) -> None:
+        if not self.focus_frame:
+            return
+        matched = self._matching_stack(frame)
+        if matched is None:
+            return
+        _, entry = matched
+        if not isinstance(entry, Node) or entry.frame_id != self.focus_frame:
+            return
+        current = self._state_locals(frame)
+        previous = entry.__dict__.get("_state_locals")
+        previous_line = entry.__dict__.get("_state_line")
+        if previous is not None and previous_line is not None:
+            self._append_state_step(entry, code, previous_line, previous, current)
+        entry.__dict__["_state_locals"] = current
+        entry.__dict__["_state_line"] = next_line
+
+    def _on_line(self, code, line_number):
+        if not self.focus_frame or not self._in_scope(code.co_filename) or self._skip(code):
+            return
+        try:
+            frame = sys._getframe(1)
+        except Exception:
+            return
+        self._capture_state_transition(code, frame, line_number)
 
     def _promote_suppressed(self, frame, exc: BaseException) -> None:
         exception_id = id(exc)
@@ -293,6 +383,7 @@ class Recorder:
                 source_id=source_id,
                 line=line,
                 callsite=callsite,
+                frame_id="",
             )
             node.__dict__["_exc_id"] = exception_id
             if parent is None:
@@ -330,6 +421,8 @@ class Recorder:
         if matched is None:
             return
         parent_stack, entry = matched
+        if isinstance(entry, Node) and entry.frame_id == self.focus_frame:
+            self._capture_state_transition(code, frame, None)
         self.suspended.pop(self._entry_fid(entry), None)
         _stack.set(parent_stack)
 
@@ -353,6 +446,7 @@ class Recorder:
                 line=line,
                 callsite=callsite,
                 children=entry.children,
+                frame_id=entry.frame_id,
             )
             self._attach(promoted, parent_stack)
             return
@@ -450,10 +544,13 @@ class Recorder:
             events.PY_UNWIND: self._on_unwind,
             events.RAISE: self._on_raise,
         }
+        if self.focus_frame:
+            callbacks[events.LINE] = self._on_line
         try:
             for event, callback in callbacks.items():
                 mon.register_callback(tool_id, event, callback)
             mon.set_events(tool_id, sum(callbacks))
+            self._registered_events = list(callbacks)
         except Exception:
             try:
                 mon.set_events(tool_id, 0)
@@ -491,11 +588,12 @@ class Recorder:
         mon = sys.monitoring
         tool_id = self._tool_id
         mon.set_events(tool_id, 0)
-        for event_name in ("PY_START", "PY_RETURN", "PY_YIELD", "PY_RESUME", "PY_UNWIND", "RAISE"):
-            mon.register_callback(tool_id, getattr(mon.events, event_name), None)
+        for event in self._registered_events:
+            mon.register_callback(tool_id, event, None)
         mon.free_tool_id(tool_id)
         self._active = False
         self._tool_id = None
+        self._registered_events.clear()
         self._suppressed_codes.clear()
         _stack.set(())
         for entry in self.suspended.values():

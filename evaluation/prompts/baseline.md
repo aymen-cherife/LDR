@@ -1,0 +1,1 @@
+Solve the supplied repository issue. Reproduce the failing test, inspect the code and runtime behavior as needed, implement the smallest correct patch, and run the focused test plus relevant regression tests. Do not modify tests to make the failure disappear. Stop when the implementation is verified or the budget is exhausted.

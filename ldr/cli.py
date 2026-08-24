@@ -15,7 +15,7 @@ from typing import Any
 
 from .diff import align, diff_tree, mark_unstable, rank
 from .node import Node
-from .render import render_call_chain, render_diff, render_run
+from .render import render_call_chain, render_diff, render_inspection, render_run
 from .store import (
     SCHEMA_VERSION,
     atomic_json,
@@ -37,7 +37,14 @@ class _RunTimedOut(BaseException):
     pass
 
 
-def _record(fn, scope: list[str], *, timeout: float = 300, **kwargs):
+def _record(
+    fn,
+    scope: list[str],
+    *,
+    timeout: float = 300,
+    defer_start: bool = False,
+    **kwargs,
+):
     recorder = Recorder(scope=scope, **kwargs)
     recorder.crashed = False
     recorder.exit_code = 0
@@ -49,14 +56,15 @@ def _record(fn, scope: list[str], *, timeout: float = 300, **kwargs):
     def expired(signum, frame):
         raise _RunTimedOut(f"execution exceeded {timeout:g} seconds")
 
-    recorder.start()
+    if not defer_start:
+        recorder.start()
     try:
         if alarm_enabled:
             previous_handler = signal.getsignal(signal.SIGALRM)
             signal.signal(signal.SIGALRM, expired)
             signal.setitimer(signal.ITIMER_REAL, timeout)
         try:
-            fn()
+            fn(recorder)
         except SystemExit as exc:
             recorder.exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
         except _RunTimedOut as exc:
@@ -173,6 +181,7 @@ def _node_state(node: Node | None) -> dict[str, Any] | None:
     if node is None:
         return None
     return {
+        "frame_id": node.frame_id,
         "inputs": node.in_,
         "output": node.out,
         "error": node.error,
@@ -186,6 +195,7 @@ def _recent_context(node: Node) -> list[dict[str, Any]]:
         recent.append(
             {
                 "function": child.name,
+                "frame_id": child.frame_id,
                 "source_id": child.source_id,
                 "location": child.location,
                 "inputs": child.in_,
@@ -206,6 +216,7 @@ def _finding_payload(changes) -> list[dict[str, Any]]:
                 "kind": change.kind,
                 "path": change.path,
                 "function": change.node.name,
+                "frame_id": change.node.frame_id,
                 "source_id": change.node.source_id,
                 "location": change.node.location,
                 "callsite": change.node.callsite,
@@ -219,13 +230,16 @@ def _finding_payload(changes) -> list[dict[str, Any]]:
 def _failure_payload(roots: list[Node]) -> list[dict[str, Any]]:
     failures = []
 
-    def visit(node: Node, path: list[str]):
+    def visit(node: Node, path: list[str], frame_path: list[str]):
         here = path + [node.name]
+        here_frames = frame_path + [node.frame_id]
         if node.error is not None and not node.handled:
             failures.append(
                 {
                     "path": here,
+                    "frame_path": here_frames,
                     "function": node.name,
+                    "frame_id": node.frame_id,
                     "source_id": node.source_id,
                     "location": node.location,
                     "callsite": node.callsite,
@@ -235,11 +249,36 @@ def _failure_payload(roots: list[Node]) -> list[dict[str, Any]]:
                 }
             )
         for child in node.children:
-            visit(child, here)
+            visit(child, here, here_frames)
 
     for root in roots:
-        visit(root, [])
+        visit(root, [], [])
     return failures
+
+
+def _frame_index(roots: list[Node], limit: int = 500) -> dict[str, Any]:
+    frames: list[dict[str, Any]] = []
+
+    def visit(node: Node, parent_id: str | None) -> None:
+        if len(frames) >= limit:
+            return
+        frames.append(
+            {
+                "frame_id": node.frame_id,
+                "parent_id": parent_id,
+                "function": node.name,
+                "location": node.location,
+                "error": node.error,
+                "handled": node.handled,
+            }
+        )
+        for child in node.children:
+            visit(child, node.frame_id or parent_id)
+
+    total = sum(root.count() for root in roots)
+    for root in roots:
+        visit(root, None)
+    return {"frames": frames, "total": total, "truncated": total > len(frames)}
 
 
 def _limit_text(text: str, max_lines: int, max_chars: int = 40_000) -> str:
@@ -336,8 +375,8 @@ def main(argv=None) -> int:
         argv, passthrough = argv[:index], argv[index + 1 :]
 
     parser = argparse.ArgumentParser(prog="ldr")
-    parser.add_argument("--version", action="version", version="ldr 0.4.1")
-    parser.add_argument("mode", choices=["run", "pytest", "module", "verify"])
+    parser.add_argument("--version", action="version", version="ldr 0.5.0")
+    parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect"])
     parser.add_argument("target")
     parser.add_argument("rest", nargs="*")
     parser.add_argument("--runner", choices=["auto", "run", "pytest", "module"], default="auto")
@@ -355,6 +394,8 @@ def main(argv=None) -> int:
     parser.add_argument("--full", action="store_true", help="disable trace pruning")
     parser.add_argument("--max-nodes", type=int, default=5000)
     parser.add_argument("--max-lines", type=int, default=200)
+    parser.add_argument("--frame", help="portable frame id to inspect on a focused re-run")
+    parser.add_argument("--max-state-steps", type=int, default=200)
     parser.add_argument("--timeout", type=float, default=300)
     args, unknown = parser.parse_known_args(argv)
     args.rest = list(args.rest) + unknown + passthrough
@@ -364,14 +405,23 @@ def main(argv=None) -> int:
         parser.error("--max-lines must be at least 20")
     if args.max_nodes < 1:
         parser.error("--max-nodes must be at least 1")
+    if args.max_state_steps < 1:
+        parser.error("--max-state-steps must be at least 1")
     if not math.isfinite(args.timeout) or args.timeout < 0:
         parser.error("--timeout must be a finite non-negative number")
 
     requested_mode = args.mode
-    if requested_mode == "verify":
+    if requested_mode in ("verify", "inspect"):
         args.mode = _infer_runner(args.target) if args.runner == "auto" else args.runner
     elif args.runner != "auto":
-        parser.error("--runner is only valid with verify")
+        parser.error("--runner is only valid with verify or inspect")
+    if requested_mode == "inspect":
+        if not args.frame:
+            parser.error("inspect requires --frame from a previous LDR result")
+        if args.golden or args.diff or args.learn_volatility:
+            parser.error("inspect cannot save or compare snapshots")
+    elif args.frame:
+        parser.error("--frame is only valid with inspect")
 
     if args.project_root:
         project_root = os.path.realpath(args.project_root)
@@ -417,7 +467,7 @@ def main(argv=None) -> int:
     if args.learn_volatility and not args.golden:
         parser.error("--learn-volatility is only valid while saving a snapshot")
 
-    def go():
+    def go(recorder):
         if args.mode == "run":
             sys.argv = [args.target] + args.rest
             runpy.run_path(args.target, run_name="__main__")
@@ -427,7 +477,17 @@ def main(argv=None) -> int:
         else:
             import pytest
 
-            code = pytest.main([args.target, *args.rest, "-q", "-p", "no:cacheprovider"])
+            class RuntimeOnlyPlugin:
+                """Arm tracing after collection, before the selected test's setup."""
+
+                def pytest_runtest_protocol(self, item, nextitem):
+                    if not recorder._active:
+                        recorder.start()
+
+            code = pytest.main(
+                [args.target, *args.rest, "-q", "-p", "no:cacheprovider"],
+                plugins=[RuntimeOnlyPlugin()],
+            )
             if int(code) != 0:
                 raise SystemExit(int(code))
 
@@ -436,9 +496,12 @@ def main(argv=None) -> int:
             go,
             scope,
             timeout=args.timeout,
+            defer_start=args.mode == "pytest",
             max_nodes=args.max_nodes,
             project_root=project_root,
             display_root=initial_cwd,
+            focus_frame=args.frame if requested_mode == "inspect" else None,
+            max_state_steps=args.max_state_steps,
         )
     except (RuntimeError, ValueError) as exc:
         message = f"LDR could not start tracing: {exc}"
@@ -458,6 +521,44 @@ def main(argv=None) -> int:
     if probe_path:
         save_trace(probe_path, recorder.roots, invocation=invocation, status=status)
         return recorder.exit_code
+
+    if requested_mode == "inspect":
+        inspected = [
+            node
+            for root in recorder.roots
+            for node in root.walk()
+            if node.frame_id == args.frame
+        ]
+        text = render_inspection(inspected, args.frame, args.max_lines)
+        run_note = (
+            f"RUN STATUS: {'PASSED' if recorder.exit_code == 0 else 'FAILED'} "
+            f"(exit {recorder.exit_code})\n\n"
+        )
+        text = _limit_text(run_note + text, args.max_lines)
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "invocation": invocation,
+            "status": status,
+            "inspection": {
+                "requested_frame": args.frame,
+                "matched": bool(inspected),
+                "match_count": len(inspected),
+                "frames": [node.to_dict() for node in inspected],
+            },
+            "frame_index": _frame_index(recorder.roots),
+            "findings": [],
+            "failures": _failure_payload(recorder.roots),
+        }
+        text_path, json_path = _write_result(text, payload, ldr_dir)
+        print(text)
+        print(
+            f"\n[ldr] agent result: {os.path.relpath(json_path, initial_cwd)}; "
+            f"text: {os.path.relpath(text_path, initial_cwd)}",
+            file=sys.stderr,
+        )
+        if recorder.exit_code != 0:
+            return recorder.exit_code
+        return 0 if inspected else 2
 
     changes = []
     snapshot_action = "none"
@@ -544,6 +645,7 @@ def main(argv=None) -> int:
             "changed": bool(changes),
             "finding_count": len(changes),
         },
+        "frame_index": _frame_index(recorder.roots),
         "findings": _finding_payload(changes),
         "failures": _failure_payload(recorder.roots),
     }

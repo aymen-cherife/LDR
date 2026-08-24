@@ -172,3 +172,112 @@ def test_capture_redacts_named_and_nested_secrets():
     rendered = capture({"token": "not-secret-name", "access_token": "hidden", "safe": "shown"})
     assert "hidden" not in rendered
     assert "shown" in rendered
+
+
+def test_agent_can_select_a_frame_and_inspect_local_state(tmp_path):
+    (tmp_path / "test_state.py").write_text(
+        "def calculate(x):\n"
+        "    total = x + 1\n"
+        "    api_key = 'very-secret-value'\n"
+        "    total *= 2\n"
+        "    return total\n"
+        "\n"
+        "def test_calculate():\n"
+        "    assert calculate(3) == 9\n"
+    )
+
+    baseline = invoke(tmp_path, "pytest", "test_state.py")
+    assert baseline.returncode == 1
+    first = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    recent = first["failures"][0]["recent_calls"]
+    selected = next(call["frame_id"] for call in recent if call["function"] == "calculate")
+    assert selected.endswith("calculate#1")
+
+    inspected = invoke(
+        tmp_path,
+        "inspect",
+        "test_state.py",
+        "--frame",
+        selected,
+        "--max-state-steps",
+        "20",
+    )
+    assert inspected.returncode == 1
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    assert payload["inspection"]["matched"] is True
+    frame = payload["inspection"]["frames"][0]
+    assert frame["frame_id"] == selected
+    changes = [
+        change
+        for step in frame["state_steps"]
+        for change in step["changes"]
+    ]
+    assert {"name": "total", "before": "<unset>", "after": "4"} in changes
+    assert {"name": "total", "before": "4", "after": "8"} in changes
+    assert any(change["name"] == "api_key" and change["after"] == "<redacted>" for change in changes)
+    output = (tmp_path / ".ldr" / "last.txt").read_text()
+    assert "STATE TRANSITIONS" in output
+    assert "very-secret-value" not in output
+
+
+def test_pytest_collection_does_not_consume_runtime_budget(tmp_path):
+    (tmp_path / "helper.py").write_text(
+        "def identity(value):\n"
+        "    return value\n"
+        "for value in range(200):\n"
+        "    identity(value)\n"
+    )
+    (tmp_path / "test_late.py").write_text(
+        "import helper\n"
+        "def fail_at_runtime():\n"
+        "    raise RuntimeError('runtime evidence')\n"
+        "def test_late():\n"
+        "    fail_at_runtime()\n"
+    )
+
+    result = invoke(
+        tmp_path,
+        "pytest",
+        "test_late.py::test_late",
+        "--only",
+        str(tmp_path),
+        "--max-nodes",
+        "10",
+    )
+    assert result.returncode == 1
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    assert payload["status"]["trace_truncated"] is False
+    assert any(failure["function"] == "fail_at_runtime" for failure in payload["failures"])
+    assert "identity" not in (tmp_path / ".ldr" / "last.txt").read_text()
+
+
+def test_focused_state_history_obeys_its_own_budget(tmp_path):
+    (tmp_path / "state_loop.py").write_text(
+        "def accumulate():\n"
+        "    total = 0\n"
+        "    for value in range(20):\n"
+        "        total += value\n"
+        "    return total\n"
+        "accumulate()\n"
+    )
+    first = invoke(tmp_path, "run", "state_loop.py", "--full")
+    assert first.returncode == 0
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    selected = next(
+        frame["frame_id"]
+        for frame in payload["frame_index"]["frames"]
+        if frame["function"] == "accumulate"
+    )
+    second = invoke(
+        tmp_path,
+        "inspect",
+        "state_loop.py",
+        "--frame",
+        selected,
+        "--max-state-steps",
+        "3",
+    )
+    assert second.returncode == 0
+    frame = json.loads((tmp_path / ".ldr" / "last.json").read_text())["inspection"]["frames"][0]
+    assert len(frame["state_steps"]) == 3
+    assert frame["state_truncated"] is True

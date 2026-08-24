@@ -246,3 +246,31 @@ def render_diff(changes: list[Change], color: bool = False, max_findings: int = 
     if omitted:
         lines.append(f"[{omitted} lower-ranked findings omitted]")
     return "\n".join(lines)
+
+
+def render_inspection(nodes: list[Node], requested_frame: str, max_lines: int = 200) -> str:
+    """Render the state history for one portable frame id."""
+    if not nodes:
+        return (
+            f"INSPECTION MISSED\nFrame {requested_frame!r} was not observed on the re-run.\n"
+            "The execution path or call ordering changed; run a fresh LDR trace and select a new frame id."
+        )
+
+    lines = ["INSPECTED FRAME"]
+    for node in nodes:
+        lines.append(f"{node.frame_id}")
+        lines.append(_sig(node, False))
+        lines.append("")
+        lines.append("STATE TRANSITIONS")
+        if not node.state_steps:
+            lines.append("(no Python local-state transitions were captured)")
+        for step in node.state_steps:
+            statement = step.get("statement") or "<source unavailable>"
+            lines.append(f"{step.get('line', '?')} | {statement}")
+            for change in step.get("changes", []):
+                lines.append(
+                    f"    {change.get('name')}: {change.get('before')} -> {change.get('after')}"
+                )
+        if node.state_truncated:
+            lines.append("[state-step budget reached; remaining transitions omitted]")
+    return "\n".join(_bounded(lines, max_lines))

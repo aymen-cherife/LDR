@@ -36,6 +36,8 @@ jobs:
             tests/test_agent_contract.py::test_caught_overflow_exception_does_not_outrank_later_failure \
             tests/test_agent_contract.py::test_varargs_kwargs_locations_and_secret_redaction \
             tests/test_agent_contract.py::test_named_snapshot_compares_across_checkout_directories \
+            tests/test_agent_contract.py::test_agent_can_select_a_frame_and_inspect_local_state \
+            tests/test_agent_contract.py::test_pytest_collection_does_not_consume_runtime_budget \
             tests/test_ldr.py::test_cli_pytest_mode_traces_the_code_under_test \
             tests/test_ldr.py::test_verify_snapshots_then_diffs \
             tests/test_ldr.py::test_run_mode_survives_a_real_crash \

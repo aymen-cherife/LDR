@@ -48,6 +48,13 @@ def is_secret_name(name: object) -> bool:
     return isinstance(name, str) and bool(_SECRET_NAME.search(name))
 
 
+def redact_source_line(source: str) -> str:
+    """Redact source text that itself contains a credential-shaped name."""
+    if any(is_secret_name(name) for name in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source)):
+        return "<redacted source line>"
+    return _redact_text(source)
+
+
 def _redact_value(value: Any, depth: int = 0, seen: set[int] | None = None) -> Any:
     """Redact built-in containers without invoking arbitrary container code."""
     if depth >= 8:
@@ -112,6 +119,11 @@ class Node:
     ms: float = 0.0
     children: list["Node"] = field(default_factory=list)
 
+    # A portable invocation identity. Unlike CPython's frame id this is stable
+    # across an immediate re-run, so an agent can select one observed call for
+    # a focused inspection pass.
+    frame_id: str = ""
+
     # Location and diagnostic bookkeeping are not timing behaviour.
     module: str = ""
     file: str = ""
@@ -121,6 +133,8 @@ class Node:
     handled: bool = False
     volatile: list[str] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)
+    state_steps: list[dict[str, Any]] = field(default_factory=list)
+    state_truncated: bool = False
     unstable: bool = False
 
     @property
@@ -150,6 +164,9 @@ class Node:
             "lines": self.lines,
             "unstable": self.unstable,
             "children": [c.to_dict() for c in self.children],
+            "frame_id": self.frame_id,
+            "state_steps": self.state_steps,
+            "state_truncated": self.state_truncated,
         }
 
     @staticmethod
@@ -167,8 +184,11 @@ class Node:
             callsite=d.get("callsite", ""),
             handled=d.get("handled", False),
             volatile=list(d.get("volatile", [])),
+            frame_id=d.get("frame_id", ""),
         )
         n.lines = d.get("lines", [])
+        n.state_steps = list(d.get("state_steps", []))
+        n.state_truncated = bool(d.get("state_truncated", False))
         n.unstable = d.get("unstable", False)
         # v0.3 marked the whole node unstable. Preserve compatibility but
         # convert it to field masks so descendants remain comparable.
