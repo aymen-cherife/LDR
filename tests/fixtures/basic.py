@@ -49,3 +49,8 @@ class Explosive:
 def mutates(xs):
     xs.append(99)
     return len(xs)
+
+
+def rebinds(xs):
+    xs = [99]
+    return len(xs)

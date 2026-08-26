@@ -36,6 +36,7 @@ def _masked_own(node: Node, masks: set[str] | None = None) -> dict:
         "name": node.name,
         "in": inputs,
         "out": None if "out" in masks else node.out,
+        "input_changes": node.input_changes,
         "error": None if "error" in masks else node.error,
         "handled": None if "handled" in masks else node.handled,
     }

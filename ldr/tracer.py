@@ -179,6 +179,15 @@ class Recorder:
         return source_id, module, line, file, callsite
 
     def _arguments(self, code, frame, *, detailed: bool = False) -> dict[str, str]:
+        names = self._argument_names(code)
+        return {
+            name: (capture_state if detailed else capture)(frame.f_locals[name], name)
+            for name in names
+            if name in frame.f_locals and name not in ("self", "cls")
+        }
+
+    @staticmethod
+    def _argument_names(code) -> list[str]:
         names = list(code.co_varnames[: code.co_argcount + code.co_kwonlyargcount])
         index = code.co_argcount + code.co_kwonlyargcount
         if code.co_flags & inspect.CO_VARARGS:
@@ -186,11 +195,34 @@ class Recorder:
             index += 1
         if code.co_flags & inspect.CO_VARKEYWORDS:
             names.append(code.co_varnames[index])
-        return {
-            name: (capture_state if detailed else capture)(frame.f_locals[name], name)
-            for name in names
-            if name in frame.f_locals and name not in ("self", "cls")
-        }
+        return names
+
+    def _mutable_argument_evidence(self, code, frame) -> dict[str, tuple[int, str]]:
+        """Capture bounded entry state for common caller-owned mutable values."""
+        evidence: dict[str, tuple[int, str]] = {}
+        for name in self._argument_names(code):
+            if name in ("self", "cls") or name not in frame.f_locals:
+                continue
+            value = frame.f_locals[name]
+            if type(value) not in (dict, list, set, bytearray):
+                continue
+            evidence[name] = (id(value), capture_state(value, name))
+        return evidence
+
+    @staticmethod
+    def _finish_mutable_argument_evidence(entry: Node, frame) -> None:
+        """Record only in-place changes visible through the original object."""
+        for name, (object_id, before) in entry.__dict__.get(
+            "_mutable_argument_evidence", {}
+        ).items():
+            if name not in frame.f_locals:
+                continue
+            value = frame.f_locals[name]
+            if id(value) != object_id:
+                continue
+            after = capture_state(value, name)
+            if before != after:
+                entry.input_changes[name] = {"before": before, "after": after}
 
     def _next_frame_id(self, code) -> tuple[str, int]:
         source_id = self._source_id(code.co_filename)
@@ -222,6 +254,9 @@ class Recorder:
         node.__dict__["_t0"] = time.perf_counter()
         node.__dict__["_fid"] = id(frame)
         node.__dict__["_code"] = code
+        node.__dict__["_mutable_argument_evidence"] = self._mutable_argument_evidence(
+            code, frame
+        )
         return node
 
     def _new_shadow(
@@ -473,6 +508,8 @@ class Recorder:
         parent_stack, entry = matched
         if isinstance(entry, Node) and self._focus_matches(entry.frame_id):
             self._capture_state_transition(code, frame, None)
+        if isinstance(entry, Node):
+            self._finish_mutable_argument_evidence(entry, frame)
         self.suspended.pop(self._entry_fid(entry), None)
         _stack.set(parent_stack)
 

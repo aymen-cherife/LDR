@@ -1,4 +1,4 @@
-# Inspection ranking in LDR 0.5.1
+# Inspection ranking in LDR 0.5.2
 
 LDR's broad trace should answer a narrow agent question: **which observed
 invocation is worth one focused rerun?** It must not pretend that one failing
@@ -15,8 +15,10 @@ removed from the final shortlist:
 3. token overlap between its function/source identifiers and failure context;
 4. overlap between its captured inputs/output and values in the failure;
 5. whether an unhandled exception was recorded in the frame;
-6. a penalty for highly repetitive functions;
-7. a penalty for common diagnostic noise such as display/serialization helpers
+6. whether a mutable argument kept its identity but changed representation
+   during the call, including overlap with values from the failure;
+7. a penalty for highly repetitive functions;
+8. a penalty for common diagnostic noise such as display/serialization helpers
    and tracing/logging setup.
 
 Calls of the same function are collapsed to their strongest invocation. LDR
@@ -29,11 +31,17 @@ The weights are product heuristics, not learned probabilities. They are kept
 small, explicit, deterministic, and covered by behavioral tests so benchmark
 cases cannot silently become special rules.
 
+The mutable-input signal is intentionally narrow. LDR records it only for
+common built-in mutable containers whose object identity is unchanged from
+entry to exit. This avoids calling a local parameter rebind a caller-visible
+mutation. The evidence remains a bounded representation change, not a formal
+alias analysis or proof of defect.
+
 ## Research basis and limits
 
 - [Dynamic program slicing](https://doi.org/10.1145/93548.93576) motivates
   prioritizing statements and calls that actually executed for this input over
-  every location that could theoretically matter. LDR 0.5.1 records call-tree
+  every location that could theoretically matter. LDR 0.5.2 records call-tree
   and selected local-state evidence; it does **not** compute a formal dynamic
   dependence graph or claim to return a dynamic slice.
 - [Cause transitions](https://doi.org/10.1145/1062455.1062522) motivates the

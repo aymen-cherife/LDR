@@ -194,6 +194,16 @@ def test_arguments_are_captured_before_later_mutation():
     rec = record(lambda: b.mutates([1, 2]))
     assert rec.roots[0].in_["xs"] == "[1, 2]"
     assert "99" not in rec.roots[0].in_["xs"]
+    assert rec.roots[0].input_changes == {
+        "xs": {"before": "[1, 2]", "after": "[1, 2, 99]"}
+    }
+
+
+def test_local_argument_rebind_is_not_reported_as_caller_visible_mutation():
+    import fixtures.basic as b
+
+    rec = record(lambda: b.rebinds([1, 2]))
+    assert rec.roots[0].input_changes == {}
 
 
 def test_capture_never_raises():

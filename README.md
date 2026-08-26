@@ -89,8 +89,9 @@ Values and output are bounded, common credential fields are redacted, and result
 - [Agent skill](agents/ldr-debug-runtime/SKILL.md)
 - [Paired evaluation harness](evaluation/README.md)
 - [Latest SWE-bench-Live smoke test](evaluation/results/hypothesis-4532.md)
+- [Haystack mutation-ranking before/after](evaluation/results/haystack-8940-mutation-ranking-052.md)
 - [Hard random benchmark sample](evaluation/results/hard-random-sample-20260824.md)
 - [Competitive analysis](docs/competitive-analysis.md)
 - [Inspection ranking design](docs/inspection-ranking.md)
 
-LDR 0.5.1 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.
+LDR 0.5.2 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.

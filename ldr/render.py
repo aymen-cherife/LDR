@@ -29,6 +29,14 @@ C = {
 MAX_ARGS = 6
 
 
+def _compact_value(value: str, limit: int = 260) -> str:
+    if len(value) <= limit:
+        return value
+    head = (limit * 2) // 3
+    tail = limit - head - 23
+    return value[:head] + "... <value omitted> ..." + value[-tail:]
+
+
 def _sig(node: Node, color: bool) -> str:
     items = list(node.in_.items())
     cap = len(items) if node.error and not node.handled else MAX_ARGS
@@ -65,6 +73,10 @@ def _collapse(children: list[Node]) -> list[tuple[Node, int]]:
             child.out,
             child.error,
             child.handled,
+            tuple(
+                (name, change.get("before"), change.get("after"))
+                for name, change in sorted(child.input_changes.items())
+            ),
             len(child.children),
         )
         if output and output[-1][2] == key and not child.children:
@@ -99,6 +111,18 @@ def tree(
     output = [head]
     for line in node.lines:
         output.append("  " * (depth + 1) + line)
+    for name, change in list(node.input_changes.items())[:3]:
+        before = _compact_value(change.get("before", "<unavailable>"))
+        after = _compact_value(change.get("after", "<unavailable>"))
+        output.append(
+            "  " * (depth + 1)
+            + f"INPUT MUTATION {name}: {before} -> {after}"
+        )
+    if len(node.input_changes) > 3:
+        output.append(
+            "  " * (depth + 1)
+            + f"[{len(node.input_changes) - 3} more mutated input(s) in JSON]"
+        )
     children = node.children
     if failure_only:
         failing_children = [child for child in children if _failing(child)]

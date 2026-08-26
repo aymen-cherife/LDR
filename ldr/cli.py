@@ -651,7 +651,7 @@ def main(argv=None) -> int:
         argv, passthrough = argv[:index], argv[index + 1 :]
 
     parser = argparse.ArgumentParser(prog="ldr")
-    parser.add_argument("--version", action="version", version="ldr 0.5.1")
+    parser.add_argument("--version", action="version", version="ldr 0.5.2")
     parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("rest", nargs="*")

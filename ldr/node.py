@@ -213,6 +213,9 @@ class Node:
     state_steps: list[dict[str, Any]] = field(default_factory=list)
     state_truncated: bool = False
     unstable: bool = False
+    # Caller-visible changes to mutable arguments that retained object identity
+    # throughout the call. Values contain bounded entry/exit evidence.
+    input_changes: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def code_id(self) -> str:
@@ -229,6 +232,7 @@ class Node:
             "name": self.name,
             "in": self.in_,
             "out": self.out,
+            "input_changes": self.input_changes,
             "error": self.error,
             "ms": round(self.ms, 2),
             "module": self.module,
@@ -252,6 +256,7 @@ class Node:
             name=d["name"],
             in_=d.get("in", {}),
             out=d.get("out"),
+            input_changes=dict(d.get("input_changes", {})),
             error=d.get("error"),
             ms=d.get("ms", 0.0),
             module=d.get("module", ""),

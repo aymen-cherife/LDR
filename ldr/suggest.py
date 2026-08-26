@@ -195,6 +195,8 @@ def rank_inspections(
             "subtree_value_overlap": [],
             "distinct_observed_callees": distinct_callees,
             "recorded_calls": counts[node.code_id],
+            "mutated_inputs": [],
+            "mutation_value_overlap": [],
             "noise_penalty": None,
         }
         source_is_test = _is_test_source(node)
@@ -248,6 +250,24 @@ def rank_inspections(
             signals.append(
                 "captured value overlaps failure evidence: "
                 + ", ".join(value_overlap[:3])
+            )
+
+        mutated_inputs = sorted(node.input_changes)
+        mutation_tokens = _tokens(*(
+            value
+            for change in node.input_changes.values()
+            for value in (change.get("before", ""), change.get("after", ""))
+        ))
+        mutation_overlap = sorted(mutation_tokens & failure_value_tokens)
+        evidence["mutated_inputs"] = mutated_inputs[:6]
+        evidence["mutation_value_overlap"] = mutation_overlap[:6]
+        if mutated_inputs:
+            score += 32
+            score += min(12, len(mutation_overlap) * 4)
+            signals.insert(
+                0,
+                "caller-owned input changed in place during call: "
+                + ", ".join(mutated_inputs[:3]),
             )
 
         descendant_code = sorted(

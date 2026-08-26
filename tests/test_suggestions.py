@@ -176,3 +176,36 @@ def test_ranked_shortcut_inspects_all_calls_when_repetition_is_evidence(tmp_path
     assert second_focus.returncode == 1
     _, repeated = load_result(tmp_path)
     assert repeated["inspection"]["match_count"] == 2
+
+
+def test_input_mutator_outranks_read_only_predicate_and_shows_evidence(tmp_path):
+    (tmp_path / "pipeline.py").write_text(
+        "SENTINEL = object()\n"
+        "def is_lazy(socket):\n"
+        "    return False\n"
+        "def write_outputs(inputs, value, socket):\n"
+        "    if not is_lazy(socket):\n"
+        "        inputs['receiver'] = value\n"
+        "def test_existing_value_survives_sentinel():\n"
+        "    inputs = {'receiver': 'keep'}\n"
+        "    write_outputs(inputs, SENTINEL, object())\n"
+        "    assert inputs['receiver'] == 'keep'\n"
+    )
+
+    broad = invoke(
+        tmp_path,
+        "pytest",
+        "pipeline.py::test_existing_value_survives_sentinel",
+    )
+    assert broad.returncode == 1
+    text, payload = load_result(tmp_path)
+
+    first = payload["suggestions"][0]
+    assert first["function"] == "write_outputs"
+    assert first["evidence"]["mutated_inputs"] == ["inputs"]
+    assert first["reasons"][0] == (
+        "caller-owned input changed in place during call: inputs"
+    )
+    assert "INPUT MUTATION inputs:" in text
+    assert "'keep'" in text
+    assert "<object object at 0x*>" in text

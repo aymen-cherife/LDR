@@ -17,6 +17,8 @@ Read `.ldr/last.json`. Prioritize `failures`, `recent_calls`, and
 `suggestions`; treat a test assertion as the symptom unless application state
 proves otherwise. A suggestion is an inspection target, not a claimed defect.
 Check its `evidence` fields and form a runtime hypothesis before editing source.
+If `mutated_inputs` is present, compare its bounded before/after evidence in
+the failed path before spending a rerun on an adjacent read-only helper.
 
 Inspect the strongest evidence-backed candidate with its short id:
 
