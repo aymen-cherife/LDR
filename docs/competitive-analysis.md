@@ -15,10 +15,11 @@ LDR is not the first agent debugger and is not currently the most capable one. I
 
 ## Current scorecard
 
-| Capability | LDR 0.5 | ADI | AIDB | debug-gym |
+| Capability | LDR 0.5.1 | ADI | AIDB | debug-gym |
 | --- | ---: | ---: | ---: | ---: |
 | Automatic failing-path packet | Strong | Weak | Weak | Medium |
 | Selective local-state history | Medium | Strong | Strong, interactive | Strong, interactive |
+| Automatic ranked inspection targets | Medium | Weak | No | Tool-dependent |
 | Persistent pre/post-edit behavioral diff | Strong | Limited | No | No |
 | Bounded agent-readable output | Strong | Medium | Tool-dependent | Open issue |
 | Multi-language | No | No | Strong | Python debugger only |

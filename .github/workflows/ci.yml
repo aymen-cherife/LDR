@@ -42,7 +42,13 @@ jobs:
             tests/test_agent_contract.py::test_repeat_sampling_preserves_late_causal_success_before_assertion \
             tests/test_agent_contract.py::test_sampled_hot_parent_does_not_discard_novel_causal_child \
             tests/test_agent_contract.py::test_focused_capture_surfaces_nested_boolean_state_without_getters \
+            tests/test_agent_contract.py::test_focused_state_preserves_distinguishing_long_value_suffix \
             tests/test_agent_contract.py::test_wildcard_inspection_exposes_late_stateful_invocation \
+            tests/test_navigation.py::test_capture_limits_only_appear_when_capture_is_incomplete \
+            tests/test_suggestions.py::test_ranked_shortcut_finds_completed_production_frame_and_captures_state \
+            tests/test_suggestions.py::test_ranking_is_deterministic_and_downranks_diagnostic_noise \
+            tests/test_suggestions.py::test_wrong_explicit_scope_warns_and_names_detected_root \
+            tests/test_suggestions.py::test_ranked_shortcut_inspects_all_calls_when_repetition_is_evidence \
             tests/test_ldr.py::test_cli_pytest_mode_traces_the_code_under_test \
             tests/test_ldr.py::test_verify_snapshots_then_diffs \
             tests/test_ldr.py::test_run_mode_survives_a_real_crash \

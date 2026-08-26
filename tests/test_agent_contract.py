@@ -411,6 +411,32 @@ def test_focused_state_history_obeys_its_own_budget(tmp_path):
     assert frame["state_truncated"] is True
 
 
+def test_focused_state_preserves_distinguishing_long_value_suffix(tmp_path):
+    prefix = "x" * 120
+    (tmp_path / "state_value.py").write_text(
+        "def choose():\n"
+        f"    value = '{prefix}FIRST'\n"
+        f"    value = '{prefix}SECOND'\n"
+        "    return value\n"
+        "choose()\n"
+    )
+    broad = invoke(tmp_path, "run", "state_value.py")
+    assert broad.returncode == 0
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    selected = next(
+        frame["id"]
+        for frame in payload["frame_index"]["frames"]
+        if frame["function"] == "choose"
+    )
+
+    focused = invoke(tmp_path, "inspect", "--frame-id", str(selected))
+    assert focused.returncode == 0
+    frame = json.loads((tmp_path / ".ldr" / "last.json").read_text())["inspection"]["frames"][0]
+    rendered = json.dumps(frame["state_steps"])
+    assert "FIRST" in rendered
+    assert "SECOND" in rendered
+
+
 def test_wildcard_inspection_exposes_late_stateful_invocation(tmp_path):
     (tmp_path / "stateful.py").write_text(
         "class Item:\n"

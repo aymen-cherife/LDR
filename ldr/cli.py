@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import math
 import os
 import runpy
+import shlex
 import signal
 import subprocess
 import sys
 import tempfile
+import time
+import tomllib
 from typing import Any
 
 from .diff import align, diff_tree, mark_unstable, rank
@@ -26,11 +30,16 @@ from .store import (
     save_trace,
     snapshot_path,
 )
+from .suggest import rank_inspections
 from .tracer import Recorder
 
 LDR_DIR = ".ldr"
 _KNOWN_RUNNERS = {"unittest", "pytest", "doctest", "pdb", "cProfile", "trace", "timeit"}
 _PROJECT_MARKERS = (".git", "pyproject.toml", "setup.cfg", "setup.py", "tox.ini")
+_PACKAGE_ROOT_EXCLUDES = {
+    ".git", ".github", ".ldr", ".tox", ".venv", "build", "dist", "docs",
+    "documentation", "examples", "scripts", "test", "tests", "tools", "venv",
+}
 
 
 class _RunTimedOut(BaseException):
@@ -184,6 +193,215 @@ def _display_scope(paths: list[str], cwd: str) -> list[str]:
     return displayed
 
 
+def _detect_production_roots(project_root: str) -> list[str]:
+    """Detect common Python package roots without importing target code."""
+    candidates: list[str] = []
+    pyproject_path = os.path.join(project_root, "pyproject.toml")
+    config: dict[str, Any] = {}
+    try:
+        with open(pyproject_path, "rb") as handle:
+            config = tomllib.load(handle)
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        pass
+
+    tool = config.get("tool", {}) if isinstance(config, dict) else {}
+    setuptools = tool.get("setuptools", {}) if isinstance(tool, dict) else {}
+    package_dir = (
+        setuptools.get("package-dir", {}) if isinstance(setuptools, dict) else {}
+    )
+    if isinstance(package_dir, dict) and isinstance(package_dir.get(""), str):
+        candidates.append(package_dir[""])
+    package_find = (
+        setuptools.get("packages", {}) if isinstance(setuptools, dict) else {}
+    )
+    package_find = (
+        package_find.get("find", {}) if isinstance(package_find, dict) else {}
+    )
+    where = package_find.get("where", []) if isinstance(package_find, dict) else []
+    if isinstance(where, str):
+        where = [where]
+    if isinstance(where, list):
+        candidates.extend(item for item in where if isinstance(item, str))
+
+    poetry = tool.get("poetry", {}) if isinstance(tool, dict) else {}
+    packages = poetry.get("packages", []) if isinstance(poetry, dict) else []
+    if isinstance(packages, list):
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            source = package.get("from")
+            include = package.get("include")
+            if isinstance(source, str):
+                candidates.append(source)
+            elif isinstance(include, str):
+                candidates.append(include.split(".", 1)[0])
+
+    hatch = tool.get("hatch", {}) if isinstance(tool, dict) else {}
+    build = hatch.get("build", {}) if isinstance(hatch, dict) else {}
+    targets = build.get("targets", {}) if isinstance(build, dict) else {}
+    wheel = targets.get("wheel", {}) if isinstance(targets, dict) else {}
+    hatch_packages = wheel.get("packages", []) if isinstance(wheel, dict) else []
+    if isinstance(hatch_packages, list):
+        candidates.extend(item for item in hatch_packages if isinstance(item, str))
+
+    src = os.path.join(project_root, "src")
+    if os.path.isdir(src):
+        candidates.append("src")
+    try:
+        entries = sorted(os.scandir(project_root), key=lambda entry: entry.name)
+    except OSError:
+        entries = []
+    for entry in entries:
+        if (
+            entry.is_dir(follow_symlinks=False)
+            and entry.name.lower() not in _PACKAGE_ROOT_EXCLUDES
+            and os.path.isfile(os.path.join(entry.path, "__init__.py"))
+        ):
+            candidates.append(entry.name)
+
+    discovered: list[str] = []
+    for candidate in candidates:
+        absolute = os.path.realpath(os.path.join(project_root, candidate))
+        if os.path.isdir(absolute) and absolute not in discovered:
+            discovered.append(absolute)
+    roots: list[str] = []
+    for candidate in sorted(discovered, key=lambda path: (len(path), path)):
+        try:
+            if any(os.path.commonpath((candidate, root)) == root for root in roots):
+                continue
+        except ValueError:
+            pass
+        roots.append(candidate)
+    return roots
+
+
+def _is_test_node(node: Node) -> bool:
+    source = (node.source_id or node.file).replace("\\", "/").lower()
+    basename = source.rsplit("/", 1)[-1]
+    leaf = node.name.rsplit(".", 1)[-1]
+    return (
+        leaf.startswith("test_")
+        or "/tests/" in f"/{source}"
+        or basename.startswith("test_")
+        or basename == "conftest.py"
+    )
+
+
+def _trace_has_production_frame(roots: list[Node], production_roots: list[str]) -> bool:
+    for root in roots:
+        for node in root.walk():
+            if _is_test_node(node):
+                continue
+            filename = os.path.realpath(node.file) if node.file else ""
+            for production_root in production_roots:
+                try:
+                    if (
+                        filename
+                        and os.path.commonpath((filename, production_root))
+                        == production_root
+                    ):
+                        return True
+                except ValueError:
+                    continue
+    return False
+
+
+def _scope_setup(
+    explicit: list[str] | None,
+    project_root: str,
+    entry_dirs: list[str],
+    initial_cwd: str,
+) -> tuple[list[str], list[str], list[str]]:
+    detected = _detect_production_roots(project_root)
+    warnings: list[str] = []
+    if explicit:
+        scope = list(explicit)
+        missing = [item for item in explicit if not os.path.exists(item)]
+        if missing:
+            shown = ", ".join(repr(item) for item in missing)
+            suggestion = _display_scope(detected, initial_cwd)
+            suffix = (
+                f" Detected production roots: {' '.join(suggestion)}."
+                if suggestion
+                else ""
+            )
+            warnings.append(f"Explicit --only path(s) do not exist: {shown}.{suffix}")
+    else:
+        scope = list(detected) or [project_root]
+    for directory in entry_dirs:
+        if directory not in scope:
+            scope.append(directory)
+    return scope, detected, warnings
+
+
+def _rerun_payload(
+    args,
+    scope: list[str],
+    initial_cwd: str,
+    project_root: str,
+) -> dict[str, Any]:
+    displayed_project_root = project_root
+    try:
+        if os.path.commonpath((project_root, initial_cwd)) == initial_cwd:
+            displayed_project_root = os.path.relpath(project_root, initial_cwd)
+    except (OSError, ValueError):
+        pass
+    return {
+        "runner": args.mode,
+        "target": args.target,
+        "arguments": list(args.rest),
+        "scope": _display_scope(scope, initial_cwd),
+        "project_root": displayed_project_root,
+    }
+
+
+def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
+    """Restore a broad invocation for ``ldr inspect --frame-id N``."""
+    result_path = os.path.join(ldr_dir, "last.json")
+    try:
+        with open(result_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        parser.error(f"--frame-id requires a readable {result_path}: {exc}")
+    frame = next(
+        (
+            item for item in payload.get("frame_index", {}).get("frames", [])
+            if item.get("id") == args.frame_id
+        ),
+        None,
+    )
+    if frame is None:
+        parser.error(f"frame id {args.frame_id} is not present in {result_path}")
+    suggestion = next(
+        (
+            item for item in payload.get("suggestions", [])
+            if item.get("id") == args.frame_id
+        ),
+        None,
+    )
+    prior_inspection = payload.get("inspection", {})
+    repeated_selector = (
+        prior_inspection.get("requested_frame")
+        if prior_inspection.get("requested_id") == args.frame_id
+        else None
+    )
+    rerun = payload.get("rerun")
+    if not isinstance(rerun, dict) or not rerun.get("target"):
+        parser.error(
+            "the previous result predates frame-id reruns; run a fresh broad trace"
+        )
+    args.frame = (
+        suggestion.get("selector")
+        if suggestion
+        else repeated_selector or frame.get("frame_id")
+    )
+    args.target = rerun["target"]
+    args.rest = list(rerun.get("arguments", []))
+    args.only = list(rerun.get("scope", [])) or None
+    args.runner = rerun.get("runner", "auto")
+    args.project_root = rerun.get("project_root")
+
+
 def _status(recorder: Recorder) -> dict[str, Any]:
     return {
         "ok": recorder.exit_code == 0 and not recorder.crashed,
@@ -276,14 +494,18 @@ def _failure_payload(roots: list[Node]) -> list[dict[str, Any]]:
     return failures
 
 
-def _frame_index(roots: list[Node], limit: int = 500) -> dict[str, Any]:
+def _frame_index(roots: list[Node], limit: int = 5000) -> dict[str, Any]:
     frames: list[dict[str, Any]] = []
     functions: dict[tuple[str, str], dict[str, Any]] = {}
+    next_id = 0
 
     def visit(node: Node, parent_id: str | None) -> None:
+        nonlocal next_id
+        next_id += 1
         if len(frames) < limit:
             frames.append(
                 {
+                    "id": next_id,
                     "frame_id": node.frame_id,
                     "parent_id": parent_id,
                     "function": node.name,
@@ -419,6 +641,7 @@ def _probe(
 
 
 def main(argv=None) -> int:
+    total_started = time.perf_counter()
     initial_cwd = os.path.realpath(os.getcwd())
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -428,9 +651,9 @@ def main(argv=None) -> int:
         argv, passthrough = argv[:index], argv[index + 1 :]
 
     parser = argparse.ArgumentParser(prog="ldr")
-    parser.add_argument("--version", action="version", version="ldr 0.5.0")
+    parser.add_argument("--version", action="version", version="ldr 0.5.1")
     parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect"])
-    parser.add_argument("target")
+    parser.add_argument("target", nargs="?")
     parser.add_argument("rest", nargs="*")
     parser.add_argument("--runner", choices=["auto", "run", "pytest", "module"], default="auto")
     parser.add_argument(
@@ -452,6 +675,11 @@ def main(argv=None) -> int:
         "--frame",
         help="portable frame id, or a function selector ending in #*, for a focused re-run",
     )
+    parser.add_argument(
+        "--frame-id",
+        type=int,
+        help="short frame id from the latest result; restores and reruns its invocation",
+    )
     parser.add_argument("--max-state-steps", type=int, default=200)
     parser.add_argument("--timeout", type=float, default=300)
     args, unknown = parser.parse_known_args(argv)
@@ -470,17 +698,28 @@ def main(argv=None) -> int:
         parser.error("--timeout must be a finite non-negative number")
 
     requested_mode = args.mode
+    if args.frame_id is not None:
+        if requested_mode != "inspect":
+            parser.error("--frame-id is only valid with inspect")
+        if args.frame_id < 1:
+            parser.error("--frame-id must be a positive integer")
+        if args.target is not None or args.frame is not None or args.rest:
+            parser.error("inspect --frame-id does not accept a target, --frame, or arguments")
+        _restore_frame_shortcut(args, parser, ldr_dir)
+    elif args.target is None:
+        parser.error("target is required (or use inspect --frame-id N)")
+
     if requested_mode in ("verify", "inspect"):
         args.mode = _infer_runner(args.target) if args.runner == "auto" else args.runner
     elif args.runner != "auto":
         parser.error("--runner is only valid with verify or inspect")
     if requested_mode == "inspect":
         if not args.frame:
-            parser.error("inspect requires --frame from a previous LDR result")
+            parser.error("inspect requires --frame or --frame-id from a previous LDR result")
         if args.golden or args.diff or args.learn_volatility:
             parser.error("inspect cannot save or compare snapshots")
-    elif args.frame:
-        parser.error("--frame is only valid with inspect")
+    elif args.frame or args.frame_id is not None:
+        parser.error("--frame and --frame-id are only valid with inspect")
 
     if args.project_root:
         project_root = os.path.realpath(args.project_root)
@@ -503,10 +742,12 @@ def main(argv=None) -> int:
         print(message, file=sys.stderr)
         return 2
 
-    scope = list(args.only) if args.only else [project_root]
-    for directory in _entry_dirs(args.mode, args.target, args.rest):
-        if directory not in scope:
-            scope.append(directory)
+    scope, detected_roots, scope_warnings = _scope_setup(
+        list(args.only) if args.only else None,
+        project_root,
+        _entry_dirs(args.mode, args.target, args.rest),
+        initial_cwd,
+    )
     invocation = invocation_descriptor(
         args.mode,
         args.target,
@@ -554,6 +795,7 @@ def main(argv=None) -> int:
             if int(code) != 0:
                 raise SystemExit(int(code))
 
+    execution_started = time.perf_counter()
     try:
         recorder = _record(
             go,
@@ -579,8 +821,28 @@ def main(argv=None) -> int:
         _write_result(message, payload, ldr_dir)
         print(message, file=sys.stderr)
         return 2
+    execution_finished = time.perf_counter()
 
     status = _status(recorder)
+    status["timing"] = {
+        "execution_seconds": round(execution_finished - execution_started, 6),
+    }
+    if (
+        recorder.exit_code != 0
+        and detected_roots
+        and not _trace_has_production_frame(recorder.roots, detected_roots)
+    ):
+        suggested_scope = _display_scope(
+            detected_roots + _entry_dirs(args.mode, args.target, args.rest),
+            initial_cwd,
+        )
+        command = shlex.join(
+            ["ldr", args.mode, args.target, "--only", *dict.fromkeys(suggested_scope)]
+        )
+        scope_warnings.append(
+            "The trace captured no frames from a detected production package. "
+            f"Try: {command}"
+        )
     probe_path = os.environ.get("LDR_PROBE")
     if probe_path:
         save_trace(probe_path, recorder.roots, invocation=invocation, status=status)
@@ -611,12 +873,26 @@ def main(argv=None) -> int:
             f"RUN STATUS: {'PASSED' if recorder.exit_code == 0 else 'FAILED'} "
             f"(exit {recorder.exit_code})\n\n"
         )
+        status["timing"].update(
+            {
+                "postprocess_seconds": round(time.perf_counter() - execution_finished, 6),
+                "total_seconds": round(time.perf_counter() - total_started, 6),
+            }
+        )
+        run_note += (
+            "TIMING: "
+            f"execution={status['timing']['execution_seconds']:.3f}s "
+            f"postprocess={status['timing']['postprocess_seconds']:.3f}s "
+            f"total={status['timing']['total_seconds']:.3f}s\n\n"
+        )
         text = _limit_text(run_note + text, args.max_lines)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "invocation": invocation,
+            "rerun": _rerun_payload(args, scope, initial_cwd, project_root),
             "status": status,
             "inspection": {
+                "requested_id": args.frame_id,
                 "requested_frame": args.frame,
                 "matched": bool(inspected),
                 "match_count": len(inspected),
@@ -640,7 +916,9 @@ def main(argv=None) -> int:
     changes = []
     snapshot_action = "none"
     frame_index_payload = _frame_index(recorder.roots)
+    suggestions = rank_inspections(recorder.roots, frame_index_payload)
     display_scope = _display_scope(scope, initial_cwd)
+    rerun = _rerun_payload(args, scope, initial_cwd, project_root)
     try:
         if args.golden:
             if args.learn_volatility:
@@ -653,12 +931,13 @@ def main(argv=None) -> int:
             text = render_run(
                 recorder.roots,
                 args.color,
-                bool(recorder.dropped_nodes),
+                recorder.truncated,
                 args.full,
                 args.max_lines,
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,
                 frame_index=frame_index_payload,
+                suggestions=suggestions if recorder.exit_code != 0 else None,
                 command_target=args.target,
                 scope=display_scope,
                 status=status,
@@ -688,12 +967,13 @@ def main(argv=None) -> int:
             text = render_run(
                 recorder.roots,
                 args.color,
-                bool(recorder.dropped_nodes),
+                recorder.truncated,
                 args.full,
                 args.max_lines,
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,
                 frame_index=frame_index_payload,
+                suggestions=suggestions if recorder.exit_code != 0 else None,
                 command_target=args.target,
                 scope=display_scope,
                 status=status,
@@ -726,10 +1006,25 @@ def main(argv=None) -> int:
         note += "\n"
     else:
         note = "RUN STATUS: PASSED\n\n"
+    if scope_warnings:
+        note += "SCOPE WARNING\n" + "\n".join(f"- {warning}" for warning in scope_warnings) + "\n\n"
+    status["timing"].update(
+        {
+            "postprocess_seconds": round(time.perf_counter() - execution_finished, 6),
+            "total_seconds": round(time.perf_counter() - total_started, 6),
+        }
+    )
+    note += (
+        "TIMING: "
+        f"execution={status['timing']['execution_seconds']:.3f}s "
+        f"postprocess={status['timing']['postprocess_seconds']:.3f}s "
+        f"total={status['timing']['total_seconds']:.3f}s\n\n"
+    )
     text = _limit_text(note + text, args.max_lines)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "invocation": invocation,
+        "rerun": rerun,
         "status": status,
         "snapshot": {"key": key, "path": golden_path, "action": snapshot_action},
         "behavior": {
@@ -737,6 +1032,11 @@ def main(argv=None) -> int:
             "finding_count": len(changes),
         },
         "frame_index": frame_index_payload,
+        "suggestions": suggestions,
+        "scope": {
+            "detected_production_roots": _display_scope(detected_roots, initial_cwd),
+            "warnings": scope_warnings,
+        },
         "findings": _finding_payload(changes),
         "failures": _failure_payload(recorder.roots),
     }

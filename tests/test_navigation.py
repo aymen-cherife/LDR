@@ -2,11 +2,9 @@
 
 import json
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,16 +45,17 @@ def test_copyable_command_handles_spaces_and_resolves_from_original_cwd(tmp_path
     )
     assert broad.returncode == 1
     text, payload = load_result(tmp_path)
-    command = next(
-        line.strip() for line in text.splitlines() if line.strip().startswith("ldr inspect ")
+    command_line = next(
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("Run: ldr inspect ")
     )
-    argv = shlex.split(command)
+    argv = command_line.removeprefix("Run: ").split()
 
-    assert argv.count("space project") == 1
-    assert argv[2] == "space project/test_calc.py"
-    assert argv[argv.index("--frame") + 1] in {
-        frame["frame_id"] for frame in payload["frame_index"]["frames"]
-    }
+    assert argv[:3] == ["ldr", "inspect", "--frame-id"]
+    assert int(argv[3]) in {item["id"] for item in payload["suggestions"]}
+    assert payload["rerun"]["target"] == "space project/test_calc.py"
+    assert payload["rerun"]["scope"] == ["space project"]
 
     focused = invoke(tmp_path, *argv[1:])
     assert focused.returncode == 1
@@ -100,11 +99,12 @@ def test_broad_output_is_compact_and_does_not_claim_uncaptured_semantics(tmp_pat
     assert result.returncode == 1
     text, _ = load_result(tmp_path)
 
-    assert "FOCUSED FOLLOW-UP" in text
+    assert "SUGGESTED INSPECTIONS" in text
+    assert "not claimed bug locations" in text
     assert "EVENT SEQUENCE" not in text
     assert "VALUE TRANSITIONS" not in text
     assert "INPUT MUTATIONS" not in text
-    assert len(text.splitlines()) < 20
+    assert len(text.splitlines()) < 35
 
 
 def test_capture_limits_only_appear_when_capture_is_incomplete(tmp_path):

@@ -164,20 +164,29 @@ def _inspection_command(target: str, scope: list[str] | None, frame: str) -> str
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
-def _render_available_inspections(
-    frame_index: dict,
-    command_target: str,
-    scope: list[str] | None,
-) -> list[str]:
-    frames = frame_index.get("frames", [])
-    lines: list[str] = ["", "FOCUSED FOLLOW-UP"]
-    for fr in frames[:4]:
-        fid = fr.get("frame_id") or ""
-        if fid:
-            lines.append(f"  {_inspection_command(command_target, scope, fid)}")
-    if len(frames) > 4:
-        lines.append(f"  [{len(frames) - 4} more frame selectors in .ldr/last.json]")
-    lines.append("  Replace #N with #* to inspect every recorded call of that function.")
+def _render_suggested_inspections(suggestions: list[dict]) -> list[str]:
+    lines: list[str] = ["", "SUGGESTED INSPECTIONS"]
+    if not suggestions:
+        lines.append("  No completed project frame could be ranked from this capture.")
+        lines.append("  Review .ldr/last.json frame_index or correct the source scope.")
+        return lines
+    for position, suggestion in enumerate(suggestions[:3], 1):
+        location = (
+            f" @ {suggestion.get('location')}"
+            if suggestion.get("location")
+            else ""
+        )
+        lines.append(
+            f"{position}. frame {suggestion.get('id')} — "
+            f"{suggestion.get('function')}{location}"
+        )
+        for reason in suggestion.get("reasons", [])[:2]:
+            lines.append(f"   Reason: {reason}")
+        if suggestion.get("match_strategy") == "all_calls":
+            calls = suggestion.get("evidence", {}).get("recorded_calls")
+            lines.append(f"   Inspect: all {calls} recorded calls of this function")
+        lines.append(f"   Run: ldr inspect --frame-id {suggestion.get('id')}")
+    lines.append("  These are evidence-ranked follow-ups, not claimed bug locations.")
     return lines
 
 
@@ -191,6 +200,7 @@ def render_run(
     sampled_nodes: int = 0,
     *,
     frame_index: dict | None = None,
+    suggestions: list[dict] | None = None,
     command_target: str | None = None,
     scope: list[str] | None = None,
     status: dict | None = None,
@@ -211,20 +221,24 @@ def render_run(
         top = roots if full else [root for root in roots if _informative(root)]
         for root, repetitions in _collapse(top):
             blocks.extend(tree(root, color, prune=not full, count=repetitions))
-    if truncated:
+    if truncated and dropped_nodes:
         detail = (
             f"; {dropped_nodes} overflow path(s) switched to exception-only monitoring"
             if dropped_nodes
             else ""
         )
-        blocks.extend(("", f"[trace budget reached{detail}; late exceptions remain visible]"))
+        blocks.extend(
+            ("", f"[trace node budget reached{detail}; late exceptions remain visible]")
+        )
+    elif truncated and not sampled_nodes:
+        blocks.extend(("", "[trace capture is incomplete; consult CAPTURE LIMITS]"))
     if sampled_nodes:
         blocks.extend((
             "",
             f"[{sampled_nodes} repetitive call(s) sampled; early and power-of-two calls retained]",
         ))
-    if frame_index is not None and command_target is not None:
-        blocks.extend(_render_available_inspections(frame_index, command_target, scope))
+    if suggestions is not None:
+        blocks.extend(_render_suggested_inspections(suggestions))
     if truncated or sampled_nodes:
         recorded = (
             status.get("recorded_nodes")
@@ -384,13 +398,41 @@ def render_inspection(
         lines.append("STATE TRANSITIONS")
         if not node.state_steps:
             lines.append("(no Python local-state transitions were captured)")
+        meaningful_steps = []
         for step in node.state_steps:
+            statement = (step.get("statement") or "").strip()
+            control_flow = statement.startswith(
+                (
+                    "if ",
+                    "elif ",
+                    "else",
+                    "for ",
+                    "async for ",
+                    "while ",
+                    "match ",
+                    "case ",
+                    "return ",
+                    "raise ",
+                    "yield ",
+                )
+            )
+            mutation = any(
+                marker in statement
+                for marker in (".add(", ".append(", ".extend(", ".put(", ".put_nowait(")
+            )
+            if step.get("changes") or control_flow or mutation:
+                meaningful_steps.append(step)
+        hidden_steps = len(node.state_steps) - len(meaningful_steps)
+        for step in meaningful_steps:
             statement = step.get("statement") or "<source unavailable>"
             lines.append(f"{step.get('line', '?')} | {statement}")
             for change in step.get("changes", []):
                 lines.append(
-                    f"    {change.get('name')}: {change.get('before')} -> {change.get('after')}"
+                    f"    {change.get('name')}: {change.get('before')} "
+                    f"-> {change.get('after')}"
                 )
+        if hidden_steps:
+            lines.append(f"[{hidden_steps} low-signal state step(s) hidden]")
         if node.state_truncated:
             lines.append("[state-step budget reached; remaining transitions omitted]")
         if command_target:

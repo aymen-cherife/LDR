@@ -21,25 +21,32 @@ pip install -e .
 Start with one failing test:
 
 ```bash
-ldr pytest tests/test_orders.py::test_refund --only src tests
+ldr pytest tests/test_orders.py::test_refund
 ```
 
-Pytest collection is excluded from the trace, so imports do not consume the runtime budget. The result includes stable frame IDs. Select a suspicious invocation and inspect only its local-state transitions:
+Pytest collection is excluded from the trace, so imports do not consume the runtime budget. LDR detects common `src/` and flat-package layouts, ranks up to three observed frames for follow-up, and prints a short command for each. Inspect the strongest candidate with:
 
 ```bash
-ldr inspect tests/test_orders.py::test_refund \
-  --frame 'src/orders.py:42:calculate_refund#1' \
-  --only src tests
+ldr inspect --frame-id 37
 ```
+
+That command restores the test target, runner, source scope, project root, and
+portable frame selector from the previous result, reruns the test, and captures
+ordered local-state transitions only for that invocation.
 
 LDR preserves the test runner's exit status and writes:
 
 - `.ldr/last.json` — structured output for agents and tooling
 - `.ldr/last.txt` — a compact human-readable trace
 
+The suggestions are evidence-ranked inspection targets, not claimed bug
+locations. Their scores use only facts from the captured execution. The JSON
+contains the component signals and exact LDR execution, post-processing, and
+total wall times.
+
 For a stateful function called many times, use the function's
 `inspect_selector` from `.ldr/last.json` to inspect every invocation in one
-rerun:
+rerun. This explicit form remains available for advanced use:
 
 ```bash
 ldr inspect tests/test_orders.py::test_refund \
@@ -67,6 +74,7 @@ The second run reports what changed in the execution tree. Snapshots are scoped 
 --max-nodes 5000            Bound the full trace
 --max-calls-per-function 8  Sample repetitive hot calls after the first eight
 --max-lines 200             Bound the prose output
+--frame-id N                Restore and inspect a ranked frame from the latest result
 --frame FRAME_ID            Inspect one invocation or a function selector ending #*
 --max-state-steps 200       Bound focused local-state history
 --learn-volatility          Mask fields that vary across repeated runs
@@ -83,5 +91,6 @@ Values and output are bounded, common credential fields are redacted, and result
 - [Latest SWE-bench-Live smoke test](evaluation/results/hypothesis-4532.md)
 - [Hard random benchmark sample](evaluation/results/hard-random-sample-20260824.md)
 - [Competitive analysis](docs/competitive-analysis.md)
+- [Inspection ranking design](docs/inspection-ranking.md)
 
-LDR 0.5 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.
+LDR 0.5.1 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.

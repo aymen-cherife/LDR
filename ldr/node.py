@@ -19,6 +19,19 @@ _repr.maxset = 6
 _repr.maxarray = 6
 _repr.maxlevel = 3
 
+# A focused inspection is already bounded by max_state_steps, so it can afford
+# enough value detail to distinguish nearby runtime states.  This remains
+# reprlib-bounded and uses the same redaction path as broad capture.
+_state_repr = reprlib.Repr()
+_state_repr.maxstring = 320
+_state_repr.maxother = 500
+_state_repr.maxlist = 10
+_state_repr.maxtuple = 10
+_state_repr.maxdict = 10
+_state_repr.maxset = 10
+_state_repr.maxarray = 10
+_state_repr.maxlevel = 4
+
 
 # Default object.__repr__ embeds the memory address. Across two processes
 # that address is always different, so on real code EVERY object-valued
@@ -115,9 +128,12 @@ def capture(value: Any, name: str | None = None) -> str:
 
 def capture_state(value: Any, name: str | None = None) -> str:
     """Capture a focused local plus bounded, side-effect-free boolean object state."""
-    rendered = capture(value, name)
     if name is not None and is_secret_name(name):
-        return rendered
+        return "<redacted>"
+    try:
+        rendered = _redact_text(_state_repr.repr(_redact_value(value)))
+    except Exception:
+        rendered = capture(value, name)
     try:
         attributes = vars(value)
     except Exception:

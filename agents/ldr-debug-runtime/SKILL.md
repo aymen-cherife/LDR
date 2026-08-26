@@ -10,20 +10,28 @@ Reproduce the failure normally before using LDR. Keep the target to one failing 
 Run a bounded evidence pass:
 
 ```bash
-ldr pytest tests/test_feature.py::test_case --only src tests
+ldr pytest tests/test_feature.py::test_case
 ```
 
-Read `.ldr/last.json`. Prioritize `failures`, `recent_calls`, and `frame_index`; treat a test assertion as the symptom unless application state proves otherwise. Form a runtime hypothesis before editing source.
+Read `.ldr/last.json`. Prioritize `failures`, `recent_calls`, and
+`suggestions`; treat a test assertion as the symptom unless application state
+proves otherwise. A suggestion is an inspection target, not a claimed defect.
+Check its `evidence` fields and form a runtime hypothesis before editing source.
 
-When the broad pass identifies a suspicious successful call, copy its `frame_id` and inspect that exact invocation:
+Inspect the strongest evidence-backed candidate with its short id:
 
 ```bash
-ldr inspect tests/test_feature.py::test_case \
-  --frame 'src/feature.py:42:calculate#1' \
-  --only src tests
+ldr inspect --frame-id 37
 ```
 
-Use the ordered state transitions to identify the statement that first violates the expected invariant. If the frame is missed, rerun the broad trace and select a fresh id; execution order changed.
+LDR restores the prior runner, target, arguments, source scope, project root,
+and portable frame selector. Use the ordered state transitions to identify the
+first observed statement where an expected invariant becomes false. If the
+frame is missed, rerun the broad trace because execution order changed.
+
+If automatic scope detection warns that no production package was captured,
+fix the scope before interpreting the rankings. Do not accept test-only
+evidence as production localization.
 
 If a repeated function may behave differently across invocations, use its
 `frame_index.functions[].inspect_selector` to inspect every invocation in one
