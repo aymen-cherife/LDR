@@ -112,6 +112,12 @@ def redact(text: str) -> tuple[str, int]:
         if secret in text:
             count += text.count(secret)
             text = text.replace(secret, f"<secret from env {name}>")
+    # A credential given on the command line is a secret wherever it shows up
+    # (for example inside the argv list a traced function receives).
+    for secret in sorted(_argv_secrets, key=len, reverse=True):
+        if len(secret) >= _ENV_MIN_LENGTH and secret in text:
+            count += text.count(secret)
+            text = text.replace(secret, "<secret from the command line>")
     lowered = text.lower()
     for label, pattern, group in _SHAPES:
         if not any(marker in lowered for marker in _MARKERS[label]):
@@ -131,3 +137,74 @@ def redact(text: str) -> tuple[str, int]:
 
 def contains_secret(text: str) -> bool:
     return redact(text)[1] > 0
+
+
+# On a command line a bare `--token` or `--auth` is a credential, unlike a
+# variable called `token` in parser code, so flags get a slightly wider list.
+_SECRET_FLAGS = {"token", "auth", "pass", "pwd", "bearer", "apikey"}
+
+
+def _secret_flag(argument: str) -> tuple[str, str | None] | None:
+    """For ``--name`` or ``--name=value`` return (name, value-or-None) if the name is secret."""
+    if not argument.startswith("-"):
+        return None
+    name, equals, value = argument.lstrip("-").partition("=")
+    normalized = name.lower().replace("-", "_")
+    if normalized in _SECRET_FLAGS or is_secret_name(normalized):
+        return name, (value if equals else None)
+    return None
+
+
+_argv_secrets: set[str] = set()
+
+
+def register_argv_secrets(argv: list[str]) -> None:
+    """Remember values given to secret flags on the raw command line.
+
+    argparse can separate ``--token VALUE`` (the value lands among the
+    positionals), so the pairing is learned from the raw order, once.
+    """
+    _argv_secrets.clear()
+    hide_next = False
+    for argument in argv:
+        if hide_next and not argument.startswith("-"):
+            _argv_secrets.add(argument)
+            hide_next = False
+            continue
+        hide_next = False
+        flag = _secret_flag(argument)
+        if flag is not None:
+            name, value = flag
+            if value is None:
+                hide_next = True
+            elif value:
+                _argv_secrets.add(value)
+
+
+def redact_argv(arguments: list[str]) -> list[str]:
+    """Redact credentials on a command line: ``--password=x``, ``--token x`` and
+    any argument that matches the value detectors."""
+    result: list[str] = []
+    hide_next = False
+    for argument in arguments:
+        if argument in _argv_secrets:
+            result.append(by_name_placeholder(argument))
+            hide_next = False
+            continue
+        if hide_next and not argument.startswith("-"):
+            result.append(by_name_placeholder(argument))
+            hide_next = False
+            continue
+        hide_next = False
+        flag = _secret_flag(argument)
+        if flag is not None:
+            name, value = flag
+            dashes = argument[: len(argument) - len(argument.lstrip("-"))]
+            if value is None:
+                hide_next = "=" not in argument
+                result.append(argument)
+            else:
+                result.append(f"{dashes}{name}={by_name_placeholder(value)}")
+            continue
+        result.append(redact(argument)[0])
+    return result

@@ -28,6 +28,7 @@ from .diff import (
 )
 from .gitinfo import describe_commit, describe_outcome, git_state
 from .node import Node, capture_error, count_redacted
+from .redact import redact_argv, register_argv_secrets
 from .render import render_call_chain, render_diff, render_inspection, render_run
 from .store import (
     SCHEMA_VERSION,
@@ -360,7 +361,7 @@ def _rerun_payload(
     return {
         "runner": args.mode,
         "target": args.target,
-        "arguments": list(args.rest),
+        "arguments": redact_argv(list(args.rest)),
         "scope": _display_scope(scope, initial_cwd),
         "project_root": displayed_project_root,
     }
@@ -400,6 +401,12 @@ def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
     if not isinstance(rerun, dict) or not rerun.get("target"):
         parser.error(
             "the previous result predates frame-id reruns; run a fresh broad trace"
+        )
+    if any("<secret" in str(argument) for argument in rerun.get("arguments", [])):
+        parser.error(
+            "the previous run's arguments contained credentials that LDR redacted, so it "
+            "cannot rerun them; call inspect with the target, --frame and the real "
+            "arguments instead of --frame-id"
         )
     args.frame = (
         suggestion.get("selector")
@@ -666,6 +673,7 @@ def main(argv=None) -> int:
     initial_cwd = os.path.realpath(os.getcwd())
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)
     argv = list(sys.argv[1:] if argv is None else argv)
+    register_argv_secrets(argv)
     timeout_requested = any(a == "--timeout" or a.startswith("--timeout=") for a in argv)
     passthrough: list[str] = []
     if "--" in argv:

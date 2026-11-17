@@ -9,6 +9,7 @@ import tempfile
 from typing import Any
 
 from .node import Node
+from .redact import redact_argv
 
 SCHEMA_VERSION = 7
 
@@ -54,7 +55,10 @@ def invocation_descriptor(
     return {
         "runner": runner,
         "target": normalized_target,
-        "arguments": [_portable_argument(argument, project_root) for argument in arguments],
+        # Credentials on the command line must not be stored or hashed into a key.
+        "arguments": [
+            _portable_argument(argument, project_root) for argument in redact_argv(arguments)
+        ],
         "scope": sorted({_portable_path(path, project_root) for path in scope}),
     }
 
