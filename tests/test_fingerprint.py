@@ -208,6 +208,56 @@ def test_objects_with_different_state_are_different_and_equal_state_is_equal():
     assert diff_tree(old.roots[0], other.roots[0])
 
 
+def test_budgets_make_oversized_values_unknown_not_slow_and_not_equal():
+    """Defect 3: a value past its budget is `unknown`, found out quickly."""
+    import time
+
+    from ldr.fingerprint import Budget, fingerprint, is_digest
+
+    assert is_digest(fingerprint(list(range(1000))))
+    assert fingerprint(list(range(100)), Budget(max_nodes=10)) == "unknown"
+    assert is_digest(fingerprint(list(range(5)), Budget(max_nodes=10)))
+    assert fingerprint([[[[1]]]], Budget(max_depth=2)) == "unknown"
+    assert fingerprint(list(range(1000)), Budget(max_seconds=0)) == "unknown"
+
+    started = time.perf_counter()
+    assert fingerprint(list(range(2_000_000))) == "unknown"
+    assert time.perf_counter() - started < 0.5
+
+
+def test_unknown_values_are_reported_as_unknown_never_unchanged():
+    import fixtures.values as v
+
+    huge_a = list(range(100_000))
+    huge_b = list(range(100_000))
+    huge_b[99_999] = -1
+    old = record(lambda: v.consume(huge_a))
+    new = record(lambda: v.consume(huge_b))
+    assert old.roots[0].in_fp["items"] == "unknown"
+
+    changes = diff_tree(old.roots[0], new.roots[0])
+
+    assert [c.kind for c in changes] == ["unknown"]
+    text = render_diff(changes)
+    assert "cannot be compared" in text and "items" in text
+
+
+def test_capturing_a_huge_list_does_not_walk_it():
+    import time
+
+    from ldr.node import capture
+
+    huge_list = list(range(2_000_000))
+    huge_set = set(range(300_000))
+    huge_dict = {i: i for i in range(300_000)}
+    started = time.perf_counter()
+    assert capture(huge_list) == "[0, 1, 2, 3, 4, 5, ...]"
+    assert capture(huge_set).endswith(", ...}")
+    assert capture(huge_dict).endswith(", ...}")
+    # reprlib sorted the whole set and dict (~0.1-0.2 s each) for a 6-item preview
+    assert time.perf_counter() - started < 0.05
+
+
 def test_identical_long_values_are_equal():
     import fixtures.values as v
 

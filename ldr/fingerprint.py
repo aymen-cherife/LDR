@@ -15,7 +15,9 @@ import abc
 import datetime
 import decimal
 import hashlib
+import time
 import types
+from dataclasses import dataclass
 from typing import Any
 
 from .node import _SECRET_VALUES, is_secret_name
@@ -28,9 +30,24 @@ FAILED = "failed"  # reading the value raised
 
 STATUSES = (UNSUPPORTED, UNKNOWN, REDACTED, FAILED)
 
-MAX_DEPTH = 24
-MAX_NODES = 50_000  # item and time budgets are tuned in the budget commit
 DIGEST_BYTES = 16
+
+
+@dataclass(frozen=True)
+class Budget:
+    """Hard per-value limits. Past any of them the result is ``unknown``.
+
+    Defaults come from measurement: about 1 ms per 1,000 nodes, so a value costs
+    at most roughly 10 ms (nodes) or 20 ms (time) per recorded call.
+    """
+
+    max_nodes: int = 10_000
+    max_depth: int = 24
+    max_seconds: float = 0.02
+
+
+DEFAULT_BUDGET = Budget()
+_CLOCK_EVERY = 64
 
 
 class _Stop(Exception):
@@ -47,13 +64,18 @@ def is_digest(token: str | None) -> bool:
 
 
 class _Walk:
-    def __init__(self) -> None:
+    def __init__(self, budget: Budget) -> None:
+        self.budget = budget
+        self.deadline = time.perf_counter() + budget.max_seconds
         self.active: list[int] = []
         self.visited = 0
 
     def encode(self, value: Any, out: hashlib.blake2b, depth: int = 0) -> None:
         self.visited += 1
-        if depth > MAX_DEPTH or self.visited > MAX_NODES:
+        budget = self.budget
+        if depth > budget.max_depth or self.visited > budget.max_nodes:
+            raise _Stop(UNKNOWN)
+        if not self.visited % _CLOCK_EVERY and time.perf_counter() > self.deadline:
             raise _Stop(UNKNOWN)
         kind = type(value)
         if value is None:
@@ -168,11 +190,11 @@ class _Walk:
             self.active.pop()
 
 
-def fingerprint(value: Any) -> str:
+def fingerprint(value: Any, budget: Budget = DEFAULT_BUDGET) -> str:
     """Return a hex digest of the full value, or a status word. Never raises."""
     try:
         out = hashlib.blake2b(digest_size=DIGEST_BYTES)
-        _Walk().encode(value, out)
+        _Walk(budget).encode(value, out)
         return out.hexdigest()
     except _Stop as stop:
         return stop.status

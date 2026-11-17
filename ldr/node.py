@@ -7,6 +7,7 @@ import array
 import collections
 import datetime
 import decimal
+import itertools
 import re
 import reprlib
 import types
@@ -34,14 +35,26 @@ def _plain_sortable(value, depth: int = 0) -> bool:
     return kind is tuple and depth < 3 and all(_plain_sortable(v, depth + 1) for v in value)
 
 
-def _ordered(items: list, key=lambda item: item) -> list:
-    """Sort like reprlib does, but never call user comparison code."""
+# reprlib sorts a whole set or dict to show its first few items. Past this size
+# that is a full traversal for a six-item preview, so larger ones keep their
+# own iteration order.
+_SORT_LIMIT = 1000
+
+
+def _ordered(items, key=lambda item: item, limit: int = 0) -> list:
+    """Sort like reprlib does, but never call user comparison code.
+
+    Returns at most ``limit`` leading items (all of them when ``limit`` is 0).
+    """
+    if len(items) > _SORT_LIMIT:
+        return list(itertools.islice(items, limit or None))
+    items = list(items)
     if all(_plain_sortable(key(item)) for item in items):
         try:
-            return sorted(items, key=key)
+            items = sorted(items, key=key)
         except Exception:
-            return items
-    return items
+            pass
+    return items[:limit] if limit else items
 
 
 class _StructuralRepr(reprlib.Repr):
@@ -59,17 +72,24 @@ class _StructuralRepr(reprlib.Repr):
             return self.repr_instance(x, level)
         return self.repr_object(x, level)
 
+    def _render_head(self, x, level, left, right, maxiter):
+        n = len(x)
+        if level <= 0:
+            return f"{left}{self.fillvalue}{right}"
+        pieces = [self.repr1(item, level - 1) for item in _ordered(x, limit=maxiter)]
+        if n > maxiter:
+            pieces.append(self.fillvalue)
+        return f"{left}{self._join(pieces, level)}{right}"
+
     def repr_set(self, x, level):
         if not x:
             return "set()"
-        return self._repr_iterable(_ordered(list(x)), level, "{", "}", self.maxset)
+        return self._render_head(x, level, "{", "}", self.maxset)
 
     def repr_frozenset(self, x, level):
         if not x:
             return "frozenset()"
-        return self._repr_iterable(
-            _ordered(list(x)), level, "frozenset({", "})", self.maxfrozenset
-        )
+        return self._render_head(x, level, "frozenset({", "})", self.maxfrozenset)
 
     def repr_dict(self, x, level):
         n = len(x)
@@ -77,9 +97,9 @@ class _StructuralRepr(reprlib.Repr):
             return "{}"
         if level <= 0:
             return "{" + self.fillvalue + "}"
-        pairs = _ordered(list(x.items()), key=lambda pair: pair[0])
+        pairs = _ordered(x.items(), key=lambda pair: pair[0], limit=self.maxdict)
         pieces = []
-        for key, item in pairs[: self.maxdict]:
+        for key, item in pairs:
             shown = "'<redacted>'" if is_secret_name(key) else self.repr1(item, level - 1)
             pieces.append(f"{self.repr1(key, level - 1)}: {shown}")
         if n > self.maxdict:
