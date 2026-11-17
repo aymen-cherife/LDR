@@ -194,7 +194,7 @@ class Node:
     out: str | None = None
     error: str | None = None
     ms: float = 0.0
-    children: list["Node"] = field(default_factory=list)
+    children: list[Node] = field(default_factory=list)
 
     # A portable invocation identity. Unlike CPython's frame id this is stable
     # across an immediate re-run, so an agent can select one observed call for
@@ -251,7 +251,7 @@ class Node:
         }
 
     @staticmethod
-    def from_dict(d: dict) -> "Node":
+    def from_dict(d: dict) -> Node:
         n = Node(
             name=d["name"],
             in_=d.get("in", {}),

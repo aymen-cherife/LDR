@@ -6,8 +6,6 @@ import subprocess
 import sys
 import threading
 
-import pytest
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ldr.diff import (  # noqa: E402
@@ -433,7 +431,6 @@ def test_test_frames_never_outrank_source_frames():
     from ldr.diff import rank
 
     src = Node("mod.compute", {"x": "1"}, out="9")
-    test = Node("test_thing", {}, error="AssertionError: 9 != 8")
     cs = diff_tree(
         Node("test_thing", {}, out="None", children=[Node("mod.compute", {"x": "1"}, out="8")]),
         Node("test_thing", {}, error="AssertionError", children=[src]),
