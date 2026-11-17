@@ -82,7 +82,7 @@ The second run reports what changed in the execution tree. Snapshots are scoped 
 --golden                    Replace the current snapshot
 ```
 
-Values and output are bounded and result files are written atomically.
+Values and output are bounded and result files are written atomically. On POSIX systems they are created with owner-only permissions (0600); on Windows LDR does not change file permissions.
 
 ## Secrets
 
