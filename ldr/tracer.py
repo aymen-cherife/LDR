@@ -121,7 +121,7 @@ class Recorder:
         absolute = os.path.realpath(filename)
         try:
             if os.path.commonpath((absolute, self.display_root)) == self.display_root:
-                result = os.path.relpath(absolute, self.display_root)
+                result = os.path.relpath(absolute, self.display_root).replace(os.sep, "/")
                 self._display_cache[filename] = result
                 return result
         except ValueError:
