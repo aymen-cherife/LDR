@@ -476,8 +476,13 @@ def test_addresses_are_normalised():
         pass
 
     a, b = capture(Thing()), capture(Thing())
-    assert "0x*" in a
     assert a == b
+    assert "0x" not in a  # objects are read structurally: no address at all
+
+    def helper():
+        pass
+
+    assert "0x*" in capture(helper)  # a function's own repr still carries one
 
 
 def test_verify_snapshots_then_diffs(tmp_path):

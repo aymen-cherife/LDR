@@ -77,6 +77,137 @@ def test_old_schema_snapshot_compares_as_unknown_with_a_rerecord_hint(tmp_path):
     assert result.returncode == 3
 
 
+class Hooked:
+    """Every hook LDR could trip over counts how often it ran."""
+
+    calls = []
+
+    def __init__(self, **state):
+        self.__dict__.update(state)
+
+    def __repr__(self):
+        Hooked.calls.append("__repr__")
+        return "<Hooked>"
+
+    def __str__(self):
+        Hooked.calls.append("__str__")
+        return "hooked"
+
+    def __getattr__(self, name):
+        Hooked.calls.append(f"__getattr__:{name}")
+        raise AttributeError(name)
+
+    def __getstate__(self):
+        Hooked.calls.append("__getstate__")
+        return {}
+
+    def __eq__(self, other):
+        Hooked.calls.append("__eq__")
+        return self is other
+
+    def __hash__(self):
+        Hooked.calls.append("__hash__")
+        return 1
+
+    def __lt__(self, other):
+        Hooked.calls.append("__lt__")
+        return False
+
+    def __iter__(self):
+        Hooked.calls.append("__iter__")
+        return iter(())
+
+    def __len__(self):
+        Hooked.calls.append("__len__")
+        return 0
+
+    @property
+    def derived(self):
+        Hooked.calls.append("derived")
+        return 1
+
+
+class HookedDict(dict):
+    def items(self):
+        Hooked.calls.append("items")
+        return super().items()
+
+    def __iter__(self):
+        Hooked.calls.append("dict.__iter__")
+        return super().__iter__()
+
+    def __repr__(self):
+        Hooked.calls.append("dict.__repr__")
+        return "{}"
+
+
+class Slotted:
+    __slots__ = ("size", "label")
+
+    def __init__(self, size, label):
+        self.size = size
+        self.label = label
+
+    @property
+    def size_text(self):
+        Hooked.calls.append("size_text")
+        return str(self.size)
+
+
+def test_recording_objects_never_runs_user_code():
+    """Defect 2: repr, str, properties, __getattr__, __getstate__, __hash__,
+    __eq__, __iter__ and __len__ can mutate, block or do work. None may run."""
+    import fixtures.values as v
+    from ldr.node import capture, capture_state
+
+    plain = Hooked(total=6)
+    nested = {"k": [Hooked(a=1)], "s": {Hooked(b=2)}, "t": (Hooked(c=3),)}
+    hooked_dict = HookedDict(a=Hooked(d=4))
+    slotted = Slotted(3, "x")
+    Hooked.calls.clear()  # building the fixtures above is the test's own business
+
+    rec = record(lambda: v.consume([plain, nested, hooked_dict, slotted]))
+    capture(plain)
+    capture_state(plain)
+    capture(nested)
+    capture(hooked_dict)
+    capture(slotted)
+
+    assert Hooked.calls == []
+    assert rec.roots[0].in_fp["items"] not in ("unsupported", "failed")
+
+
+def test_object_preview_is_structural():
+    from ldr.node import capture
+
+    assert capture(Slotted(3, "x")) == "Slotted(size=3, label='x')"
+    assert capture(Hooked(total=6, name="cart")) == "Hooked(total=6, name='cart')"
+    many = Hooked(**{f"f{i}": "y" * 60 for i in range(30)})
+    text = capture(many)
+    assert "more fields)" in text, text  # what was cut is always printed
+    assert "api_key=<redacted>" in capture(Hooked(api_key="abc12345678", mode="x"))
+
+
+def test_builtin_previews_read_exactly_as_before():
+    from ldr.node import capture
+
+    assert capture({"b": 2, "a": 1}) == "{'a': 1, 'b': 2}"
+    assert capture(list(range(10))) == "[0, 1, 2, 3, 4, 5, ...]"
+    assert capture({3, 1, 2}) == "{1, 2, 3}"
+    assert capture(("x", None, 1.5)) == "('x', None, 1.5)"
+
+
+def test_objects_with_different_state_are_different_and_equal_state_is_equal():
+    import fixtures.values as v
+
+    old = record(lambda: v.accept(Slotted(3, "x")))
+    same = record(lambda: v.accept(Slotted(3, "x")))
+    other = record(lambda: v.accept(Slotted(4, "x")))
+
+    assert diff_tree(old.roots[0], same.roots[0]) == []
+    assert diff_tree(old.roots[0], other.roots[0])
+
+
 def test_identical_long_values_are_equal():
     import fixtures.values as v
 

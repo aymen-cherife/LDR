@@ -11,11 +11,15 @@ can be compared for equality; any other status means "not compared" or
 
 from __future__ import annotations
 
+import abc
+import datetime
 import decimal
 import hashlib
+import types
 from typing import Any
 
 from .node import _SECRET_VALUES, is_secret_name
+from .structure import read, type_identity, type_label
 
 UNSUPPORTED = "unsupported"  # a type we do not read structurally (yet)
 UNKNOWN = "unknown"  # budget exhausted: we cannot say equal or different
@@ -25,6 +29,7 @@ FAILED = "failed"  # reading the value raised
 STATUSES = (UNSUPPORTED, UNKNOWN, REDACTED, FAILED)
 
 MAX_DEPTH = 24
+MAX_NODES = 50_000  # item and time budgets are tuned in the budget commit
 DIGEST_BYTES = 16
 
 
@@ -44,9 +49,11 @@ def is_digest(token: str | None) -> bool:
 class _Walk:
     def __init__(self) -> None:
         self.active: list[int] = []
+        self.visited = 0
 
     def encode(self, value: Any, out: hashlib.blake2b, depth: int = 0) -> None:
-        if depth > MAX_DEPTH:
+        self.visited += 1
+        if depth > MAX_DEPTH or self.visited > MAX_NODES:
             raise _Stop(UNKNOWN)
         kind = type(value)
         if value is None:
@@ -71,8 +78,55 @@ class _Walk:
             self._text(b"D", str(value).encode(), out)
         elif kind in (list, tuple, dict, set, frozenset):
             self._container(kind, value, out, depth)
+        elif not self._known_leaf(kind, value, out, depth):
+            self._object(value, out, depth)
+
+    def _known_leaf(self, kind: type, value: Any, out: hashlib.blake2b, depth: int) -> bool:
+        """Exact standard types whose state we can read without user code."""
+        if kind is type or kind is abc.ABCMeta:
+            self._text(b"C", type_identity(value).encode(), out)
+        elif kind is types.FunctionType or kind is types.BuiltinFunctionType:
+            name = f"{value.__module__}.{value.__qualname__}"
+            self._text(b"Y", name.encode("utf-8", "surrogatepass"), out)
+        elif kind is types.MethodType:
+            out.update(b"Mt")
+            self.encode(value.__func__, out, depth + 1)
+            self.encode(value.__self__, out, depth + 1)
+        elif kind in (datetime.datetime, datetime.date, datetime.time):
+            self._text(b"M", (type_label(kind) + value.isoformat()).encode(), out)
+        elif kind is datetime.timedelta:
+            self._text(b"M", f"td{value.days},{value.seconds},{value.microseconds}".encode(), out)
+        elif kind is range:
+            self._text(b"R", f"{value.start},{value.stop},{value.step}".encode(), out)
+        elif value is Ellipsis:
+            out.update(b"E")
+        elif value is NotImplemented:
+            out.update(b"X")
         else:
+            return False
+        return True
+
+    def _object(self, value: Any, out: hashlib.blake2b, depth: int) -> None:
+        reading = read(value)
+        if reading is None:
             raise _Stop(UNSUPPORTED)
+        marker = id(value)
+        if marker in self.active:
+            out.update(b"@" + str(len(self.active) - self.active.index(marker)).encode() + b";")
+            return
+        self.active.append(marker)
+        try:
+            self._text(b"O", reading.identity.encode("utf-8", "surrogatepass"), out)
+            out.update(str(len(reading.fields)).encode() + b"{")
+            for name, item in reading.fields:
+                if name is not None:
+                    if is_secret_name(name):
+                        raise _Stop(REDACTED)
+                    self._text(b"n", name.encode("utf-8", "surrogatepass"), out)
+                self.encode(item, out, depth + 1)
+            out.update(b"}")
+        finally:
+            self.active.pop()
 
     @staticmethod
     def _text(tag: bytes, data: bytes, out: hashlib.blake2b) -> None:

@@ -2,14 +2,123 @@
 
 from __future__ import annotations
 
+import abc
+import array
+import collections
+import datetime
+import decimal
 import re
 import reprlib
+import types
 from dataclasses import dataclass, field
 from typing import Any
 
+from .structure import instance_dict, read, type_label
+
+_PLAIN_SCALARS = (str, int, float, bool, bytes, type(None))
+# Exact types whose built-in repr is C code that cannot call user code.
+_PLAIN_REPR = (
+    type(None), bool, float, complex, bytes, bytearray, decimal.Decimal, range, slice,
+    type(Ellipsis), type(NotImplemented), types.FunctionType, types.BuiltinFunctionType,
+    datetime.datetime, datetime.date, datetime.time, datetime.timedelta,
+    type, abc.ABCMeta,
+)
+_REPR_DISPATCH = (tuple, list, set, frozenset, dict, str, int, collections.deque, array.array)
+_OBJECT_PREVIEW_CHARS = 400
+
+
+def _plain_sortable(value, depth: int = 0) -> bool:
+    kind = type(value)
+    if kind in _PLAIN_SCALARS:
+        return True
+    return kind is tuple and depth < 3 and all(_plain_sortable(v, depth + 1) for v in value)
+
+
+def _ordered(items: list, key=lambda item: item) -> list:
+    """Sort like reprlib does, but never call user comparison code."""
+    if all(_plain_sortable(key(item)) for item in items):
+        try:
+            return sorted(items, key=key)
+        except Exception:
+            return items
+    return items
+
+
+class _StructuralRepr(reprlib.Repr):
+    """reprlib's bounded previews, without ever running a user object's code.
+
+    Built-in types read exactly as ``reprlib`` renders them. Any other object
+    is rendered from its stored state as ``ClassName(field=preview, ...)``.
+    """
+
+    def repr1(self, x, level):
+        kind = type(x)
+        if kind in _REPR_DISPATCH:
+            return super().repr1(x, level)
+        if kind in _PLAIN_REPR:
+            return self.repr_instance(x, level)
+        return self.repr_object(x, level)
+
+    def repr_set(self, x, level):
+        if not x:
+            return "set()"
+        return self._repr_iterable(_ordered(list(x)), level, "{", "}", self.maxset)
+
+    def repr_frozenset(self, x, level):
+        if not x:
+            return "frozenset()"
+        return self._repr_iterable(
+            _ordered(list(x)), level, "frozenset({", "})", self.maxfrozenset
+        )
+
+    def repr_dict(self, x, level):
+        n = len(x)
+        if n == 0:
+            return "{}"
+        if level <= 0:
+            return "{" + self.fillvalue + "}"
+        pairs = _ordered(list(x.items()), key=lambda pair: pair[0])
+        pieces = []
+        for key, item in pairs[: self.maxdict]:
+            shown = "'<redacted>'" if is_secret_name(key) else self.repr1(item, level - 1)
+            pieces.append(f"{self.repr1(key, level - 1)}: {shown}")
+        if n > self.maxdict:
+            pieces.append(self.fillvalue)
+        return "{%s}" % self._join(pieces, level)
+
+    def repr_object(self, x, level):
+        if type(x) is types.MethodType:
+            return "<bound method>"
+        reading = read(x)
+        if reading is None:
+            return f"<{type_label(type(x))}>"
+        label = reading.label
+        if not reading.fields:
+            return f"{label}()"
+        if level <= 0:
+            return f"{label}({self.fillvalue})"
+        pieces: list[str] = []
+        used = 0
+        for name, item in reading.fields:
+            if name is None:
+                piece = self.repr1(item, level - 1)
+            elif is_secret_name(name):
+                piece = f"{name}=<redacted>"
+            else:
+                piece = f"{name}={self.repr1(item, level - 1)}"
+            if pieces and used + len(piece) > _OBJECT_PREVIEW_CHARS:
+                break
+            pieces.append(piece)
+            used += len(piece) + 2
+        hidden = len(reading.fields) - len(pieces)
+        if hidden:
+            pieces.append(f"(+{hidden} more fields)")
+        return f"{label}({', '.join(pieces)})"
+
+
 # Repr limits. These are the difference between a readable trace and a
 # 40k-token wall. Tuned to keep a node under ~200 chars in the common case.
-_repr = reprlib.Repr()
+_repr = _StructuralRepr()
 _repr.maxstring = 80
 _repr.maxother = 80
 _repr.maxlist = 6
@@ -22,7 +131,7 @@ _repr.maxlevel = 3
 # A focused inspection is already bounded by max_state_steps, so it can afford
 # enough value detail to distinguish nearby runtime states.  This remains
 # reprlib-bounded and uses the same redaction path as broad capture.
-_state_repr = reprlib.Repr()
+_state_repr = _StructuralRepr()
 _state_repr.maxstring = 320
 _state_repr.maxother = 500
 _state_repr.maxlist = 10
@@ -69,32 +178,6 @@ def redact_source_line(source: str) -> str:
     return _redact_text(source)
 
 
-def _redact_value(value: Any, depth: int = 0, seen: set[int] | None = None) -> Any:
-    """Redact built-in containers without invoking arbitrary container code."""
-    if depth >= 8:
-        return "<max-depth>"
-    seen = set() if seen is None else seen
-    if type(value) in (dict, tuple, list, set, frozenset):
-        value_id = id(value)
-        if value_id in seen:
-            return "<cycle>"
-        seen = seen | {value_id}
-    if type(value) is dict:
-        return {
-            key: "<redacted>" if is_secret_name(key) else _redact_value(item, depth + 1, seen)
-            for key, item in value.items()
-        }
-    if type(value) is tuple:
-        return tuple(_redact_value(item, depth + 1, seen) for item in value)
-    if type(value) is list:
-        return [_redact_value(item, depth + 1, seen) for item in value]
-    if type(value) is set:
-        return {_redact_value(item, depth + 1, seen) for item in value}
-    if type(value) is frozenset:
-        return frozenset(_redact_value(item, depth + 1, seen) for item in value)
-    return value
-
-
 def capture(value: Any, name: str | None = None) -> str:
     """Render a value to a bounded string, never raising.
 
@@ -106,19 +189,19 @@ def capture(value: Any, name: str | None = None) -> str:
         return "<redacted>"
     # Preserve exact numeric representations for Decimal and other precise numerics.
     # reprlib truncates at maxother=80; a Decimal with 50 digits must not lose precision.
+    # Exact types only: a subclass may define its own __repr__.
     try:
-        type_name = type(value).__name__
-        type_mod = type(value).__module__
-        if type_name == "Decimal" and type_mod == "decimal":
+        kind = type(value)
+        if kind is decimal.Decimal:
             return _redact_text(repr(value))
-        if isinstance(value, (int, float, complex)) and not isinstance(value, bool):
+        if kind in (int, float, complex):
             direct = repr(value)
             if len(direct) < 500:
                 return _redact_text(direct)
     except Exception:
         pass
     try:
-        return _redact_text(_repr.repr(_redact_value(value)))
+        return _redact_text(_repr.repr(value))
     except Exception:
         try:
             return f"<{type(value).__name__} repr-failed>"
@@ -131,14 +214,11 @@ def capture_state(value: Any, name: str | None = None) -> str:
     if name is not None and is_secret_name(name):
         return "<redacted>"
     try:
-        rendered = _redact_text(_state_repr.repr(_redact_value(value)))
+        rendered = _redact_text(_state_repr.repr(value))
     except Exception:
         rendered = capture(value, name)
-    try:
-        attributes = vars(value)
-    except Exception:
-        return rendered
-    if type(attributes) is not dict:
+    attributes = instance_dict(value)
+    if attributes is None:
         return rendered
 
     state: list[tuple[str, bool]] = []
@@ -151,11 +231,8 @@ def capture_state(value: Any, name: str | None = None) -> str:
             state.append((key, item))
         if len(nested) >= 128:
             continue
-        try:
-            child_attributes = vars(item)
-        except Exception:
-            continue
-        if type(child_attributes) is not dict:
+        child_attributes = instance_dict(item)
+        if child_attributes is None:
             continue
         for child_key in ("_visible", "_in_layout", "visible", "in_layout"):
             child_value = child_attributes.get(child_key)
