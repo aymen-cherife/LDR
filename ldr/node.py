@@ -284,15 +284,31 @@ def count_redacted(roots: list[Node]) -> int:
     return total
 
 
+_ERROR_SCAN_LIMIT = 200_000
+
+
 def capture_error(error: BaseException) -> str:
-    """Bound exception text while keeping pytest's useful assertion detail."""
+    """Bound exception text while keeping pytest's useful assertion detail.
+
+    ``str(error)`` is called, as Python's traceback and pytest do, so LDR adds
+    no new risk, but it is guarded: a raising ``__str__`` never fails the run,
+    huge messages are cut before the detectors run, and secrets are redacted
+    before the text is shortened (so none is left half-visible).
+    """
     try:
-        detail = _redact_text(str(error))
+        raw = str(error)
+        if len(raw) > _ERROR_SCAN_LIMIT:
+            raw = raw[: _ERROR_SCAN_LIMIT // 2] + raw[-_ERROR_SCAN_LIMIT // 2 :]
+        detail = _redact_text(raw)
     except Exception:
         detail = "<message unavailable>"
     if len(detail) > 600:
         detail = detail[:450] + f"... <{len(detail) - 550} chars omitted> ..." + detail[-100:]
-    return f"{type(error).__name__}: {detail}"
+    try:
+        name = type(error).__name__
+    except Exception:
+        name = "Exception"
+    return f"{name}: {detail}"
 
 
 @dataclass

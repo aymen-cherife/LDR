@@ -114,6 +114,54 @@ def test_environment_secrets_are_matched_by_value_and_named():
         redact.load_environment()
 
 
+def test_exception_text_is_redacted_capped_and_never_raises():
+    """Python's traceback and pytest call str(exc) anyway, so LDR keeps calling
+    it, but guards it: no failure, bounded length, secrets removed."""
+    from ldr.node import capture_error
+
+    token = SHAPES["github-token"]
+    text = capture_error(RuntimeError(f"auth failed for {token}"))
+    assert token not in text and "<secret: github-token" in text and text.startswith("RuntimeError:")
+
+    class BrokenStr(Exception):
+        def __str__(self):
+            raise ValueError("boom")
+
+    assert capture_error(BrokenStr()) == "BrokenStr: <message unavailable>"
+
+    huge = capture_error(RuntimeError(token + " " + "x" * 5_000_000 + " " + token))
+    assert len(huge) < 800
+    assert token not in huge and token[:12] not in huge
+
+    redact.load_environment({"MY_API_TOKEN": "env-secret-value-555"})
+    try:
+        assert "env-secret-value-555" not in capture_error(KeyError("env-secret-value-555"))
+    finally:
+        redact.load_environment()
+
+
+def test_a_crash_summary_never_carries_a_secret(tmp_path):
+    token = SHAPES["stripe-key"]
+    (tmp_path / "app.py").write_text(
+        "def charge():\n"
+        f"    raise RuntimeError('declined for {token}')\n"
+        "charge()\n"
+    )
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
+    result = subprocess.run(
+        [sys.executable, "-m", "ldr.cli", "run", str(tmp_path / "app.py"), "--only", str(tmp_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 1
+
+    everything = result.stdout + result.stderr
+    for path in (tmp_path / ".ldr").rglob("*"):
+        if path.is_file():
+            everything += path.read_text(encoding="utf-8")
+    assert token not in everything
+    assert "RUN STATUS: CRASHED" in everything
+
+
 def test_nothing_secret_reaches_the_output_files(tmp_path):
     secret_env = "env-secret-value-98765"
     (tmp_path / "app.py").write_text(

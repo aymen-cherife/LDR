@@ -27,7 +27,7 @@ from .diff import (
     unstable_fields,
 )
 from .gitinfo import describe_commit, describe_outcome, git_state
-from .node import Node, count_redacted
+from .node import Node, capture_error, count_redacted
 from .render import render_call_chain, render_diff, render_inspection, render_run
 from .store import (
     SCHEMA_VERSION,
@@ -96,7 +96,9 @@ def _record(
         except BaseException as exc:
             recorder.crashed = True
             recorder.exit_code = 1
-            recorder.crash_summary = f"{type(exc).__name__}: {exc}"
+            # Guarded, capped and secret-redacted: a raising __str__ must not
+            # crash LDR, and the message must not carry a credential to the model.
+            recorder.crash_summary = capture_error(exc)
             recorder.escaped_exception = exc
     finally:
         if alarm_enabled:
