@@ -14,7 +14,10 @@ import types
 from dataclasses import dataclass, field
 from typing import Any
 
+from .redact import by_name_placeholder, is_secret_name, redact
 from .structure import instance_dict, read, type_label
+
+__all__ = ["Node", "capture", "capture_error", "capture_state", "is_secret_name"]
 
 _PLAIN_SCALARS = (str, int, float, bool, bytes, type(None))
 # Exact types whose built-in repr is C code that cannot call user code.
@@ -66,11 +69,21 @@ class _StructuralRepr(reprlib.Repr):
 
     def repr1(self, x, level):
         kind = type(x)
+        if kind in (bytes, bytearray):
+            # Look for secrets in the whole value; the preview cuts it afterwards.
+            cleaned, found = redact(bytes(x).decode("latin-1"))
+            if found:
+                return self.repr_instance(cleaned.encode("latin-1", "replace"), level)
         if kind in _REPR_DISPATCH:
             return super().repr1(x, level)
         if kind in _PLAIN_REPR:
             return self.repr_instance(x, level)
         return self.repr_object(x, level)
+
+    def repr_str(self, x, level):
+        # Redact the whole string first. Doing it after truncation would leave
+        # a fragment of a secret that straddles the cut.
+        return super().repr_str(redact(x)[0], level)
 
     def _render_head(self, x, level, left, right, maxiter):
         n = len(x)
@@ -100,7 +113,11 @@ class _StructuralRepr(reprlib.Repr):
         pairs = _ordered(x.items(), key=lambda pair: pair[0], limit=self.maxdict)
         pieces = []
         for key, item in pairs:
-            shown = "'<redacted>'" if is_secret_name(key) else self.repr1(item, level - 1)
+            shown = (
+                repr(by_name_placeholder(item))
+                if is_secret_name(key)
+                else self.repr1(item, level - 1)
+            )
             pieces.append(f"{self.repr1(key, level - 1)}: {shown}")
         if n > self.maxdict:
             pieces.append(self.fillvalue)
@@ -123,7 +140,7 @@ class _StructuralRepr(reprlib.Repr):
             if name is None:
                 piece = self.repr1(item, level - 1)
             elif is_secret_name(name):
-                piece = f"{name}=<redacted>"
+                piece = f"{name}={by_name_placeholder(item)}"
             else:
                 piece = f"{name}={self.repr1(item, level - 1)}"
             if pieces and used + len(piece) > _OBJECT_PREVIEW_CHARS:
@@ -167,28 +184,12 @@ _state_repr.maxlevel = 4
 # argument reads as a behaviour change. Found the hard way on tqdm: the
 # real regression was buried under a dozen address-only diffs.
 _ADDR = re.compile(r"(?<= at )0x[0-9a-fA-F]{6,16}(?=>)")
-_SECRET_NAME = re.compile(
-    r"(?:^|_)(?:password|passwd|secret|api_?key|access_?token|refresh_?token|"
-    r"authorization|cookie|session_?id|private_?key)(?:$|_)",
-    re.IGNORECASE,
-)
-_SECRET_VALUES = (
-    re.compile(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
-    re.compile(r"\b(?:sk|pk)-[A-Za-z0-9_-]{16,}\b"),
-)
 _STATE_SIGNAL = re.compile(r"(?:visible|layout|enabled|active|valid|closed|dirty)$")
 
 
 def _redact_text(rendered: str) -> str:
-    rendered = _ADDR.sub("0x*", rendered)
-    for pattern in _SECRET_VALUES:
-        rendered = pattern.sub("<redacted>", rendered)
-    return rendered
-
-
-def is_secret_name(name: object) -> bool:
-    return isinstance(name, str) and bool(_SECRET_NAME.search(name))
+    """Last line of defence on finished text: addresses and any detected secret."""
+    return redact(_ADDR.sub("0x*", rendered))[0]
 
 
 def redact_source_line(source: str) -> str:
@@ -206,7 +207,7 @@ def capture(value: Any, name: str | None = None) -> str:
     repr() is worse than no tracer.
     """
     if name is not None and is_secret_name(name):
-        return "<redacted>"
+        return by_name_placeholder(value)
     # Preserve exact numeric representations for Decimal and other precise numerics.
     # reprlib truncates at maxother=80; a Decimal with 50 digits must not lose precision.
     # Exact types only: a subclass may define its own __repr__.
@@ -232,7 +233,7 @@ def capture(value: Any, name: str | None = None) -> str:
 def capture_state(value: Any, name: str | None = None) -> str:
     """Capture a focused local plus bounded, side-effect-free boolean object state."""
     if name is not None and is_secret_name(name):
-        return "<redacted>"
+        return by_name_placeholder(value)
     try:
         rendered = _redact_text(_state_repr.repr(value))
     except Exception:
@@ -271,6 +272,16 @@ def capture_state(value: Any, name: str | None = None) -> str:
         return rendered
     detail = ", ".join(f"{key}={item}" for key, item in selected)
     return f"{rendered} {{{detail}}}"
+
+
+def count_redacted(roots: list[Node]) -> int:
+    """How many recorded values were replaced by a secret placeholder (not compared)."""
+    total = 0
+    for root in roots:
+        for node in root.walk():
+            total += sum(token == "redacted" for token in node.in_fp.values())
+            total += node.out_fp == "redacted"
+    return total
 
 
 def capture_error(error: BaseException) -> str:

@@ -20,7 +20,7 @@ import types
 from dataclasses import dataclass
 from typing import Any
 
-from .node import _SECRET_VALUES, is_secret_name
+from .redact import contains_secret, is_secret_name
 from .structure import read, type_identity, type_label
 
 UNSUPPORTED = "unsupported"  # a type we do not read structurally (yet)
@@ -56,7 +56,7 @@ class _Stop(Exception):
 
 
 def _looks_secret(text: str) -> bool:
-    return any(pattern.search(text) for pattern in _SECRET_VALUES)
+    return contains_secret(text)
 
 
 def is_digest(token: str | None) -> bool:
@@ -94,10 +94,10 @@ class _Walk:
             if _looks_secret(value):
                 raise _Stop(REDACTED)
             self._text(b"s", value.encode("utf-8", "surrogatepass"), out)
-        elif kind is bytes:
-            self._text(b"b", value, out)
-        elif kind is bytearray:
-            self._text(b"B", bytes(value), out)
+        elif kind is bytes or kind is bytearray:
+            if _looks_secret(bytes(value).decode("latin-1")):
+                raise _Stop(REDACTED)
+            self._text(b"b" if kind is bytes else b"B", bytes(value), out)
         elif kind is decimal.Decimal:
             self._text(b"D", str(value).encode(), out)
         elif kind in (list, tuple, dict, set, frozenset):

@@ -105,7 +105,7 @@ def test_varargs_kwargs_locations_and_secret_redaction(tmp_path):
     assert result.returncode == 0
     output = (tmp_path / ".ldr" / "last.txt").read_text()
     assert "values=(1, 2)" in output
-    assert "options={'api_key': '<redacted>', 'mode': 'strict'}" in output
+    assert "options={'api_key': '<secret: by name, 17 chars>', 'mode': 'strict'}" in output
     assert "very-secret-value" not in output
     assert "@ values.py:1" in output
 
@@ -169,7 +169,7 @@ def test_named_snapshot_compares_across_checkout_directories(tmp_path):
 
 
 def test_capture_redacts_named_and_nested_secrets():
-    assert capture("hello", "password") == "<redacted>"
+    assert capture("hello", "password") == "<secret: by name, 5 chars>"
     rendered = capture({"token": "not-secret-name", "access_token": "hidden", "safe": "shown"})
     assert "hidden" not in rendered
     assert "shown" in rendered
@@ -233,7 +233,10 @@ def test_agent_can_select_a_frame_and_inspect_local_state(tmp_path):
     ]
     assert {"name": "total", "before": "<unset>", "after": "4"} in changes
     assert {"name": "total", "before": "4", "after": "8"} in changes
-    assert any(change["name"] == "api_key" and change["after"] == "<redacted>" for change in changes)
+    assert any(
+        change["name"] == "api_key" and change["after"] == "<secret: by name, 17 chars>"
+        for change in changes
+    )
     output = (tmp_path / ".ldr" / "last.txt").read_text()
     assert "STATE TRANSITIONS" in output
     assert "very-secret-value" not in output

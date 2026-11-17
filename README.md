@@ -82,7 +82,19 @@ The second run reports what changed in the execution tree. Snapshots are scoped 
 --golden                    Replace the current snapshot
 ```
 
-Values and output are bounded, common credential fields are redacted, and result files are written atomically with owner-only permissions.
+Values and output are bounded and result files are written atomically.
+
+## Secrets
+
+LDR records the values your program computes and prints them where a model reads them. It treats all of its output as sent to a model provider, and redacts before anything is hashed, written to `.ldr/` or printed:
+
+- values equal to (or containing) a secret-looking environment variable (`*_KEY`, `*_SECRET`, `*_TOKEN`, `PASSWORD`), labeled `<secret from env NAME>`;
+- known shapes: AWS, GitHub, Stripe, Slack, OpenAI/Anthropic and Google keys, JWTs, PEM private keys, `user:password@` in URLs, secret URL query parameters, Bearer headers, labeled `<secret: github-token, 40 chars>`;
+- variables, keys and attributes with compound secret names (`api_key`, `auth_token`, `password`, ...), labeled `<secret: by name, 24 chars>`. A bare `token` or `auth` is not treated as secret.
+
+A redacted value keeps no value and no hash, so it is never compared. Each run reports how many values were redacted.
+
+**Redaction is best effort.** It finds what it can recognize and will miss secrets with no known shape or name. Run LDR with development credentials, not production ones.
 
 ## Evidence and integrations
 

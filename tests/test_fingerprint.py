@@ -185,7 +185,7 @@ def test_object_preview_is_structural():
     many = Hooked(**{f"f{i}": "y" * 60 for i in range(30)})
     text = capture(many)
     assert "more fields)" in text, text  # what was cut is always printed
-    assert "api_key=<redacted>" in capture(Hooked(api_key="abc12345678", mode="x"))
+    assert "api_key=<secret: by name, 11 chars>" in capture(Hooked(api_key="abc12345678", mode="x"))
 
 
 def test_builtin_previews_read_exactly_as_before():

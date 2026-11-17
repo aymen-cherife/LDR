@@ -18,7 +18,7 @@ import tomllib
 from typing import Any
 
 from .diff import align, diff_tree, mark_unstable, rank
-from .node import Node
+from .node import Node, count_redacted
 from .render import render_call_chain, render_diff, render_inspection, render_run
 from .store import (
     SCHEMA_VERSION,
@@ -569,6 +569,12 @@ def _limit_text(text: str, max_lines: int, max_chars: int = 40_000) -> str:
     return text
 
 
+def _redaction_note(count: int) -> str:
+    if not count:
+        return ""
+    return f"REDACTED: {count} value(s) redacted, not compared.\n\n"
+
+
 def _write_result(text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR) -> tuple[str, str]:
     os.makedirs(ldr_dir, exist_ok=True)
     text_path = os.path.join(ldr_dir, "last.txt")
@@ -827,6 +833,8 @@ def main(argv=None) -> int:
     status["timing"] = {
         "execution_seconds": round(execution_finished - execution_started, 6),
     }
+    status["redacted_values"] = count_redacted(recorder.roots)
+    redaction_note = _redaction_note(status["redacted_values"])
     if (
         recorder.exit_code != 0
         and detected_roots
@@ -872,7 +880,7 @@ def main(argv=None) -> int:
         run_note = (
             f"RUN STATUS: {'PASSED' if recorder.exit_code == 0 else 'FAILED'} "
             f"(exit {recorder.exit_code})\n\n"
-        )
+        ) + redaction_note
         status["timing"].update(
             {
                 "postprocess_seconds": round(time.perf_counter() - execution_finished, 6),
@@ -1020,6 +1028,7 @@ def main(argv=None) -> int:
         note += "\n"
     else:
         note = "RUN STATUS: PASSED\n\n"
+    note += redaction_note
     if scope_warnings:
         note += "SCOPE WARNING\n" + "\n".join(f"- {warning}" for warning in scope_warnings) + "\n\n"
     status["timing"].update(
