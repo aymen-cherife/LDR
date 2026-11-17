@@ -106,4 +106,4 @@ A redacted value keeps no value and no hash, so it is never compared. Each run r
 - [Competitive analysis](docs/competitive-analysis.md)
 - [Inspection ranking design](docs/inspection-ranking.md)
 
-LDR 0.5.2 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.
+LDR 0.6.0 is still a prototype. The current goal is to measure whether structured runtime evidence helps coding agents resolve real failures with fewer investigation turns—not to maximize debugger features.

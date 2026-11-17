@@ -17,6 +17,7 @@ import time
 import tomllib
 from typing import Any
 
+from . import __version__
 from .diff import (
     EQUAL_READABLE,
     align,
@@ -681,7 +682,7 @@ def main(argv=None) -> int:
         argv, passthrough = argv[:index], argv[index + 1 :]
 
     parser = argparse.ArgumentParser(prog="ldr")
-    parser.add_argument("--version", action="version", version="ldr 0.5.2")
+    parser.add_argument("--version", action="version", version=f"ldr {__version__}")
     parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("rest", nargs="*")

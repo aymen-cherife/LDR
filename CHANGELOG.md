@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.6.0
+
+**Breaking: snapshots recorded by 0.5.x cannot be compared.** Trace schema 7
+replaces schema 6. Comparing against a schema 6 snapshot answers `unknown` and
+tells you to re-record it (`--golden`). Nothing is silently trusted.
+
+Comparison reads the full value, not the preview:
+
+- Calls carry a BLAKE2b fingerprint of the full value. A change at item 8 of 10
+  no longer reads as unchanged. Previews are for reading only.
+- Dict order is part of a value; set order is not. The receiver (`self`/`cls`)
+  has a fingerprint, so the same arguments on an object in a different state are
+  a different call. A receiver with unreadable parts (a lock, a socket) that
+  matches in everything readable is reported as "equal in readable parts only",
+  never as equal.
+- Values past 10,000 nodes or depth 24 are `unknown`, reported as "cannot be
+  compared". There is deliberately no time budget, so a fingerprint never depends
+  on machine load.
+- Recording never runs user code: no `__repr__`, `__str__` (for values),
+  properties, `__getattr__`, `__getstate__`, `__hash__`, `__eq__`, `__iter__` or
+  `__len__`. Custom objects preview as `ClassName(field=..., (+N more fields))`;
+  built-in previews are unchanged. Sets and dicts above 1,000 entries keep their
+  iteration order in previews instead of being sorted.
+
+Secrets never reach disk or output (best effort, see the README):
+
+- Environment values, known shapes (AWS, GitHub, Stripe, Slack, OpenAI/Anthropic,
+  Google, JWT, PEM, URL credentials and query secrets, Bearer) and compound names
+  are replaced by labeled placeholders such as `<secret: github-token, 40 chars>`.
+  Redacted values keep no value and no hash; each run reports how many.
+- Exception text and the crash summary are guarded, capped and redacted.
+- Command-line credentials (`--password=...`, `--token ...`) are redacted in
+  stored and printed arguments; the program still receives them.
+
+Every run states its facts:
+
+- `COMMIT:` (read-only git; LDR never writes to git), `SCOPE:` with the number of
+  project calls recorded, a warning when there were none, and the outcome and
+  commit of a saved baseline and of both sides of a comparison.
+- Fields learned to vary between identical runs are listed as `UNSTABLE (shown,
+  not compared)` instead of being masked silently.
+- Until every call is recorded, output says "calls beyond the first N per
+  function are not compared" whenever calls were sampled.
+
+Also:
+
+- The word-overlap ranking signals are removed; the replacement waits for a
+  benchmark. Suggestion evidence no longer has the `*_overlap` keys.
+- LDR refuses to start below Python 3.12 with a clear message.
+- `--timeout` warns when it cannot be enforced (Windows has no `SIGALRM`).
+- `python -m ldr` works; the volatility probe is now the noise run.
+- Known open defect: in pytest mode, a package without `__init__.py` can go
+  unrecorded when there is no `.git` or `pyproject.toml`.
+
 ## 0.5.2
 
 - Capture bounded before/after evidence when a mutable input keeps object
