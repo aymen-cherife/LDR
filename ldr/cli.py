@@ -17,7 +17,15 @@ import time
 import tomllib
 from typing import Any
 
-from .diff import align, diff_tree, mark_unstable, rank, render_unstable, unstable_fields
+from .diff import (
+    EQUAL_READABLE,
+    align,
+    diff_tree,
+    mark_unstable,
+    rank,
+    render_unstable,
+    unstable_fields,
+)
 from .gitinfo import describe_commit, describe_outcome, git_state
 from .node import Node, count_redacted
 from .render import render_call_chain, render_diff, render_inspection, render_run
@@ -1012,7 +1020,12 @@ def main(argv=None) -> int:
             if comparison_unknown:
                 pass
             elif changes:
-                text = "BEST GUESS, RANKED\n" + render_diff(changes, args.color)
+                headline = (
+                    "BEST GUESS, RANKED"
+                    if any(change.kind != EQUAL_READABLE for change in changes)
+                    else "EQUAL IN READABLE PARTS ONLY (not proven equal)"
+                )
+                text = headline + "\n" + render_diff(changes, args.color)
                 text += "\n\nCALL CHAIN\n" + render_call_chain(recorder.roots, changes, args.color)
             else:
                 text = "No behavioural change vs snapshot."
@@ -1105,8 +1118,11 @@ def main(argv=None) -> int:
         "status": status,
         "snapshot": {"key": key, "path": golden_path, "action": snapshot_action},
         "behavior": {
-            "changed": bool(changes),
+            "changed": any(change.kind != EQUAL_READABLE for change in changes),
             "finding_count": len(changes),
+            "equal_in_readable_parts_only": sum(
+                change.kind == EQUAL_READABLE for change in changes
+            ),
             "unstable_fields": unstable[:50],
         },
         "frame_index": frame_index_payload,
@@ -1130,7 +1146,10 @@ def main(argv=None) -> int:
 
     if recorder.exit_code != 0:
         return recorder.exit_code
-    if args.fail_on_change and (changes or comparison_unknown):
+    # Equal-in-readable-parts is stated, not failed: it is not a proven change.
+    if args.fail_on_change and (
+        comparison_unknown or any(change.kind != EQUAL_READABLE for change in changes)
+    ):
         return 3
     return 0
 

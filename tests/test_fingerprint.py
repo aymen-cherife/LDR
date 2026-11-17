@@ -325,6 +325,70 @@ def test_dict_order_is_kept_but_set_order_is_not():
     assert "changed beyond the preview or in ordering" in render_diff(changes)
 
 
+def test_equal_partial_receivers_are_equal_in_readable_parts_not_equal():
+    """Two receivers that differ only in an unreadable part (a lock) have equal
+    `+` digests. That is not proof of equality, and the output must not say it."""
+    import threading
+
+    import fixtures.values as v
+
+    held = threading.Lock()
+    held.acquire()
+
+    def calls(rec):
+        return [n for r in rec.roots for n in r.walk() if n.name.endswith("label")][0]
+
+    free = record(lambda: v.Account(10, guard=threading.Lock()).label("acct"))
+    locked = record(lambda: v.Account(10, guard=held).label("acct"))
+    assert calls(free).in_fp["self"] == calls(locked).in_fp["self"]  # the lock is unreadable
+
+    changes = diff_tree(calls(free), calls(locked))
+
+    assert [c.kind for c in changes] == ["equal-readable"]
+    text = render_diff(changes)
+    assert "equal in the readable parts" in text
+    assert "not compared" in text
+    assert "no behavioural change" not in text.lower()
+
+
+def test_cli_does_not_report_no_change_for_partially_readable_receivers(tmp_path):
+    import json
+    import subprocess
+
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
+    script = (
+        "import threading\n"
+        "class Client:\n"
+        "    def __init__(self):\n"
+        "        self.name = 'c'\n"
+        "        self.guard = threading.Lock()\n"
+        "    def call(self, x):\n"
+        "        return x\n"
+        "client = Client()\n"
+        "%s"
+        "client.call(1)\n"
+    )
+
+    def run(*extra):
+        return subprocess.run(
+            [sys.executable, "-m", "ldr.cli", "run", "app.py", *extra],
+            cwd=tmp_path, env=env, capture_output=True, text=True,
+        )
+
+    (tmp_path / "app.py").write_text(script % "")
+    assert run("--golden").returncode == 0
+    (tmp_path / "app.py").write_text(script % "client.guard.acquire()\n")
+
+    result = run("--diff", "--fail-on-change")
+
+    assert "EQUAL IN READABLE PARTS ONLY" in result.stdout
+    assert "No behavioural change" not in result.stdout
+    payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    assert payload["behavior"]["changed"] is False
+    assert payload["behavior"]["equal_in_readable_parts_only"] >= 1
+    assert result.returncode == 0  # not a proven change; stated, not failed
+
+
 def test_identical_long_values_are_equal():
     import fixtures.values as v
 

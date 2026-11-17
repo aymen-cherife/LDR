@@ -6,7 +6,7 @@ import difflib
 import hashlib
 import json
 
-from .fingerprint import REDACTED, is_digest
+from .fingerprint import PARTIAL_MARK, REDACTED, is_digest
 from .fingerprint import UNKNOWN as FP_UNKNOWN
 from .node import Node
 
@@ -22,12 +22,17 @@ HANDLED = "handled-exception"
 
 
 UNKNOWN = "unknown"
+EQUAL_READABLE = "equal-readable"
 
 # Per-field comparison outcomes. A comparison answers equal, different or
 # unknown; a redacted value is never compared, so it cannot make a call differ.
+# `_PARTIAL` is a fourth, narrower answer: two digests that end in `+` match in
+# everything LDR could read, but some part (a lock, a socket, a C object) was
+# unreadable, so that is not proof of equality and is never reported as equal.
 _EQUAL = "equal"
 _DIFFERENT = "different"
 _UNKNOWN = "unknown"
+_PARTIAL = "equal-readable"
 
 
 def identity(node: Node) -> str:
@@ -45,7 +50,7 @@ def _compare_value(old_text, old_fp, new_text, new_fp) -> tuple[str, bool]:
     """
     if is_digest(old_fp) and is_digest(new_fp):
         if old_fp == new_fp:
-            return _EQUAL, False
+            return (_PARTIAL if old_fp.endswith(PARTIAL_MARK) else _EQUAL), False
         return _DIFFERENT, old_text == new_text
     if REDACTED in (old_fp, new_fp):
         return _EQUAL, False
@@ -57,7 +62,9 @@ def _compare_value(old_text, old_fp, new_text, new_fp) -> tuple[str, bool]:
 def _compare_fingerprints(old_fp, new_fp) -> tuple[str, bool]:
     """Compare values that only exist as fingerprints. Never reports a guess."""
     if is_digest(old_fp) and is_digest(new_fp):
-        return (_EQUAL if old_fp == new_fp else _DIFFERENT), False
+        if old_fp != new_fp:
+            return _DIFFERENT, False
+        return (_PARTIAL if old_fp.endswith(PARTIAL_MARK) else _EQUAL), False
     if FP_UNKNOWN in (old_fp, new_fp):
         return _UNKNOWN, False
     return _EQUAL, False  # absent or redacted on a side: not compared
@@ -95,9 +102,10 @@ def compare_fields(old: Node, new: Node, masks: set[str] | None = None) -> dict[
 
 def _own_state(old: Node, new: Node, masks: set[str] | None = None) -> str:
     states = {state for state, _ in compare_fields(old, new, masks).values()}
-    if _DIFFERENT in states:
-        return _DIFFERENT
-    return _UNKNOWN if _UNKNOWN in states else _EQUAL
+    for state in (_DIFFERENT, _UNKNOWN, _PARTIAL):
+        if state in states:
+            return state
+    return _EQUAL
 
 
 def beyond_preview(old: Node, new: Node) -> list[str]:
@@ -116,6 +124,10 @@ def _fingerprint_only(old: Node, new: Node, field: str) -> bool:
 
 def unknown_fields(old: Node, new: Node) -> list[str]:
     return [name for name, (state, _) in compare_fields(old, new).items() if state == _UNKNOWN]
+
+
+def partial_fields(old: Node, new: Node) -> list[str]:
+    return [name for name, (state, _) in compare_fields(old, new).items() if state == _PARTIAL]
 
 
 def _inputs_differ(old: Node, new: Node) -> bool:
@@ -286,7 +298,11 @@ def diff_tree(
     own_state = _own_state(old, new)
     own_changed = own_state == _DIFFERENT
     unknown = (
-        [Change(UNKNOWN, here, new, old, depth)] if own_state == _UNKNOWN else []
+        [Change(UNKNOWN, here, new, old, depth)]
+        if own_state == _UNKNOWN
+        else [Change(EQUAL_READABLE, here, new, old, depth)]
+        if own_state == _PARTIAL
+        else []
     )
     if not own_changed and not child_changes:
         return unknown

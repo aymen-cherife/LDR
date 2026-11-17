@@ -14,8 +14,10 @@ from .diff import (
     REMOVED,
     UNKNOWN,
     UNSTABLE,
+    EQUAL_READABLE,
     Change,
     beyond_preview,
+    partial_fields,
     unknown_fields,
 )
 from .node import Node
@@ -290,6 +292,7 @@ _LABEL = {
     REMOVED: "call gone",
     UNSTABLE: "nondeterministic field ignored",
     UNKNOWN: "cannot compare",
+    EQUAL_READABLE: "equal in readable parts only",
 }
 
 
@@ -365,6 +368,12 @@ def render_diff(changes: list[Change], color: bool = False, max_findings: int = 
                 lines.append(
                     f"    {prefix}{label}: changed beyond the preview or in ordering "
                     "(the previews read the same)"
+                )
+            for field in partial_fields(change.old, change.node):
+                label = field[3:] if field.startswith("in.") else field
+                lines.append(
+                    f"    in {label}: equal in the readable parts; the parts that could not be "
+                    "read (lock, socket, C object) were not compared"
                 )
             for field in unknown_fields(change.old, change.node):
                 lines.append(f"    {field}: cannot be compared (value past the capture budget)")
