@@ -19,11 +19,14 @@ from .fingerprint import REDACTED, fingerprint
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
 
 
+_RECEIVERS = ("self", "cls")
+
+
 def fp_value(value, name: str | None = None) -> str:
     """Fingerprint a captured value; secret-named variables are never hashed."""
     if name is not None and is_secret_name(name):
         return REDACTED
-    return fingerprint(value)
+    return fingerprint(value, partial_ok=name in _RECEIVERS)
 
 
 @dataclass(slots=True)
@@ -198,9 +201,9 @@ class Recorder:
         """Fingerprint the full value of each argument (same rule in every mode)."""
         result: dict[str, str] = {}
         for name in self._argument_names(code):
-            if name not in frame.f_locals or name in ("self", "cls"):
-                continue
-            result[name] = fp_value(frame.f_locals[name], name)
+            if name in frame.f_locals:
+                # The receiver has no preview, but its state is part of the call.
+                result[name] = fp_value(frame.f_locals[name], name)
         return result
 
     @staticmethod

@@ -64,8 +64,10 @@ def is_digest(token: str | None) -> bool:
 
 
 class _Walk:
-    def __init__(self, budget: Budget) -> None:
+    def __init__(self, budget: Budget, partial_ok: bool = False) -> None:
         self.budget = budget
+        self.partial_ok = partial_ok
+        self.partial = False  # some leaf could not be read; only its type is hashed
         self.deadline = time.perf_counter() + budget.max_seconds
         self.active: list[int] = []
         self.visited = 0
@@ -131,7 +133,12 @@ class _Walk:
     def _object(self, value: Any, out: hashlib.blake2b, depth: int) -> None:
         reading = read(value)
         if reading is None:
-            raise _Stop(UNSUPPORTED)
+            if not self.partial_ok:
+                raise _Stop(UNSUPPORTED)
+            # A lock, socket or C object: hash its type, say the rest is unread.
+            self.partial = True
+            self._text(b"?", type_identity(type(value)).encode("utf-8", "surrogatepass"), out)
+            return
         marker = id(value)
         if marker in self.active:
             out.update(b"@" + str(len(self.active) - self.active.index(marker)).encode() + b";")
@@ -190,12 +197,22 @@ class _Walk:
             self.active.pop()
 
 
-def fingerprint(value: Any, budget: Budget = DEFAULT_BUDGET) -> str:
-    """Return a hex digest of the full value, or a status word. Never raises."""
+PARTIAL_MARK = "+"
+
+
+def fingerprint(value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool = False) -> str:
+    """Return a hex digest of the full value, or a status word. Never raises.
+
+    With ``partial_ok`` a value holding unreadable parts still gets a digest of
+    the readable part, followed by ``+`` (used for a call's receiver, which has
+    no preview to fall back on). Equal ``+`` digests mean the readable parts
+    match; the unread parts are a stated gap.
+    """
     try:
         out = hashlib.blake2b(digest_size=DIGEST_BYTES)
-        _Walk(budget).encode(value, out)
-        return out.hexdigest()
+        walk = _Walk(budget, partial_ok)
+        walk.encode(value, out)
+        return out.hexdigest() + (PARTIAL_MARK if walk.partial else "")
     except _Stop as stop:
         return stop.status
     except RecursionError:

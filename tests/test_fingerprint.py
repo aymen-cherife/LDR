@@ -258,6 +258,36 @@ def test_capturing_a_huge_list_does_not_walk_it():
     assert time.perf_counter() - started < 0.05
 
 
+def test_receiver_state_is_part_of_the_comparison():
+    """Defect 4: `self` is not an argument preview, yet same arguments on an
+    object in a different state is a different call."""
+    import fixtures.values as v
+
+    old = record(lambda: v.Account(10).label("acct"))
+    same = record(lambda: v.Account(10).label("acct"))
+    other = record(lambda: v.Account(99).label("acct"))
+    def calls(rec):
+        return [n for r in rec.roots for n in r.walk() if n.name.endswith("label")][0]
+
+    assert "self" not in calls(old).in_  # previews are unchanged
+    assert diff_tree(calls(old), calls(same)) == []
+    changes = diff_tree(calls(old), calls(other))
+    assert changes, "same arguments, different receiver state, must not read as unchanged"
+    text = render_diff(changes)
+    assert "self" in text and "receiver" in text
+
+
+def test_receiver_with_unreadable_parts_is_marked_partial_not_dropped():
+    import threading
+
+    import fixtures.values as v
+
+    rec = record(lambda: v.Account(10, guard=threading.Lock()).label("acct"))
+    node = [n for r in rec.roots for n in r.walk() if n.name.endswith("label")][0]
+    token = node.in_fp["self"]
+    assert token.endswith("+") and token[:-1].isalnum(), token  # readable part only
+
+
 def test_identical_long_values_are_equal():
     import fixtures.values as v
 

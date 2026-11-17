@@ -54,12 +54,25 @@ def _compare_value(old_text, old_fp, new_text, new_fp) -> tuple[str, bool]:
     return (_EQUAL if old_text == new_text else _DIFFERENT), False
 
 
+def _compare_fingerprints(old_fp, new_fp) -> tuple[str, bool]:
+    """Compare values that only exist as fingerprints. Never reports a guess."""
+    if is_digest(old_fp) and is_digest(new_fp):
+        return (_EQUAL if old_fp == new_fp else _DIFFERENT), False
+    if FP_UNKNOWN in (old_fp, new_fp):
+        return _UNKNOWN, False
+    return _EQUAL, False  # absent or redacted on a side: not compared
+
+
 def compare_fields(old: Node, new: Node, masks: set[str] | None = None) -> dict[str, tuple[str, bool]]:
     """Per-field outcome for a pair of calls: ``in.<name>``, ``out``, ``error``, ``handled``."""
     masks = set(old.volatile) | set(new.volatile) | (masks or set())
     fields: dict[str, tuple[str, bool]] = {}
-    for key in sorted(set(old.in_) | set(new.in_)):
+    for key in sorted(set(old.in_) | set(new.in_) | set(old.in_fp) | set(new.in_fp)):
         if f"in.{key}" in masks:
+            continue
+        if key not in old.in_ and key not in new.in_:
+            # Fingerprint only, such as a receiver (`self`): it has no preview.
+            fields[f"in.{key}"] = _compare_fingerprints(old.in_fp.get(key), new.in_fp.get(key))
             continue
         if key not in old.in_ or key not in new.in_:
             fields[f"in.{key}"] = (_DIFFERENT, False)
@@ -92,8 +105,13 @@ def beyond_preview(old: Node, new: Node) -> list[str]:
     return [
         name
         for name, (state, only_fingerprint) in compare_fields(old, new).items()
-        if state == _DIFFERENT and only_fingerprint
+        if state == _DIFFERENT and (only_fingerprint or _fingerprint_only(old, new, name))
     ]
+
+
+def _fingerprint_only(old: Node, new: Node, field: str) -> bool:
+    key = field[3:] if field.startswith("in.") else None
+    return key is not None and key not in old.in_ and key not in new.in_
 
 
 def unknown_fields(old: Node, new: Node) -> list[str]:

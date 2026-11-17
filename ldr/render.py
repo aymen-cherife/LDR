@@ -358,6 +358,9 @@ def render_diff(changes: list[Change], color: bool = False, max_findings: int = 
                 lines.append(f"    err: {change.old.error} -> {change.node.error}")
             for field in beyond_preview(change.old, change.node):
                 label = field[3:] if field.startswith("in.") else field
+                if label in ("self", "cls"):
+                    lines.append(f"    in {label}: receiver state differs (no preview is kept for it)")
+                    continue
                 prefix = "in " if field.startswith("in.") else ""
                 lines.append(
                     f"    {prefix}{label}: changed beyond the preview or in ordering "
