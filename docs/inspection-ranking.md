@@ -52,7 +52,7 @@ alias analysis or proof of defect.
   and passing states; LDR's single-run ranking is deliberately weaker and does
   not call its transitions causal.
 - [Fault localization using textual similarities](https://arxiv.org/abs/1211.2858)
-  motivated an earlier identifier-overlap signal. It is removed in 0.6 (see
+  motivated an earlier identifier-overlap signal. It is removed (see
   above); the reference is kept as history.
 - [The Whyline](https://doi.org/10.1145/1368088.1368130) motivates grounding
   explanations in observed behavior instead of asking the agent to invent a
