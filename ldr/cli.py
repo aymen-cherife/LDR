@@ -656,6 +656,7 @@ def main(argv=None) -> int:
     initial_cwd = os.path.realpath(os.getcwd())
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)
     argv = list(sys.argv[1:] if argv is None else argv)
+    timeout_requested = any(a == "--timeout" or a.startswith("--timeout=") for a in argv)
     passthrough: list[str] = []
     if "--" in argv:
         index = argv.index("--")
@@ -1069,6 +1070,12 @@ def main(argv=None) -> int:
     else:
         note = "RUN STATUS: PASSED\n\n"
     note += redaction_note
+    if timeout_requested and not hasattr(signal, "SIGALRM"):
+        # Windows has no SIGALRM, so the in-process timeout cannot fire.
+        note += (
+            "WARNING: --timeout is not enforced on this platform (no SIGALRM); "
+            "a hung run will not be stopped.\n\n"
+        )
     if scope_warnings:
         note += "SCOPE WARNING\n" + "\n".join(f"- {warning}" for warning in scope_warnings) + "\n\n"
     status["timing"].update(
