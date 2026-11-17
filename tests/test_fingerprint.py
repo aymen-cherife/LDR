@@ -218,11 +218,28 @@ def test_budgets_make_oversized_values_unknown_not_slow_and_not_equal():
     assert fingerprint(list(range(100)), Budget(max_nodes=10)) == "unknown"
     assert is_digest(fingerprint(list(range(5)), Budget(max_nodes=10)))
     assert fingerprint([[[[1]]]], Budget(max_depth=2)) == "unknown"
-    assert fingerprint(list(range(1000)), Budget(max_seconds=0)) == "unknown"
+    assert not hasattr(Budget(), "max_seconds")  # no time budget: see the next test
 
     started = time.perf_counter()
     assert fingerprint(list(range(2_000_000))) == "unknown"
     assert time.perf_counter() - started < 0.5
+
+
+def test_a_fingerprint_never_depends_on_machine_load(monkeypatch):
+    """A time budget would make the same value `complete` in one run and
+    `unknown` in the next, faking differences. Only node count and depth bound it."""
+    import time
+
+    from ldr.fingerprint import fingerprint, is_digest
+
+    value = {"rows": [list(range(20)) for _ in range(400)]}
+    expected = fingerprint(value)
+    assert is_digest(expected)
+
+    ticks = iter(range(0, 10**9, 10**6))  # a clock that jumps a million seconds per call
+    monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+
+    assert fingerprint(value) == expected
 
 
 def test_unknown_values_are_reported_as_unknown_never_unchanged():

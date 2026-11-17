@@ -15,7 +15,6 @@ import abc
 import datetime
 import decimal
 import hashlib
-import time
 import types
 from dataclasses import dataclass
 from typing import Any
@@ -35,19 +34,19 @@ DIGEST_BYTES = 16
 
 @dataclass(frozen=True)
 class Budget:
-    """Hard per-value limits. Past any of them the result is ``unknown``.
+    """Hard per-value limits. Past either of them the result is ``unknown``.
 
-    Defaults come from measurement: about 1 ms per 1,000 nodes, so a value costs
-    at most roughly 10 ms (nodes) or 20 ms (time) per recorded call.
+    Deliberately no time budget: a wall-clock limit would make the same value
+    ``complete`` in one run and ``unknown`` in the next, depending on machine
+    load, and fake a difference. No user code runs while reading a value, so node
+    count and depth already bound the cost (about 1 ms per 1,000 nodes).
     """
 
     max_nodes: int = 10_000
     max_depth: int = 24
-    max_seconds: float = 0.02
 
 
 DEFAULT_BUDGET = Budget()
-_CLOCK_EVERY = 64
 
 
 class _Stop(Exception):
@@ -68,7 +67,6 @@ class _Walk:
         self.budget = budget
         self.partial_ok = partial_ok
         self.partial = False  # some leaf could not be read; only its type is hashed
-        self.deadline = time.perf_counter() + budget.max_seconds
         self.active: list[int] = []
         self.visited = 0
 
@@ -76,8 +74,6 @@ class _Walk:
         self.visited += 1
         budget = self.budget
         if depth > budget.max_depth or self.visited > budget.max_nodes:
-            raise _Stop(UNKNOWN)
-        if not self.visited % _CLOCK_EVERY and time.perf_counter() > self.deadline:
             raise _Stop(UNKNOWN)
         kind = type(value)
         if value is None:
