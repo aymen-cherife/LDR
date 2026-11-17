@@ -12,8 +12,11 @@ from .diff import (
     ORIGIN,
     RAISED,
     REMOVED,
+    UNKNOWN,
     UNSTABLE,
     Change,
+    beyond_preview,
+    unknown_fields,
 )
 from .node import Node
 
@@ -286,6 +289,7 @@ _LABEL = {
     ADDED: "new call",
     REMOVED: "call gone",
     UNSTABLE: "nondeterministic field ignored",
+    UNKNOWN: "cannot compare",
 }
 
 
@@ -352,6 +356,15 @@ def render_diff(changes: list[Change], color: bool = False, max_findings: int = 
                 lines.append(f"    out: {_state(change.old.out)} -> {_state(change.node.out)}")
             if "error" not in masks and change.old.error != change.node.error:
                 lines.append(f"    err: {change.old.error} -> {change.node.error}")
+            for field in beyond_preview(change.old, change.node):
+                label = field[3:] if field.startswith("in.") else field
+                prefix = "in " if field.startswith("in.") else ""
+                lines.append(
+                    f"    {prefix}{label}: changed beyond the preview or in ordering "
+                    "(the previews read the same)"
+                )
+            for field in unknown_fields(change.old, change.node):
+                lines.append(f"    {field}: cannot be compared (value past the capture budget)")
     if omitted:
         lines.append(f"[{omitted} lower-ranked findings omitted]")
     return "\n".join(lines)

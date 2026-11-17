@@ -15,7 +15,15 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from .node import Node, capture, capture_error, capture_state, redact_source_line
+from .fingerprint import REDACTED, fingerprint
+from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
+
+
+def fp_value(value, name: str | None = None) -> str:
+    """Fingerprint a captured value; secret-named variables are never hashed."""
+    if name is not None and is_secret_name(name):
+        return REDACTED
+    return fingerprint(value)
 
 
 @dataclass(slots=True)
@@ -186,6 +194,15 @@ class Recorder:
             if name in frame.f_locals and name not in ("self", "cls")
         }
 
+    def _argument_fingerprints(self, code, frame) -> dict[str, str]:
+        """Fingerprint the full value of each argument (same rule in every mode)."""
+        result: dict[str, str] = {}
+        for name in self._argument_names(code):
+            if name not in frame.f_locals or name in ("self", "cls"):
+                continue
+            result[name] = fp_value(frame.f_locals[name], name)
+        return result
+
     @staticmethod
     def _argument_names(code) -> list[str]:
         names = list(code.co_varnames[: code.co_argcount + code.co_kwonlyargcount])
@@ -241,9 +258,14 @@ class Recorder:
             arguments = self._arguments(code, frame, detailed=detailed)
         except Exception:
             arguments = {}
+        try:
+            argument_fps = self._argument_fingerprints(code, frame)
+        except Exception:
+            argument_fps = {}
         node = Node(
             name=code.co_qualname,
             in_=arguments,
+            in_fp=argument_fps,
             module=module,
             file=file,
             source_id=source_id,
@@ -497,7 +519,7 @@ class Recorder:
                 return stack[:index], entry
         return None
 
-    def _close(self, code, out=None, error=None):
+    def _close(self, code, out=None, error=None, out_fp=None):
         try:
             frame = sys._getframe(2)
         except Exception:
@@ -542,6 +564,7 @@ class Recorder:
 
         entry.ms = (time.perf_counter() - entry.__dict__.get("_t0", 0)) * 1000
         entry.out = out
+        entry.out_fp = out_fp
         entry.error = error
         if error is None:
             for child in entry.children:
@@ -552,7 +575,7 @@ class Recorder:
             return sys.monitoring.DISABLE
         if code in self._suppressed_codes:
             return sys.monitoring.DISABLE
-        self._close(code, out=capture(retval))
+        self._close(code, out=capture(retval), out_fp=fp_value(retval))
 
     def _on_yield(self, code, offset, retval):
         if not self._in_scope(code.co_filename) or self._skip(code):

@@ -216,6 +216,10 @@ class Node:
     # Caller-visible changes to mutable arguments that retained object identity
     # throughout the call. Values contain bounded entry/exit evidence.
     input_changes: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Fingerprints of the full values (see fingerprint.py). The text fields above
+    # are previews for reading; comparison uses these when both sides have them.
+    in_fp: dict[str, str] = field(default_factory=dict)
+    out_fp: str | None = None
 
     @property
     def code_id(self) -> str:
@@ -232,6 +236,8 @@ class Node:
             "name": self.name,
             "in": self.in_,
             "out": self.out,
+            "in_fp": self.in_fp,
+            "out_fp": self.out_fp,
             "input_changes": self.input_changes,
             "error": self.error,
             "ms": round(self.ms, 2),
@@ -256,6 +262,8 @@ class Node:
             name=d["name"],
             in_=d.get("in", {}),
             out=d.get("out"),
+            in_fp=dict(d.get("in_fp", {})),
+            out_fp=d.get("out_fp"),
             input_changes=dict(d.get("input_changes", {})),
             error=d.get("error"),
             ms=d.get("ms", 0.0),

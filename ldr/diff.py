@@ -6,6 +6,8 @@ import difflib
 import hashlib
 import json
 
+from .fingerprint import REDACTED, is_digest
+from .fingerprint import UNKNOWN as FP_UNKNOWN
 from .node import Node
 
 UNCHANGED = "unchanged"
@@ -19,10 +21,96 @@ RAISED = "raised"
 HANDLED = "handled-exception"
 
 
+UNKNOWN = "unknown"
+
+# Per-field comparison outcomes. A comparison answers equal, different or
+# unknown; a redacted value is never compared, so it cannot make a call differ.
+_EQUAL = "equal"
+_DIFFERENT = "different"
+_UNKNOWN = "unknown"
+
+
 def identity(node: Node) -> str:
     """Checkout-independent identity; display paths and lines are diagnostic."""
     source = node.source_id or node.file
     return f"{source}:{node.name}" if source else node.name
+
+
+def _compare_value(old_text, old_fp, new_text, new_fp) -> tuple[str, bool]:
+    """Compare one captured value; also say if only the fingerprints differ.
+
+    Fingerprints cover the full value; the text is a cut-off preview. When both
+    sides have a digest the digest decides. Otherwise (older traces, types not
+    read structurally) the preview text is all there is to compare.
+    """
+    if is_digest(old_fp) and is_digest(new_fp):
+        if old_fp == new_fp:
+            return _EQUAL, False
+        return _DIFFERENT, old_text == new_text
+    if REDACTED in (old_fp, new_fp):
+        return _EQUAL, False
+    if FP_UNKNOWN in (old_fp, new_fp):
+        return _UNKNOWN, False
+    return (_EQUAL if old_text == new_text else _DIFFERENT), False
+
+
+def compare_fields(old: Node, new: Node, masks: set[str] | None = None) -> dict[str, tuple[str, bool]]:
+    """Per-field outcome for a pair of calls: ``in.<name>``, ``out``, ``error``, ``handled``."""
+    masks = set(old.volatile) | set(new.volatile) | (masks or set())
+    fields: dict[str, tuple[str, bool]] = {}
+    for key in sorted(set(old.in_) | set(new.in_)):
+        if f"in.{key}" in masks:
+            continue
+        if key not in old.in_ or key not in new.in_:
+            fields[f"in.{key}"] = (_DIFFERENT, False)
+            continue
+        fields[f"in.{key}"] = _compare_value(
+            old.in_[key], old.in_fp.get(key), new.in_[key], new.in_fp.get(key)
+        )
+    if "out" not in masks:
+        fields["out"] = _compare_value(old.out, old.out_fp, new.out, new.out_fp)
+    if "error" not in masks:
+        fields["error"] = (_EQUAL if old.error == new.error else _DIFFERENT, False)
+    if "handled" not in masks:
+        fields["handled"] = (_EQUAL if old.handled == new.handled else _DIFFERENT, False)
+    fields["input_changes"] = (
+        _EQUAL if old.input_changes == new.input_changes else _DIFFERENT,
+        False,
+    )
+    return fields
+
+
+def _own_state(old: Node, new: Node, masks: set[str] | None = None) -> str:
+    states = {state for state, _ in compare_fields(old, new, masks).values()}
+    if _DIFFERENT in states:
+        return _DIFFERENT
+    return _UNKNOWN if _UNKNOWN in states else _EQUAL
+
+
+def beyond_preview(old: Node, new: Node) -> list[str]:
+    """Fields whose full values differ although their previews read the same."""
+    return [
+        name
+        for name, (state, only_fingerprint) in compare_fields(old, new).items()
+        if state == _DIFFERENT and only_fingerprint
+    ]
+
+
+def unknown_fields(old: Node, new: Node) -> list[str]:
+    return [name for name, (state, _) in compare_fields(old, new).items() if state == _UNKNOWN]
+
+
+def _inputs_differ(old: Node, new: Node) -> bool:
+    return any(
+        state == _DIFFERENT
+        for name, (state, _) in compare_fields(old, new).items()
+        if name.startswith("in.")
+    )
+
+
+def _fp_or_text(node: Node, key: str) -> str:
+    fingerprint = node.in_fp.get(key)
+    return fingerprint if is_digest(fingerprint) else "t:" + node.in_[key]
 
 
 def _masked_own(node: Node, masks: set[str] | None = None) -> dict:
@@ -32,7 +120,7 @@ def _masked_own(node: Node, masks: set[str] | None = None) -> dict:
         for key, value in node.in_.items()
         if f"in.{key}" not in masks
     }
-    return {
+    payload = {
         "name": node.name,
         "in": inputs,
         "out": None if "out" in masks else node.out,
@@ -40,6 +128,10 @@ def _masked_own(node: Node, masks: set[str] | None = None) -> dict:
         "error": None if "error" in masks else node.error,
         "handled": None if "handled" in masks else node.handled,
     }
+    if node.in_fp or node.out_fp:
+        payload["in_fp"] = {k: v for k, v in node.in_fp.items() if f"in.{k}" not in masks}
+        payload["out_fp"] = None if "out" in masks else node.out_fp
+    return payload
 
 
 def shallow_hash(node: Node) -> str:
@@ -56,14 +148,9 @@ def node_hash(node: Node) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()[:16]
 
 
-def _own_equal(old: Node, new: Node) -> bool:
-    masks = set(old.volatile) | set(new.volatile)
-    return _masked_own(old, masks) == _masked_own(new, masks)
-
-
 def _input_token(node: Node) -> str:
     masks = set(node.volatile)
-    values = {k: v for k, v in node.in_.items() if f"in.{k}" not in masks}
+    values = {k: _fp_or_text(node, k) for k in node.in_ if f"in.{k}" not in masks}
     return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
 
@@ -182,9 +269,13 @@ def diff_tree(
     for left, right in align(old.children, new.children):
         child_changes.extend(diff_tree(left, right, here + " > ", depth + 1))
 
-    own_changed = not _own_equal(old, new)
+    own_state = _own_state(old, new)
+    own_changed = own_state == _DIFFERENT
+    unknown = (
+        [Change(UNKNOWN, here, new, old, depth)] if own_state == _UNKNOWN else []
+    )
     if not own_changed and not child_changes:
-        return []
+        return unknown
 
     from_below = [
         change
@@ -198,7 +289,7 @@ def diff_tree(
         kind = HANDLED
     elif raised_now and not deep_unhandled:
         kind = RAISED
-    elif old.in_ != new.in_ and own_changed:
+    elif _inputs_differ(old, new) and own_changed:
         kind = INPUT_CHANGED
     elif from_below:
         kind = DOWNSTREAM
@@ -214,7 +305,7 @@ def diff_tree(
             for change in child_changes
         )
         self_change = [Change(kind, here, new, old, depth, leaf)]
-    return self_change + child_changes
+    return self_change + unknown + child_changes
 
 
 def origins(changes: list[Change]) -> list[Change]:

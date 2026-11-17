@@ -914,6 +914,7 @@ def main(argv=None) -> int:
         return 0 if inspected else 2
 
     changes = []
+    comparison_unknown = False
     snapshot_action = "none"
     frame_index_payload = _frame_index(recorder.roots)
     suggestions = rank_inspections(recorder.roots, frame_index_payload)
@@ -955,10 +956,23 @@ def main(argv=None) -> int:
             old, envelope = load_trace(golden_path)
             if envelope.get("invocation") not in ({}, invocation):
                 raise ValueError("snapshot invocation metadata does not match this command")
-            for left, right in align(old, recorder.roots):
-                changes.extend(diff_tree(left, right))
-            snapshot_action = "compared"
-            if changes:
+            snapshot_schema = envelope.get("schema_version", 1)
+            if snapshot_schema < SCHEMA_VERSION:
+                comparison_unknown = True
+                snapshot_action = "unknown"
+                text = (
+                    "COMPARISON UNKNOWN: this snapshot was recorded by an older LDR "
+                    f"(schema {snapshot_schema}, current {SCHEMA_VERSION}). Its values are "
+                    "cut-off previews, so equal or different cannot be said. "
+                    "Re-record it with --golden, then compare again."
+                )
+            else:
+                for left, right in align(old, recorder.roots):
+                    changes.extend(diff_tree(left, right))
+                snapshot_action = "compared"
+            if comparison_unknown:
+                pass
+            elif changes:
                 text = "BEST GUESS, RANKED\n" + render_diff(changes, args.color)
                 text += "\n\nCALL CHAIN\n" + render_call_chain(recorder.roots, changes, args.color)
             else:
@@ -1050,7 +1064,7 @@ def main(argv=None) -> int:
 
     if recorder.exit_code != 0:
         return recorder.exit_code
-    if args.fail_on_change and changes:
+    if args.fail_on_change and (changes or comparison_unknown):
         return 3
     return 0
 
