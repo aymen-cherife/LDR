@@ -3,8 +3,9 @@
 The ranker deliberately works with one captured execution.  It therefore does
 not present statistical suspiciousness or causal claims.  It combines signals
 that are observable in that execution: location on a failing branch, completion
-proximity, captured-value overlap, identifier overlap, repetition, and common
-diagnostic noise.
+proximity, in-place input mutation, repetition, and common diagnostic noise.
+Words shared between a function's name and the error text are NOT a signal:
+on a real probe they ranked the culprit last.  The replacement waits for Bench 0.
 """
 
 from __future__ import annotations
@@ -139,40 +140,18 @@ def rank_inspections(
     ]
     if not failures:
         return []
-    context = _tokens(*(
-        item
-        for frame in failures
-        for item in (frame.node.name, frame.node.error or "")
-    ))
-    failure_value_tokens = _tokens(*(frame.node.error or "" for frame in failures))
     counts = Counter(frame.node.code_id for frame in observed)
     short_ids = {
         frame.get("frame_id"): frame.get("id")
         for frame in frame_index.get("frames", [])
     }
 
-    subtree_code_overlap: dict[int, set[str]] = {}
-    subtree_value_overlap: dict[int, set[str]] = {}
     subtree_sizes: dict[int, int] = {}
 
-    def collect_subtree(node: Node) -> tuple[set[str], set[str], int]:
-        code_overlap = set()
-        value_overlap = set()
-        size = 1
-        if not _is_test_source(node):
-            code_overlap = _tokens(node.name, node.module) & context
-            value_overlap = (
-                _tokens(*node.in_.values(), node.out or "") & failure_value_tokens
-            )
-        for child in node.children:
-            child_code, child_values, child_size = collect_subtree(child)
-            code_overlap.update(child_code)
-            value_overlap.update(child_values)
-            size += child_size
-        subtree_code_overlap[id(node)] = code_overlap
-        subtree_value_overlap[id(node)] = value_overlap
+    def collect_subtree(node: Node) -> int:
+        size = 1 + sum(collect_subtree(child) for child in node.children)
         subtree_sizes[id(node)] = size
-        return code_overlap, value_overlap, size
+        return size
 
     for root in roots:
         collect_subtree(root)
@@ -189,14 +168,9 @@ def rank_inspections(
         evidence: dict[str, object] = {
             "on_failed_branch": False,
             "completion_distance": None,
-            "identifier_overlap": [],
-            "captured_value_overlap": [],
-            "subtree_identifier_overlap": [],
-            "subtree_value_overlap": [],
             "distinct_observed_callees": distinct_callees,
             "recorded_calls": counts[node.code_id],
             "mutated_inputs": [],
-            "mutation_value_overlap": [],
             "noise_penalty": None,
         }
         source_is_test = _is_test_source(node)
@@ -231,58 +205,14 @@ def rank_inspections(
             else:
                 signals.append("exception recorded on the failed execution branch")
 
-        name_overlap = _tokens(node.name, node.module) & context
-        source_overlap = (_tokens(node.source_id) & context) - name_overlap
-        identifier_overlap = sorted(name_overlap | source_overlap)
-        evidence["identifier_overlap"] = identifier_overlap[:6]
-        if identifier_overlap:
-            score += min(24, len(name_overlap) * 7 + len(source_overlap) * 2)
-            signals.append(
-                "identifier overlap with failure context: "
-                + ", ".join(identifier_overlap[:3])
-            )
-
-        captured_tokens = _tokens(*node.in_.values(), node.out or "")
-        value_overlap = sorted(captured_tokens & failure_value_tokens)
-        evidence["captured_value_overlap"] = value_overlap[:6]
-        if value_overlap:
-            score += min(15, len(value_overlap) * 5)
-            signals.append(
-                "captured value overlaps failure evidence: "
-                + ", ".join(value_overlap[:3])
-            )
-
         mutated_inputs = sorted(node.input_changes)
-        mutation_tokens = _tokens(*(
-            value
-            for change in node.input_changes.values()
-            for value in (change.get("before", ""), change.get("after", ""))
-        ))
-        mutation_overlap = sorted(mutation_tokens & failure_value_tokens)
         evidence["mutated_inputs"] = mutated_inputs[:6]
-        evidence["mutation_value_overlap"] = mutation_overlap[:6]
         if mutated_inputs:
             score += 32
-            score += min(12, len(mutation_overlap) * 4)
             signals.insert(
                 0,
                 "caller-owned input changed in place during call: "
                 + ", ".join(mutated_inputs[:3]),
-            )
-
-        descendant_code = sorted(
-            subtree_code_overlap.get(id(node), set()) - name_overlap
-        )
-        descendant_values = sorted(
-            subtree_value_overlap.get(id(node), set()) - set(value_overlap)
-        )
-        evidence["subtree_identifier_overlap"] = descendant_code[:6]
-        evidence["subtree_value_overlap"] = descendant_values[:6]
-        if descendant_code or descendant_values:
-            score += min(15, len(descendant_code) * 4 + len(descendant_values) * 3)
-            signals.append(
-                "relevant evidence in observed callees: "
-                + ", ".join((descendant_code + descendant_values)[:3])
             )
 
         if distinct_callees >= 2:

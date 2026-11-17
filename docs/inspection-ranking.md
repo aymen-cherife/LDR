@@ -12,14 +12,17 @@ removed from the final shortlist:
 
 1. whether the frame is structurally on the failed execution branch;
 2. how recently it completed relative to the observed failure;
-3. token overlap between its function/source identifiers and failure context;
-4. overlap between its captured inputs/output and values in the failure;
-5. whether an unhandled exception was recorded in the frame;
-6. whether a mutable argument kept its identity but changed representation
-   during the call, including overlap with values from the failure;
-7. a penalty for highly repetitive functions;
-8. a penalty for common diagnostic noise such as display/serialization helpers
+3. whether an unhandled exception was recorded in the frame;
+4. whether a mutable argument kept its identity but changed representation
+   during the call;
+5. a penalty for highly repetitive functions;
+6. a penalty for common diagnostic noise such as display/serialization helpers
    and tracing/logging setup.
+
+Words shared between a function's name (or its captured values) and the error
+text are **not** a signal. On a real probe that overlap ranked the actual
+culprit last, so the signals were removed. The replacement ranking method waits
+for Bench 0.
 
 Calls of the same function are collapsed to their strongest invocation. LDR
 returns at most three suggestions and omits candidates more than 30 points
@@ -49,9 +52,8 @@ alias analysis or proof of defect.
   and passing states; LDR's single-run ranking is deliberately weaker and does
   not call its transitions causal.
 - [Fault localization using textual similarities](https://arxiv.org/abs/1211.2858)
-  motivates lightweight identifier overlap between failure context and
-  executed code. LDR uses deterministic token overlap, not an IR corpus or a
-  semantic model.
+  motivated an earlier identifier-overlap signal. It is removed in 0.6 (see
+  above); the reference is kept as history.
 - [The Whyline](https://doi.org/10.1145/1368088.1368130) motivates grounding
   explanations in observed behavior instead of asking the agent to invent a
   source-level cause before inspecting runtime evidence.
@@ -63,7 +65,7 @@ alias analysis or proof of defect.
 ## What the agent may conclude
 
 The agent may say that a frame is a strong next inspection because LDR observed
-it on the failed branch, near the failure, with relevant identifiers or values.
+it on the failed branch, near the failure, or mutating an input in place.
 It may not say that LDR proved that frame contains the bug. A focused state
 transition is direct evidence of a value change at a statement; the causal
 interpretation still requires program semantics, source reading, and a normal

@@ -72,7 +72,6 @@ def test_ranked_shortcut_finds_completed_production_frame_and_captures_state(tmp
     first = payload["suggestions"][0]
     assert first["function"] == "calculate_checkout"
     assert first["evidence"]["on_failed_branch"] is True
-    assert first["evidence"]["identifier_overlap"]
     assert "SUGGESTED INSPECTIONS" in text
     assert f"ldr inspect --frame-id {first['id']}" in text
 
@@ -114,6 +113,47 @@ def test_ranking_is_deterministic_and_downranks_diagnostic_noise(tmp_path):
     assert projection(first) == projection(second)
     assert first["suggestions"][0]["function"] == "calculate_checkout"
     assert [item["function"] for item in first["suggestions"]] == ["calculate_checkout"]
+
+
+def test_ranking_does_not_reward_words_shared_with_the_error_text(tmp_path):
+    """Defect 10: on the 13 Nov probe, word overlap ranked the real culprit last.
+
+    The same program with every project identifier renamed must score the same:
+    only observed facts may move a place to inspect up or down."""
+    def scores(project: Path, function: str, text: str) -> list:
+        (project / "m.py").write_text(
+            f"def {function}(value):\n"
+            "    return value + 1\n"
+            "def test_it():\n"
+            f"    assert {function}(1) == 3, 'wrong {text}'\n"
+        )
+        broad = invoke(project, "pytest", "m.py::test_it")
+        assert broad.returncode == 1
+        _, payload = load_result(project)
+        return [(item["score"], item["reasons"]) for item in payload["suggestions"]]
+
+    shared = tmp_path / "shared"
+    unrelated = tmp_path / "unrelated"
+    shared.mkdir()
+    unrelated.mkdir()
+
+    same_words = scores(shared, "build_total", "build total")
+    other_words = scores(unrelated, "zq_frobnicate", "unrelated words")
+
+    assert same_words and same_words == other_words
+    for _, reasons in same_words:
+        assert not any("overlap" in reason for reason in reasons)
+
+
+def test_suggestion_evidence_lists_only_observed_facts(tmp_path):
+    make_flat_project(tmp_path)
+
+    invoke(tmp_path, "pytest", "tests/test_checkout.py::test_checkout_total")
+    _, payload = load_result(tmp_path)
+
+    evidence = payload["suggestions"][0]["evidence"]
+    assert not [key for key in evidence if "overlap" in key], evidence
+    assert evidence["on_failed_branch"] is True
 
 
 def test_wrong_explicit_scope_warns_and_names_detected_root(tmp_path):
