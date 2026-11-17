@@ -206,15 +206,11 @@ def mark_unstable(old: Node, probe: Node) -> None:
     if identity(old) != identity(probe):
         return
     masks = set(old.volatile)
-    for key in set(old.in_) | set(probe.in_):
-        if old.in_.get(key) != probe.in_.get(key):
-            masks.add(f"in.{key}")
-    if old.out != probe.out:
-        masks.add("out")
-    if old.error != probe.error:
-        masks.add("error")
-    if old.handled != probe.handled:
-        masks.add("handled")
+    # Same rule as comparison: full-value fingerprints decide, so a field that
+    # varies only beyond its preview is learned too.
+    for name, (state, _) in compare_fields(old, probe).items():
+        if state == _DIFFERENT and name != "input_changes":
+            masks.add(name)
     old.volatile = sorted(masks)
     old.unstable = bool(masks)
     for left, right in align(old.children, probe.children):
@@ -324,6 +320,29 @@ def diff_tree(
         )
         self_change = [Change(kind, here, new, old, depth, leaf)]
     return self_change + unknown + child_changes
+
+
+def unstable_fields(roots: list[Node]) -> list[dict[str, str]]:
+    """Fields learned to vary between identical runs. They are not compared, so
+    they are listed instead: a masked field must never hide silently."""
+    found = []
+    for root in roots:
+        for node in root.walk():
+            for name in sorted(set(node.volatile)):
+                found.append(
+                    {"call": node.frame_id or node.code_id, "function": node.name, "field": name}
+                )
+    return found
+
+
+def render_unstable(items: list[dict[str, str]], limit: int = 10) -> str:
+    if not items:
+        return ""
+    lines = ["UNSTABLE (shown, not compared)"]
+    lines += [f"  {item['call']}  {item['field']}" for item in items[:limit]]
+    if len(items) > limit:
+        lines.append(f"  (+{len(items) - limit} more in .ldr/last.json)")
+    return "\n".join(lines)
 
 
 def origins(changes: list[Change]) -> list[Change]:

@@ -17,7 +17,7 @@ import time
 import tomllib
 from typing import Any
 
-from .diff import align, diff_tree, mark_unstable, rank
+from .diff import align, diff_tree, mark_unstable, rank, render_unstable, unstable_fields
 from .gitinfo import describe_commit, describe_outcome, git_state
 from .node import Node, count_redacted
 from .render import render_call_chain, render_diff, render_inspection, render_run
@@ -939,6 +939,7 @@ def main(argv=None) -> int:
         return 0 if inspected else 2
 
     changes = []
+    unstable: list[dict[str, str]] = []
     comparison_unknown = False
     snapshot_action = "none"
     frame_index_payload = _frame_index(recorder.roots)
@@ -977,6 +978,9 @@ def main(argv=None) -> int:
             )
             if args.learn_volatility:
                 text += f"\n{volatility} node(s) contain field-level volatility masks."
+                unstable = unstable_fields(recorder.roots)
+                if unstable:
+                    text += "\n\n" + render_unstable(unstable)
         elif args.diff:
             if not os.path.exists(golden_path):
                 raise FileNotFoundError(
@@ -1006,6 +1010,9 @@ def main(argv=None) -> int:
                 text += "\n\nCALL CHAIN\n" + render_call_chain(recorder.roots, changes, args.color)
             else:
                 text = "No behavioural change vs snapshot."
+            unstable = unstable_fields(old)
+            if unstable:
+                text += "\n\n" + render_unstable(unstable)
             baseline_status = envelope.get("status", {})
             if baseline_status:
                 text = (
@@ -1082,6 +1089,7 @@ def main(argv=None) -> int:
         "behavior": {
             "changed": bool(changes),
             "finding_count": len(changes),
+            "unstable_fields": unstable[:50],
         },
         "frame_index": frame_index_payload,
         "suggestions": suggestions,
