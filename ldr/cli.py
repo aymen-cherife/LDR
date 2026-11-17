@@ -18,6 +18,7 @@ import tomllib
 from typing import Any
 
 from .diff import align, diff_tree, mark_unstable, rank
+from .gitinfo import describe_commit, describe_outcome, git_state
 from .node import Node, count_redacted
 from .render import render_call_chain, render_diff, render_inspection, render_run
 from .store import (
@@ -572,7 +573,7 @@ def _limit_text(text: str, max_lines: int, max_chars: int = 40_000) -> str:
 def _redaction_note(count: int) -> str:
     if not count:
         return ""
-    return f"REDACTED: {count} value(s) redacted, not compared.\n\n"
+    return f"REDACTED: {count} value(s) redacted, not compared.\n"
 
 
 def _write_result(text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR) -> tuple[str, str]:
@@ -834,7 +835,10 @@ def main(argv=None) -> int:
         "execution_seconds": round(execution_finished - execution_started, 6),
     }
     status["redacted_values"] = count_redacted(recorder.roots)
-    redaction_note = _redaction_note(status["redacted_values"])
+    status["commit"] = git_state(project_root)
+    redaction_note = f"COMMIT: {describe_commit(status['commit'])}\n" + _redaction_note(
+        status["redacted_values"]
+    )
     if (
         recorder.exit_code != 0
         and detected_roots
@@ -954,6 +958,10 @@ def main(argv=None) -> int:
             )
             volatility = sum(bool(node.volatile) for root in recorder.roots for node in root.walk())
             text += f"\n\nSnapshot saved for this invocation: {os.path.relpath(golden_path, initial_cwd)}"
+            text += (
+                f"\nBaseline recorded from a run with outcome {describe_outcome(status)} "
+                f"at commit {describe_commit(status['commit'])}."
+            )
             if args.learn_volatility:
                 text += f"\n{volatility} node(s) contain field-level volatility masks."
         elif args.diff:
@@ -985,6 +993,14 @@ def main(argv=None) -> int:
                 text += "\n\nCALL CHAIN\n" + render_call_chain(recorder.roots, changes, args.color)
             else:
                 text = "No behavioural change vs snapshot."
+            baseline_status = envelope.get("status", {})
+            if baseline_status:
+                text = (
+                    f"BASELINE: outcome {describe_outcome(baseline_status)}, commit "
+                    f"{describe_commit(baseline_status.get('commit'))}. "
+                    f"THIS RUN: outcome {describe_outcome(status)}, commit "
+                    f"{describe_commit(status['commit'])}.\n\n" + text
+                )
         else:
             text = render_run(
                 recorder.roots,
