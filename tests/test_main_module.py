@@ -4,7 +4,6 @@ import os
 import subprocess
 import sys
 
-import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
