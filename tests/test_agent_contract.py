@@ -71,7 +71,8 @@ def test_late_exception_survives_node_budget(tmp_path):
     assert result.returncode == 1
     output = (tmp_path / ".ldr" / "last.txt").read_text()
     assert "fail() ! RuntimeError: late" in output
-    assert len(output.splitlines()) < 30
+    # Still compact. The bound grew from 30 when COMMIT and SCOPE header lines were added.
+    assert len(output.splitlines()) < 32
     assert "CAPTURE LIMITS" in output
 
 

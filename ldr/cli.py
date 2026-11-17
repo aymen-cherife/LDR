@@ -836,8 +836,21 @@ def main(argv=None) -> int:
     }
     status["redacted_values"] = count_redacted(recorder.roots)
     status["commit"] = git_state(project_root)
-    redaction_note = f"COMMIT: {describe_commit(status['commit'])}\n" + _redaction_note(
-        status["redacted_values"]
+    recorded_scope = _display_scope(scope, initial_cwd)
+    project_calls = sum(
+        1 for root in recorder.roots for node in root.walk() if not _is_test_node(node)
+    )
+    if project_calls == 0:
+        scope_warnings.append(
+            "No calls from project code were recorded. If the code you expected lives "
+            "elsewhere, rerun with --only <dir> to name it, or --project-root <dir> to "
+            f"set the project root. Recorded scope: {', '.join(recorded_scope) or '(none)'}."
+        )
+    redaction_note = (
+        f"COMMIT: {describe_commit(status['commit'])}\n"
+        f"SCOPE: {', '.join(recorded_scope) or '(none)'}; "
+        f"{project_calls} project call(s) recorded\n"
+        + _redaction_note(status["redacted_values"])
     )
     if (
         recorder.exit_code != 0
@@ -1074,6 +1087,8 @@ def main(argv=None) -> int:
         "suggestions": suggestions,
         "scope": {
             "detected_production_roots": _display_scope(detected_roots, initial_cwd),
+            "recorded": recorded_scope,
+            "project_calls": project_calls,
             "warnings": scope_warnings,
         },
         "findings": _finding_payload(changes),
