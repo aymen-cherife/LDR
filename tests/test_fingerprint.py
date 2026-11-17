@@ -325,6 +325,37 @@ def test_dict_order_is_kept_but_set_order_is_not():
     assert "changed beyond the preview or in ordering" in render_diff(changes)
 
 
+def test_set_fingerprints_do_not_depend_on_hash_randomization():
+    """String hashes differ per process, so set iteration order does too. An
+    order-sensitive set fingerprint would flag a difference between two runs of
+    identical code. Dict order, by contrast, is a stable part of the value."""
+    import subprocess
+
+    probe = (
+        "import sys; sys.path.insert(0, sys.argv[1])\n"
+        "from ldr.fingerprint import fingerprint\n"
+        "words = {'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel'}\n"
+        "print(fingerprint(words), fingerprint(frozenset(words)),\n"
+        "      fingerprint({'k': words, 'n': [frozenset(words)]}),\n"
+        "      fingerprint({'a': 1, 'b': 2}), fingerprint({'b': 2, 'a': 1}))\n"
+    )
+    root = os.path.dirname(HERE)
+
+    def run(seed):
+        return subprocess.run(
+            [sys.executable, "-c", probe, root],
+            env=dict(os.environ, PYTHONHASHSEED=seed),
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+
+    first, second, third = run("1"), run("2"), run("12345")
+
+    assert first == second == third
+    set_fp, frozen_fp, nested_fp, ab_fp, ba_fp = first
+    assert set_fp != frozen_fp  # a set and a frozenset are different values
+    assert ab_fp != ba_fp  # dict order is kept, in every process
+
+
 def test_equal_partial_receivers_are_equal_in_readable_parts_not_equal():
     """Two receivers that differ only in an unreadable part (a lock) have equal
     `+` digests. That is not proof of equality, and the output must not say it."""
