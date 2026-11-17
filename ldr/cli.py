@@ -944,6 +944,7 @@ def main(argv=None) -> int:
         return 0 if inspected else 2
 
     changes = []
+    baseline_sampled = 0
     unstable: list[dict[str, str]] = []
     comparison_unknown = False
     snapshot_action = "none"
@@ -1019,6 +1020,7 @@ def main(argv=None) -> int:
             if unstable:
                 text += "\n\n" + render_unstable(unstable)
             baseline_status = envelope.get("status", {})
+            baseline_sampled = baseline_status.get("sampled_repetitions", 0)
             if baseline_status:
                 text = (
                     f"BASELINE: outcome {describe_outcome(baseline_status)}, commit "
@@ -1070,6 +1072,11 @@ def main(argv=None) -> int:
     else:
         note = "RUN STATUS: PASSED\n\n"
     note += redaction_note
+    if recorder.sampled_nodes or baseline_sampled:
+        note += (
+            f"NOT COMPARED: calls beyond the first {args.max_calls_per_function} "
+            "per function are not compared (sampled).\n"
+        )
     if timeout_requested and not hasattr(signal, "SIGALRM"):
         # Windows has no SIGALRM, so the in-process timeout cannot fire.
         note += (
