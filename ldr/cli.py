@@ -32,7 +32,7 @@ from .store import (
     snapshot_path,
 )
 from .suggest import rank_inspections
-from .tracer import Recorder
+from .tracer import Recorder, python_version_message
 
 LDR_DIR = ".ldr"
 _KNOWN_RUNNERS = {"unittest", "pytest", "doctest", "pdb", "cProfile", "trace", "timeit"}
@@ -648,6 +648,10 @@ def _probe(
 
 
 def main(argv=None) -> int:
+    unsupported = python_version_message()
+    if unsupported:
+        print(unsupported, file=sys.stderr)
+        return 2
     total_started = time.perf_counter()
     initial_cwd = os.path.realpath(os.getcwd())
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)

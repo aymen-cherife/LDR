@@ -50,6 +50,19 @@ def _mark_handled(node: Node) -> None:
         _mark_handled(child)
 
 
+MIN_PYTHON = (3, 12)
+
+
+def python_version_message() -> str | None:
+    """Why LDR cannot run on this interpreter, or None if it can."""
+    if sys.version_info[:2] >= MIN_PYTHON and hasattr(sys, "monitoring"):
+        return None
+    return (
+        f"LDR needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+. "
+        f"You are on {sys.version_info[0]}.{sys.version_info[1]}."
+    )
+
+
 class Recorder:
     def __init__(
         self,
@@ -647,6 +660,9 @@ class Recorder:
         )
 
     def start(self) -> None:
+        unsupported = python_version_message()
+        if unsupported:
+            raise RuntimeError(unsupported)
         mon = sys.monitoring
         tool_id = self._claim_tool_id()
         self._tool_id = tool_id
