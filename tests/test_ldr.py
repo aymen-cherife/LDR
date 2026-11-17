@@ -624,7 +624,7 @@ def test_entry_file_failure_is_never_hidden_by_only(tmp_path):
 
 
 def test_only_accepts_multiple_paths_without_dropping_any():
-    """--only used to accept a single path; the golden-run probe
+    """--only used to accept a single path; the golden-run noise run
     subprocess also only forwarded the first scope entry, silently
     narrowing scope on the second half of every --golden call."""
     from ldr.cli import _entry_dirs

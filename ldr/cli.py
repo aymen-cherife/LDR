@@ -585,7 +585,7 @@ def _write_result(text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR) ->
     return text_path, json_path
 
 
-def _probe(
+def _noise_run(
     args,
     scope: list[str],
     invocation: dict[str, Any],
@@ -593,10 +593,10 @@ def _probe(
     ldr_dir: str,
 ) -> list[Node]:
     os.makedirs(ldr_dir, exist_ok=True)
-    fd, probe_path = tempfile.mkstemp(prefix="probe-", suffix=".json", dir=ldr_dir)
+    fd, noise_path = tempfile.mkstemp(prefix="noise-", suffix=".json", dir=ldr_dir)
     os.close(fd)
-    os.unlink(probe_path)
-    environment = dict(os.environ, LDR_PROBE=probe_path)
+    os.unlink(noise_path)
+    environment = dict(os.environ, LDR_NOISE_RUN=noise_path)
     command = [
         sys.executable,
         "-m",
@@ -627,22 +627,22 @@ def _probe(
             cwd=args.initial_cwd,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("volatility probe timed out; snapshot was not saved") from exc
+        raise RuntimeError("noise run timed out; snapshot was not saved") from exc
     try:
-        if not os.path.exists(probe_path):
+        if not os.path.exists(noise_path):
             detail = completed.stderr.decode(errors="replace")[-500:]
-            raise RuntimeError(f"volatility probe produced no trace: {detail}")
-        roots, envelope = load_trace(probe_path)
-        probe_status = envelope.get("status", {})
-        if probe_status.get("exit_code") != recorder.exit_code:
+            raise RuntimeError(f"noise run produced no trace: {detail}")
+        roots, envelope = load_trace(noise_path)
+        noise_status = envelope.get("status", {})
+        if noise_status.get("exit_code") != recorder.exit_code:
             raise RuntimeError(
-                "volatility probe changed runner status; snapshot was not saved "
-                f"({recorder.exit_code} then {probe_status.get('exit_code')})"
+                "noise run changed runner status; snapshot was not saved "
+                f"({recorder.exit_code} then {noise_status.get('exit_code')})"
             )
         return roots
     finally:
         try:
-            os.unlink(probe_path)
+            os.unlink(noise_path)
         except FileNotFoundError:
             pass
 
@@ -873,9 +873,9 @@ def main(argv=None) -> int:
             "The trace captured no frames from a detected production package. "
             f"Try: {command}"
         )
-    probe_path = os.environ.get("LDR_PROBE")
-    if probe_path:
-        save_trace(probe_path, recorder.roots, invocation=invocation, status=status)
+    noise_path = os.environ.get("LDR_NOISE_RUN")
+    if noise_path:
+        save_trace(noise_path, recorder.roots, invocation=invocation, status=status)
         return recorder.exit_code
 
     if requested_mode == "inspect":
@@ -955,7 +955,7 @@ def main(argv=None) -> int:
     try:
         if args.golden:
             if args.learn_volatility:
-                second = _probe(args, scope, invocation, recorder, ldr_dir)
+                second = _noise_run(args, scope, invocation, recorder, ldr_dir)
                 for left, right in align(recorder.roots, second):
                     if left is not None and right is not None:
                         mark_unstable(left, right)

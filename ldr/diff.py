@@ -201,19 +201,19 @@ def align(old: list[Node], new: list[Node]):
     return pairs
 
 
-def mark_unstable(old: Node, probe: Node) -> None:
+def mark_unstable(old: Node, noise: Node) -> None:
     """Learn volatile fields without suppressing deterministic descendants."""
-    if identity(old) != identity(probe):
+    if identity(old) != identity(noise):
         return
     masks = set(old.volatile)
     # Same rule as comparison: full-value fingerprints decide, so a field that
     # varies only beyond its preview is learned too.
-    for name, (state, _) in compare_fields(old, probe).items():
+    for name, (state, _) in compare_fields(old, noise).items():
         if state == _DIFFERENT and name != "input_changes":
             masks.add(name)
     old.volatile = sorted(masks)
     old.unstable = bool(masks)
-    for left, right in align(old.children, probe.children):
+    for left, right in align(old.children, noise.children):
         if left is not None and right is not None:
             mark_unstable(left, right)
 
