@@ -288,6 +288,26 @@ def test_receiver_with_unreadable_parts_is_marked_partial_not_dropped():
     assert token.endswith("+") and token[:-1].isalnum(), token  # readable part only
 
 
+def test_dict_order_is_kept_but_set_order_is_not():
+    """Defect 13: insertion order is part of a dict's value; sets have none."""
+    import fixtures.values as v
+
+    from ldr.fingerprint import fingerprint
+
+    assert fingerprint({"a": 1, "b": 2}) != fingerprint({"b": 2, "a": 1})
+    assert fingerprint({1, 2, 3}) == fingerprint({3, 2, 1})
+    assert fingerprint(["a", "b"]) != fingerprint(["b", "a"])
+
+    old = record(lambda: v.accept({"a": 1, "b": 2}))
+    new = record(lambda: v.accept({"b": 2, "a": 1}))
+    assert old.roots[0].in_ == new.roots[0].in_  # previews stay sorted, as before
+
+    changes = diff_tree(old.roots[0], new.roots[0])
+
+    assert changes
+    assert "changed beyond the preview or in ordering" in render_diff(changes)
+
+
 def test_identical_long_values_are_equal():
     import fixtures.values as v
 
