@@ -10,6 +10,7 @@ import os
 import runpy
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from . import __version__
 from .diff import (
     EQUAL_READABLE,
     align,
+    compare_fields,
     diff_tree,
     mark_unstable,
     rank,
@@ -28,7 +30,7 @@ from .diff import (
     unstable_fields,
 )
 from .gitinfo import describe_commit, describe_outcome, git_state
-from .node import Node, capture_error, count_redacted
+from .node import Node, capture, capture_error, count_redacted
 from .redact import redact_argv, register_argv_secrets
 from .render import render_call_chain, render_diff, render_inspection, render_run
 from .store import (
@@ -42,7 +44,10 @@ from .store import (
     snapshot_path,
 )
 from .suggest import rank_inspections
+from .call_stream import CallStream, changed_functions
+from .sqlite_store import TraceStore, storage_settings
 from .tracer import Recorder, python_version_message
+from .value_capture import first_difference
 
 LDR_DIR = ".ldr"
 _KNOWN_RUNNERS = {"unittest", "pytest", "doctest", "pdb", "cProfile", "trace", "timeit"}
@@ -63,9 +68,11 @@ def _record(
     *,
     timeout: float = 300,
     defer_start: bool = False,
+    call_stream: CallStream | None = None,
     **kwargs,
 ):
     recorder = Recorder(scope=scope, **kwargs)
+    recorder.call_stream = call_stream
     recorder.crashed = False
     recorder.exit_code = 0
     recorder.crash_summary = ""
@@ -174,7 +181,7 @@ def _target_origin(mode: str, target: str, rest: list[str]) -> str | None:
 def _infer_project_root(mode: str, target: str, rest: list[str], cwd: str) -> str:
     origin = _target_origin(mode, target, rest)
     start = os.path.dirname(origin) if origin and os.path.isfile(origin) else (origin or cwd)
-    current = os.path.realpath(start)
+    fallback = current = os.path.realpath(start)
     generic_roots = {
         os.path.realpath(os.path.abspath(os.sep)),
         os.path.realpath(tempfile.gettempdir()),
@@ -186,7 +193,15 @@ def _infer_project_root(mode: str, target: str, rest: list[str], cwd: str) -> st
             return current
         parent = os.path.dirname(current)
         if parent == current:
-            return os.path.realpath(start)
+            return fallback
+        if (
+            mode == "pytest"
+            and parent == cwd
+            and cwd not in generic_roots
+            and os.path.basename(current).lower() in {"test", "tests"}
+        ):
+            # A markerless project may keep its source beside the test directory.
+            fallback = cwd
         current = parent
 
 
@@ -464,7 +479,32 @@ def _recent_context(node: Node) -> list[dict[str, Any]]:
     return recent
 
 
-def _finding_payload(changes) -> list[dict[str, Any]]:
+def _value_differences(store, baseline_id, change):
+    if change.old is None or not change.old.frame_id or not change.node.frame_id:
+        return []
+    before = store.frame_values(baseline_id, change.old.frame_id)
+    after = store.frame_values(store.run_id, change.node.frame_id)
+    differences = []
+    for field, (state, _) in compare_fields(change.old, change.node).items():
+        if state != "different":
+            continue
+        if field == "out":
+            phase, name = "return", "result"
+        elif field.startswith("in."):
+            phase, name = "entry", field[3:]
+        else:
+            continue
+        left = before.get(phase, {}).get(name, {})
+        right = after.get(phase, {}).get(name, {})
+        if left.get("status") == right.get("status") == "complete":
+            detail = first_difference(left["value"], right["value"])
+            if detail is not None:
+                path, old, new = detail
+                differences.append({"field": field, "path": path, "before": capture(old), "after": capture(new)})
+    return differences
+
+
+def _finding_payload(changes, store=None, baseline_id=None) -> list[dict[str, Any]]:
     findings = []
     for position, change in enumerate(sorted(changes, key=rank)[:25], 1):
         findings.append(
@@ -481,6 +521,10 @@ def _finding_payload(changes) -> list[dict[str, Any]]:
                 "after": _node_state(change.node),
             }
         )
+        if store is not None and store.max_value_bytes and baseline_id:
+            details = _value_differences(store, baseline_id, change)
+            if details:
+                findings[-1]["value_changes"] = details
     return findings
 
 
@@ -531,6 +575,7 @@ def _frame_index(roots: list[Node], limit: int = 5000) -> dict[str, Any]:
                     "location": node.location,
                     "error": node.error,
                     "handled": node.handled,
+                    **({"timing": node.timing} if node.timing is not None else {}),
                 }
             )
         key = (node.source_id, node.name)
@@ -601,6 +646,13 @@ def _write_result(text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR) ->
     atomic_text(text_path, text)
     atomic_json(json_path, payload)
     return text_path, json_path
+
+
+def _print_result(text: str) -> None:
+    encoding = sys.stdout.encoding
+    if encoding:
+        text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    print(text)
 
 
 def _noise_run(
@@ -798,7 +850,26 @@ def main(argv=None) -> int:
     if args.learn_volatility and not args.golden:
         parser.error("--learn-volatility is only valid while saving a snapshot")
 
+    store = None
+    storage_warning = None
+    try:
+        store = TraceStore.start(ldr_dir, invocation, *storage_settings(project_root))
+    except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        storage_warning = capture_error(exc)
+
+    recorder_options = {
+        "scope": scope,
+        "max_nodes": args.max_nodes,
+        "project_root": project_root,
+        "display_root": initial_cwd,
+        "focus_frame": args.frame if requested_mode == "inspect" else None,
+        "max_state_steps": args.max_state_steps,
+        "max_calls_per_function": args.max_calls_per_function,
+    }
+    pytest_capture = None
+
     def go(recorder):
+        nonlocal pytest_capture
         if args.mode == "run":
             sys.argv = [args.target] + args.rest
             runpy.run_path(args.target, run_name="__main__")
@@ -808,20 +879,12 @@ def main(argv=None) -> int:
         else:
             import pytest
 
-            class RuntimeOnlyPlugin:
-                """Arm tracing after collection, before the selected test's setup."""
+            from .pytest_capture import ControllerCapture
 
-                def pytest_runtest_protocol(self, item, nextitem):
-                    if not recorder._active:
-                        recorder.start()
-
-                def pytest_runtest_makereport(self, item, call):
-                    if call.excinfo is not None:
-                        recorder.runner_exception = call.excinfo.value
-
+            pytest_capture = ControllerCapture(recorder, store, recorder_options)
             code = pytest.main(
-                [args.target, *args.rest, "-q", "-p", "no:cacheprovider"],
-                plugins=[RuntimeOnlyPlugin()],
+                [args.target, *args.rest, "-q", "-p", "no:cacheprovider", "-p", "ldr.pytest_worker"],
+                plugins=[pytest_capture],
             )
             if int(code) != 0:
                 raise SystemExit(int(code))
@@ -830,15 +893,10 @@ def main(argv=None) -> int:
     try:
         recorder = _record(
             go,
-            scope,
             timeout=args.timeout,
             defer_start=args.mode == "pytest",
-            max_nodes=args.max_nodes,
-            project_root=project_root,
-            display_root=initial_cwd,
-            focus_frame=args.frame if requested_mode == "inspect" else None,
-            max_state_steps=args.max_state_steps,
-            max_calls_per_function=args.max_calls_per_function,
+            call_stream=CallStream(store, "main") if store is not None else None,
+            **recorder_options,
         )
     except (RuntimeError, ValueError) as exc:
         message = f"LDR could not start tracing: {exc}"
@@ -854,12 +912,42 @@ def main(argv=None) -> int:
         return 2
     execution_finished = time.perf_counter()
 
+    missing_workers = pytest_capture.merge() if pytest_capture and pytest_capture.workers else []
     status = _status(recorder)
+    if pytest_capture and pytest_capture.workers:
+        status["trace_workers"] = sorted(set(pytest_capture.workers) - set(missing_workers))
+    if missing_workers:
+        status["missing_trace_workers"] = missing_workers
+        scope_warnings.append(f"Missing trace from pytest workers: {', '.join(missing_workers)}.")
     status["timing"] = {
         "execution_seconds": round(execution_finished - execution_started, 6),
     }
     status["redacted_values"] = count_redacted(recorder.roots)
     status["commit"] = git_state(project_root)
+    if store is not None:
+        status["run_id"] = store.run_id
+        try:
+            if not pytest_capture or not pytest_capture.workers:
+                recorder.call_stream.finish()
+                store.save_worker("main", recorder.roots, {})
+            stream_summaries = store.read_stream(store.run_id)
+            status["call_stream"] = {
+                key: sum(summary[key] for summary in stream_summaries)
+                for key in ("started", "stored", "unfinished", "uncomparable", "write_failed")
+            }
+            status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1
+            status["call_stream"]["summaries"] = len(stream_summaries)
+            status["call_stream"]["volatile_baseline"] = bool(args.learn_volatility)
+            status["call_stream"]["capture_lines"] = store.capture_lines
+            if store.max_value_bytes:
+                status["call_stream"]["value_bytes"] = store.value_bytes_used()
+                status["call_stream"]["max_value_bytes"] = store.max_value_bytes
+            store.finish(status)
+        except (OSError, sqlite3.Error) as exc:
+            storage_warning = capture_error(exc)
+    if storage_warning:
+        status["storage_warning"] = storage_warning
+        scope_warnings.append(f"SQLite trace storage: {storage_warning}")
     recorded_scope = _display_scope(scope, initial_cwd)
     project_calls = sum(
         1 for root in recorder.roots for node in root.walk() if not _is_test_node(node)
@@ -876,6 +964,14 @@ def main(argv=None) -> int:
         f"{project_calls} project call(s) recorded\n"
         + _redaction_note(status["redacted_values"])
     )
+    stream_status = status.get("call_stream")
+    if stream_status:
+        redaction_note += (
+            f"CALL STREAM: {stream_status['stored']} of {stream_status['started']} call(s) stored individually, "
+            f"{stream_status['unfinished']} unfinished, {stream_status['uncomparable']} with incomparable values.\n"
+        )
+        if stream_status["write_failed"] or stream_status["summaries"] != stream_status["expected_workers"]:
+            scope_warnings.append("Some call stream records could not be written.")
     if (
         recorder.exit_code != 0
         and detected_roots
@@ -894,6 +990,8 @@ def main(argv=None) -> int:
         )
     noise_path = os.environ.get("LDR_NOISE_RUN")
     if noise_path:
+        if missing_workers:
+            raise SystemExit(recorder.exit_code or 2)
         save_trace(noise_path, recorder.roots, invocation=invocation, status=status)
         return recorder.exit_code
 
@@ -910,6 +1008,13 @@ def main(argv=None) -> int:
         ]
         frame_index_payload = _frame_index(recorder.roots)
         display_scope = _display_scope(scope, initial_cwd)
+        inspected_frames = [node.to_dict() for node in inspected]
+        if store is not None and store.max_value_bytes:
+            try:
+                for frame in inspected_frames:
+                    frame["captured_values"] = store.frame_values(store.run_id, frame["frame_id"])
+            except sqlite3.Error:
+                scope_warnings.append("Could not read stored structural values for inspection.")
         text = render_inspection(
             inspected,
             args.frame,
@@ -922,6 +1027,8 @@ def main(argv=None) -> int:
             f"RUN STATUS: {'PASSED' if recorder.exit_code == 0 else 'FAILED'} "
             f"(exit {recorder.exit_code})\n\n"
         ) + redaction_note
+        if scope_warnings:
+            run_note += "SCOPE WARNING\n" + "\n".join(f"- {warning}" for warning in scope_warnings) + "\n\n"
         status["timing"].update(
             {
                 "postprocess_seconds": round(time.perf_counter() - execution_finished, 6),
@@ -945,14 +1052,14 @@ def main(argv=None) -> int:
                 "requested_frame": args.frame,
                 "matched": bool(inspected),
                 "match_count": len(inspected),
-                "frames": [node.to_dict() for node in inspected],
+                "frames": inspected_frames,
             },
             "frame_index": frame_index_payload,
             "findings": [],
             "failures": _failure_payload(recorder.roots),
         }
         text_path, json_path = _write_result(text, payload, ldr_dir)
-        print(text)
+        _print_result(text)
         print(
             f"\n[ldr] agent result: {os.path.relpath(json_path, initial_cwd)}; "
             f"text: {os.path.relpath(text_path, initial_cwd)}",
@@ -966,13 +1073,19 @@ def main(argv=None) -> int:
     baseline_sampled = 0
     unstable: list[dict[str, str]] = []
     comparison_unknown = False
+    stream_changes = []
+    findings = []
     snapshot_action = "none"
     frame_index_payload = _frame_index(recorder.roots)
     suggestions = rank_inspections(recorder.roots, frame_index_payload)
     display_scope = _display_scope(scope, initial_cwd)
     rerun = _rerun_payload(args, scope, initial_cwd, project_root)
     try:
-        if args.golden:
+        if missing_workers and (args.golden or args.diff):
+            comparison_unknown = True
+            snapshot_action = "unknown"
+            text = "COMPARISON UNKNOWN: at least one pytest worker trace is missing."
+        elif args.golden:
             if args.learn_volatility:
                 second = _noise_run(args, scope, invocation, recorder, ldr_dir)
                 for left, right in align(recorder.roots, second):
@@ -1015,7 +1128,15 @@ def main(argv=None) -> int:
             if envelope.get("invocation") not in ({}, invocation):
                 raise ValueError("snapshot invocation metadata does not match this command")
             snapshot_schema = envelope.get("schema_version", 1)
-            if snapshot_schema < SCHEMA_VERSION:
+            baseline_status = envelope.get("status", {})
+            if ("trace_workers" in status) != ("trace_workers" in baseline_status):
+                comparison_unknown = True
+                snapshot_action = "unknown"
+                text = (
+                    "COMPARISON UNKNOWN: the baseline and this run use different "
+                    "pytest capture modes. Re-record the baseline with --golden."
+                )
+            elif snapshot_schema < SCHEMA_VERSION:
                 comparison_unknown = True
                 snapshot_action = "unknown"
                 text = (
@@ -1027,6 +1148,18 @@ def main(argv=None) -> int:
             else:
                 for left, right in align(old, recorder.roots):
                     changes.extend(diff_tree(left, right))
+                if (
+                    not changes and store is not None and stream_status
+                    and baseline_status.get("run_id") and baseline_status.get("call_stream")
+                    and not baseline_status.get("call_stream", {}).get("volatile_baseline")
+                    and stream_status["summaries"] == stream_status["expected_workers"]
+                ):
+                    try:
+                        baseline_stream = store.read_stream(baseline_status["run_id"])
+                        if len(baseline_stream) == baseline_status["call_stream"]["expected_workers"]:
+                            stream_changes = changed_functions(baseline_stream, stream_summaries)
+                    except sqlite3.Error:
+                        scope_warnings.append("Could not read baseline call stream fingerprints.")
                 snapshot_action = "compared"
             if comparison_unknown:
                 pass
@@ -1037,13 +1170,24 @@ def main(argv=None) -> int:
                     else "EQUAL IN READABLE PARTS ONLY (not proven equal)"
                 )
                 text = headline + "\n" + render_diff(changes, args.color)
+                try:
+                    findings = _finding_payload(changes, store, baseline_status.get("run_id"))
+                except sqlite3.Error:
+                    scope_warnings.append("Could not read structural values for comparison.")
+                details = [
+                    f"{finding['function']} {value['field']}{value['path']}: {value['before']} -> {value['after']}"
+                    for finding in findings for value in finding.get("value_changes", [])
+                ]
+                if details:
+                    text += "\n\nSTORED VALUE DIFFERENCES\n" + "\n".join(details)
                 text += "\n\nCALL CHAIN\n" + render_call_chain(recorder.roots, changes, args.color)
+            elif stream_changes:
+                text = "CALL STREAM: fingerprints changed for " + ", ".join(stream_changes[:10]) + "."
             else:
                 text = "No behavioural change vs snapshot."
             unstable = unstable_fields(old)
             if unstable:
                 text += "\n\n" + render_unstable(unstable)
-            baseline_status = envelope.get("status", {})
             baseline_sampled = baseline_status.get("sampled_repetitions", 0)
             if baseline_status:
                 text = (
@@ -1098,8 +1242,8 @@ def main(argv=None) -> int:
     note += redaction_note
     if recorder.sampled_nodes or baseline_sampled:
         note += (
-            f"NOT COMPARED: calls beyond the first {args.max_calls_per_function} "
-            "per function are not compared (sampled).\n"
+            f"DIAGNOSTIC SAMPLE: calls beyond the first {args.max_calls_per_function} "
+            "per function are not compared individually unless sampled.\n"
         )
     if timeout_requested and not hasattr(signal, "SIGALRM"):
         # Windows has no SIGALRM, so the in-process timeout cannot fire.
@@ -1129,7 +1273,8 @@ def main(argv=None) -> int:
         "status": status,
         "snapshot": {"key": key, "path": golden_path, "action": snapshot_action},
         "behavior": {
-            "changed": any(change.kind != EQUAL_READABLE for change in changes),
+            "changed": bool(stream_changes) or any(change.kind != EQUAL_READABLE for change in changes),
+            "stream_changed_functions": stream_changes,
             "finding_count": len(changes),
             "equal_in_readable_parts_only": sum(
                 change.kind == EQUAL_READABLE for change in changes
@@ -1144,11 +1289,11 @@ def main(argv=None) -> int:
             "project_calls": project_calls,
             "warnings": scope_warnings,
         },
-        "findings": _finding_payload(changes),
+        "findings": findings or _finding_payload(changes),
         "failures": _failure_payload(recorder.roots),
     }
     text_path, json_path = _write_result(text, payload, ldr_dir)
-    print(text)
+    _print_result(text)
     print(
         f"\n[ldr] agent result: {os.path.relpath(json_path, initial_cwd)}; "
         f"text: {os.path.relpath(text_path, initial_cwd)}",
@@ -1159,7 +1304,7 @@ def main(argv=None) -> int:
         return recorder.exit_code
     # Equal-in-readable-parts is stated, not failed: it is not a proven change.
     if args.fail_on_change and (
-        comparison_unknown or any(change.kind != EQUAL_READABLE for change in changes)
+        comparison_unknown or stream_changes or any(change.kind != EQUAL_READABLE for change in changes)
     ):
         return 3
     return 0

@@ -51,8 +51,9 @@ Also:
 - LDR refuses to start below Python 3.12 with a clear message.
 - `--timeout` warns when it cannot be enforced (Windows has no `SIGALRM`).
 - `python -m ldr` works; the volatility probe is now the noise run.
-- Known open defect: in pytest mode, a package without `__init__.py` can go
-  unrecorded when there is no `.git` or `pyproject.toml`.
+- In pytest mode, running a target under `tests/` or `test/` from a project
+  directory without project markers can record calls to sibling source packages,
+  including packages without `__init__.py`.
 
 ## 0.5.2
 

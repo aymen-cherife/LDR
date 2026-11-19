@@ -424,6 +424,13 @@ def render_inspection(
         else:
             lines.append(f"{node.frame_id}")
         lines.append(_sig(node, False))
+        if node.timing is not None:
+            timing = node.timing
+            suffix = " (through recorder stop)" if not timing["complete"] else ""
+            lines.append(
+                f"  Time in ms · elapsed {timing['elapsed_ms']:.2f} · own {timing['own_ms']:.2f} "
+                f"· children {timing['children_ms']:.2f} · suspended {timing['suspended_ms']:.2f}{suffix}"
+            )
         if frame_index:
             parent = next(
                 (

@@ -12,11 +12,12 @@ import inspect
 import linecache
 import os
 import sys
-import time
 from dataclasses import dataclass, field
+from time import perf_counter_ns
 
 from .fingerprint import REDACTED, fingerprint
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
+from .timing import CallTiming
 
 
 _RECEIVERS = ("self", "cls")
@@ -91,6 +92,9 @@ class Recorder:
         self.max_depth = max_depth
         self.lines_for = lines_for or set()
         self.focus_frame = focus_frame
+        self.frame_prefix = ""
+        self.call_stream = None
+        self._timings: dict[int, CallTiming] = {}
         self.max_state_steps = max_state_steps
         self.max_calls_per_function = max_calls_per_function
         self.inspection_matches = 0
@@ -262,7 +266,12 @@ class Recorder:
         key = f"{source_id}:{code.co_firstlineno}:{code.co_qualname}"
         ordinal = self._invocation_counts.get(key, 0) + 1
         self._invocation_counts[key] = ordinal
-        return f"{key}#{ordinal}", ordinal
+        if not self.frame_prefix:
+            return f"{key}#{ordinal}", ordinal
+        test_key = self.frame_prefix + key
+        test_ordinal = self._invocation_counts.get(test_key, 0) + 1
+        self._invocation_counts[test_key] = test_ordinal
+        return f"{test_key}#{test_ordinal}", ordinal
 
     def _sample_repeated_call(self, ordinal: int) -> bool:
         """Keep early calls and exponentially spaced samples from hot functions."""
@@ -289,7 +298,6 @@ class Recorder:
             callsite=callsite,
             frame_id=frame_id,
         )
-        node.__dict__["_t0"] = time.perf_counter()
         node.__dict__["_fid"] = id(frame)
         node.__dict__["_code"] = code
         node.__dict__["_mutable_argument_evidence"] = self._mutable_argument_evidence(
@@ -333,6 +341,43 @@ class Recorder:
             return frame_id.startswith(self.focus_frame[:-1])
         return frame_id == self.focus_frame
 
+    def _timing_parent(self, frame):
+        caller = frame.f_back
+        while caller is not None:
+            parent = self._timings.get(id(caller))
+            if parent is not None and parent.active_since is not None:
+                return parent
+            caller = caller.f_back
+        return None
+
+    def _start_capture(self, code, frame, frame_id, at, node=None):
+        timing = CallTiming(at)
+        timing.resume(at, self._timing_parent(frame))
+        self._timings[id(frame)] = timing
+        if self.call_stream is None:
+            return
+        inputs = (
+            node.in_fp if node is not None else self._argument_fingerprints(code, frame)
+        )
+        preview = None
+        if self.call_stream.keeping_details:
+            preview = node.in_ if node is not None else self._arguments(code, frame)
+        function = f"{self.frame_prefix}{self._source_id(code.co_filename)}:{code.co_qualname}"
+        self.call_stream.start(frame, frame_id, function, inputs, preview)
+
+    def _finish_timing(self, frame, at):
+        timing = self._timings.pop(id(frame), None)
+        if timing is not None:
+            timing.pause(at)
+            return timing.snapshot(at, complete=True)
+        return None
+
+    @staticmethod
+    def _set_node_timing(node, timing):
+        if timing is not None:
+            node.timing = timing
+            node.ms = timing["elapsed_ms"]
+
     def _on_start(self, code, offset):
         mon = sys.monitoring
         if not self._in_scope(code.co_filename) or self._skip(code):
@@ -341,8 +386,12 @@ class Recorder:
             frame = sys._getframe(1)
         except Exception:
             return
+        at = perf_counter_ns()
         stack = _stack.get()
         frame_id, ordinal = self._next_frame_id(code)
+        if code in self._suppressed_codes:
+            self._start_capture(code, frame, frame_id, at)
+            return
         focused = self._focus_matches(frame_id)
         direct_focus = bool(
             self.focus_frame
@@ -392,8 +441,12 @@ class Recorder:
                 # The global RAISE event remains active and reconstructs the
                 # scoped Python frame chain if a later invocation fails.
                 self._suppressed_codes.add(code)
+                if self.call_stream is not None:
+                    self._start_capture(code, frame, frame_id, at)
+                    return
                 return mon.DISABLE
             entry = self._new_shadow(code, frame, frame_id)
+        self._start_capture(code, frame, frame_id, at, entry if isinstance(entry, Node) else None)
         _stack.set(stack + (entry,))
 
     @staticmethod
@@ -453,13 +506,16 @@ class Recorder:
         entry.__dict__["_state_line"] = next_line
 
     def _on_line(self, code, line_number):
-        if not self.focus_frame or not self._in_scope(code.co_filename) or self._skip(code):
-            return
+        if not self._in_scope(code.co_filename) or self._skip(code):
+            return sys.monitoring.DISABLE
         try:
             frame = sys._getframe(1)
         except Exception:
             return
-        self._capture_state_transition(code, frame, line_number)
+        if self.call_stream is not None and self.call_stream.store.capture_lines:
+            self.call_stream.record_line(id(frame), line_number)
+        if self.focus_frame:
+            self._capture_state_transition(code, frame, line_number)
 
     def _promote_suppressed(self, frame, exc: BaseException) -> None:
         exception_id = id(exc)
@@ -535,11 +591,7 @@ class Recorder:
                 return stack[:index], entry
         return None
 
-    def _close(self, code, out=None, error=None, out_fp=None):
-        try:
-            frame = sys._getframe(2)
-        except Exception:
-            return
+    def _close(self, code, frame, timing, out=None, error=None, out_fp=None, return_value=None):
         matched = self._matching_stack(frame)
         if matched is None:
             return
@@ -550,6 +602,10 @@ class Recorder:
             self._finish_mutable_argument_evidence(entry, frame)
         self.suspended.pop(self._entry_fid(entry), None)
         _stack.set(parent_stack)
+        if self.call_stream is not None:
+            self.call_stream.close(
+                frame, self._argument_fingerprints(code, frame), out_fp, error, out, timing, return_value,
+            )
 
         if isinstance(entry, _Shadow):
             if error is None:
@@ -575,10 +631,11 @@ class Recorder:
                 children=entry.children,
                 frame_id=entry.frame_id,
             )
+            self._set_node_timing(promoted, timing)
             self._attach(promoted, parent_stack)
             return
 
-        entry.ms = (time.perf_counter() - entry.__dict__.get("_t0", 0)) * 1000
+        self._set_node_timing(entry, timing)
         entry.out = out
         entry.out_fp = out_fp
         entry.error = error
@@ -589,9 +646,18 @@ class Recorder:
     def _on_return(self, code, offset, retval):
         if not self._in_scope(code.co_filename) or self._skip(code):
             return sys.monitoring.DISABLE
+        frame = sys._getframe(1)
+        timing = self._finish_timing(frame, perf_counter_ns())
         if code in self._suppressed_codes:
+            if self.call_stream is not None:
+                preview = capture(retval) if self.call_stream.keeping_details else None
+                self.call_stream.close(
+                    frame, self._argument_fingerprints(code, frame),
+                    fp_value(retval), None, preview, timing, retval,
+                )
+                return
             return sys.monitoring.DISABLE
-        self._close(code, out=capture(retval), out_fp=fp_value(retval))
+        self._close(code, frame, timing, out=capture(retval), out_fp=fp_value(retval), return_value=retval)
 
     def _on_yield(self, code, offset, retval):
         if not self._in_scope(code.co_filename) or self._skip(code):
@@ -600,6 +666,9 @@ class Recorder:
             frame = sys._getframe(1)
         except Exception:
             return
+        timing = self._timings.get(id(frame))
+        if timing is not None:
+            timing.pause(perf_counter_ns())
         matched = self._matching_stack(frame)
         if matched is None:
             return
@@ -607,13 +676,17 @@ class Recorder:
         self.suspended[id(frame)] = entry
         _stack.set(parent_stack)
 
-    def _on_resume(self, code, offset):
+    def _on_resume(self, code, offset, _exception=None):
         if not self._in_scope(code.co_filename) or self._skip(code):
             return
         try:
-            fid = id(sys._getframe(1))
+            frame = sys._getframe(1)
         except Exception:
             return
+        fid = id(frame)
+        timing = self._timings.get(fid)
+        if timing is not None:
+            timing.resume(perf_counter_ns(), self._timing_parent(frame))
         entry = self.suspended.pop(fid, None)
         if entry is not None:
             _stack.set(_stack.get() + (entry,))
@@ -621,14 +694,17 @@ class Recorder:
     def _on_unwind(self, code, offset, exc):
         if not self._in_scope(code.co_filename) or self._skip(code):
             return
+        frame = sys._getframe(1)
+        timing = self._finish_timing(frame, perf_counter_ns())
         if code in self._suppressed_codes:
-            try:
-                frame = sys._getframe(1)
-            except Exception:
-                return
             self._promote_suppressed(frame, exc)
+            if self.call_stream is not None:
+                self.call_stream.close(
+                    frame, self._argument_fingerprints(code, frame),
+                    None, capture_error(exc), None, timing,
+                )
             return
-        self._close(code, error=capture_error(exc))
+        self._close(code, frame, timing, error=capture_error(exc))
 
     def _on_raise(self, code, offset, exc):
         if code not in self._suppressed_codes:
@@ -672,10 +748,11 @@ class Recorder:
             events.PY_RETURN: self._on_return,
             events.PY_YIELD: self._on_yield,
             events.PY_RESUME: self._on_resume,
+            events.PY_THROW: self._on_resume,
             events.PY_UNWIND: self._on_unwind,
             events.RAISE: self._on_raise,
         }
-        if self.focus_frame:
+        if self.focus_frame or (self.call_stream is not None and self.call_stream.store.capture_lines):
             callbacks[events.LINE] = self._on_line
         try:
             for event, callback in callbacks.items():
@@ -737,7 +814,12 @@ class Recorder:
         self._registered_events.clear()
         self._suppressed_codes.clear()
         _stack.set(())
-        for entry in self.suspended.values():
+        stopped = perf_counter_ns()
+        for fid, entry in self.suspended.items():
             if isinstance(entry, Node) and entry.out is None and entry.error is None:
                 entry.out = "<suspended>"
+                timing = self._timings.get(fid)
+                if timing is not None:
+                    self._set_node_timing(entry, timing.snapshot(stopped, complete=False))
         self.suspended.clear()
+        self._timings.clear()

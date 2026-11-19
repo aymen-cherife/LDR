@@ -5,8 +5,6 @@ import os
 import subprocess
 import sys
 
-import pytest
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
 
@@ -61,22 +59,20 @@ def pytest_layout_without_git(tmp_path):
 def test_pytest_without_git_warns_when_the_package_under_test_was_not_recorded(tmp_path):
     pytest_layout_without_git(tmp_path)
 
-    ldr(tmp_path, "pytest", "tests/test_calc.py")
+    result = ldr(tmp_path, "pytest", "tests/test_calc.py", "--only", "tests")
 
+    assert result.returncode == 1
     text, _ = last(tmp_path)
     assert "0 project call(s) recorded" in text
     assert "No calls from project code were recorded" in text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="defect 9 is open: a package without __init__.py is not recorded in pytest mode "
-    "when there is no .git or pyproject.toml. Cause not found yet.",
-)
 def test_pytest_without_git_records_a_package_without_init(tmp_path):
     pytest_layout_without_git(tmp_path)
 
-    ldr(tmp_path, "pytest", "tests/test_calc.py")
+    result = ldr(tmp_path, "pytest", "tests/test_calc.py")
 
-    text, _ = last(tmp_path)
+    assert result.returncode == 1
+    text, payload = last(tmp_path)
     assert "total(xs=[1, 2])" in text
+    assert payload["scope"]["project_calls"] == 1

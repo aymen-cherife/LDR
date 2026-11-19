@@ -157,7 +157,7 @@ def test_a_crash_summary_never_carries_a_secret(tmp_path):
     everything = result.stdout + result.stderr
     for path in (tmp_path / ".ldr").rglob("*"):
         if path.is_file():
-            everything += path.read_text(encoding="utf-8")
+            everything += path.read_bytes().decode("utf-8", errors="replace")
     assert token not in everything
     assert "RUN STATUS: CRASHED" in everything
 
@@ -184,7 +184,7 @@ def test_nothing_secret_reaches_the_output_files(tmp_path):
     everything = result.stdout + result.stderr
     for path in (tmp_path / ".ldr").rglob("*"):
         if path.is_file():
-            everything += path.read_text(encoding="utf-8")
+            everything += path.read_bytes().decode("utf-8", errors="replace")
     for secret in [*SECRET_PARTS.values(), secret_env, "plain-value-1234"]:
         assert secret not in everything, secret
 

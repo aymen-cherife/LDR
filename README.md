@@ -38,6 +38,56 @@ LDR preserves the test runner's exit status and writes:
 
 - `.ldr/last.json` — structured output for agents and tooling
 - `.ldr/last.txt` — a compact human-readable trace
+- `.ldr/traces.sqlite3` — recorded call history keyed by `status.run_id` in the JSON result
+
+LDR follows pytest's configured worker count. With local `pytest-xdist` workers,
+each worker records the tests it executes and saves its bounded trace when it
+finishes. The result names workers whose traces are missing. The existing
+`--max-nodes` limit applies per worker.
+
+You can tune SQLite writes in the project's `pyproject.toml`.
+
+```toml
+[tool.ldr.storage]
+batch_size = 1000
+busy_timeout = 30 # seconds
+max_trace_bytes = 16777216 # per run, shared by local workers
+```
+
+`batch_size` is the number of captured calls per transaction. `busy_timeout`
+is how long a writer can wait for a lock. The database uses WAL on SQLite
+releases with the WAL-reset fix and rollback journaling on earlier releases.
+
+LDR streams completed in-scope calls into SQLite. The byte budget covers the
+serialized call records and their frame IDs. SQLite pages, indexes, the
+diagnostic tree, and function summaries use additional space. When the detail
+budget is exhausted, function fingerprints still summarize the remaining calls.
+If the sampled diagnostic comparison finds no changes, local snapshots can
+use those fingerprints to detect changes outside the sample.
+
+Set `capture_lines = true` in the same table and set `max_trace_bytes`
+explicitly for the workload. Each retained SQLite call then has an
+`executed_lines` list in first-visit order. A line appears once per call even
+if a loop runs it thousands of times. The list shares the byte budget with the
+rest of the call record. See the [line budget audit](evaluation/README.md#line-budget-audit)
+for the workload and byte measurements.
+
+Set a positive `max_value_bytes` under `[tool.ldr.storage]` to capture full
+values. It is a shared per-run allowance for serialized value bodies within
+an explicit `max_trace_bytes`. The default is `0` (off).
+
+LDR stores supported built-in scalars and containers at function entry and
+exit and on return. Larger or unsupported values keep available fingerprints,
+shape, and previews. Redacted values carry a redaction status. Run `ldr
+inspect --frame-id N` and open `captured_values` in `.ldr/last.json` to read
+the values. When both local runs retained a complete changed value, `--diff`
+can report the first differing item, such as `out[42]: 8 -> 9`.
+
+Frame inspection and the JSON frame index show elapsed, own, traced child,
+and suspended wall time. Own time includes blocking or library work that
+LDR did not trace. The measurements include tracing overhead. A frame still
+suspended at recorder stop is marked incomplete. Timing stays outside
+behaviour fingerprints.
 
 The suggestions are evidence-ranked inspection targets, not claimed bug
 locations. Their scores use only facts from the captured execution. The JSON

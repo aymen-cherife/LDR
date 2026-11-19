@@ -54,7 +54,7 @@ def stored_text(tmp_path, result):
     everything = result.stdout + result.stderr
     for path in (tmp_path / ".ldr").rglob("*"):
         if path.is_file():
-            everything += path.read_text(encoding="utf-8")
+            everything += path.read_bytes().decode("utf-8", errors="replace")
     return everything
 
 

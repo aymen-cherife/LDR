@@ -344,6 +344,7 @@ class Node:
     # are previews for reading; comparison uses these when both sides have them.
     in_fp: dict[str, str] = field(default_factory=dict)
     out_fp: str | None = None
+    timing: dict[str, float | bool] | None = None
 
     @property
     def code_id(self) -> str:
@@ -355,7 +356,7 @@ class Node:
             return ""
         return f"{self.file}:{self.line}" if self.line else self.file
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, include_children: bool = True) -> dict:
         return {
             "name": self.name,
             "in": self.in_,
@@ -365,6 +366,7 @@ class Node:
             "input_changes": self.input_changes,
             "error": self.error,
             "ms": round(self.ms, 2),
+            **({"timing": self.timing} if self.timing is not None else {}),
             "module": self.module,
             "file": self.file,
             "source_id": self.source_id,
@@ -374,7 +376,7 @@ class Node:
             "volatile": sorted(set(self.volatile)),
             "lines": self.lines,
             "unstable": self.unstable,
-            "children": [c.to_dict() for c in self.children],
+            "children": [c.to_dict() for c in self.children] if include_children else [],
             "frame_id": self.frame_id,
             "state_steps": self.state_steps,
             "state_truncated": self.state_truncated,
@@ -391,6 +393,7 @@ class Node:
             input_changes=dict(d.get("input_changes", {})),
             error=d.get("error"),
             ms=d.get("ms", 0.0),
+            timing=d.get("timing"),
             module=d.get("module", ""),
             file=d.get("file", ""),
             source_id=d.get("source_id", ""),
