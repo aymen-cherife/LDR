@@ -64,16 +64,20 @@ _ENV_NAME = re.compile(
 )
 _ENV_MIN_LENGTH = 8
 
-_environment: dict[str, str] = {}  # secret value -> variable name
+# Swap the data and its identity token together on a refresh.
+_environment: tuple[tuple[tuple[str, str], ...], object] = ((), object())
 
 
 def load_environment(environ: Mapping[str, str] | None = None) -> int:
     """(Re)read secret-looking environment variables. Values stay in memory only."""
-    _environment.clear()
+    global _environment
+    secrets = {}
     for name, value in (os.environ if environ is None else environ).items():
         if len(value) >= _ENV_MIN_LENGTH and (_ENV_NAME.search(name) or is_secret_name(name)):
-            _environment[value] = name
-    return len(_environment)
+            secrets[value] = name
+    ordered = tuple(sorted(secrets.items(), key=lambda item: -len(item[0])))
+    _environment = (ordered, object())
+    return len(secrets)
 
 
 load_environment()
@@ -103,24 +107,33 @@ _MARKERS: dict[str, tuple[str, ...]] = {
     "url-credentials": ("://",),
     "url-query-secret": ("=",),
 }
+_ALL_MARKERS = tuple(dict.fromkeys(marker for markers in _MARKERS.values() for marker in markers))
 
 
 def redact(text: str) -> tuple[str, int]:
     """Replace every detected secret in ``text``; return the new text and the count."""
     count = 0
-    for secret, name in sorted(_environment.items(), key=lambda item: -len(item[0])):
+    for secret, name in _environment[0]:
         if secret in text:
             count += text.count(secret)
             text = text.replace(secret, f"<secret from env {name}>")
     # A credential given on the command line is a secret wherever it shows up
     # (for example inside the argv list a traced function receives).
-    for secret in sorted(_argv_secrets, key=len, reverse=True):
+    for secret in _argv_secrets[1]:
         if secret and (secret == text or (len(secret) >= _ENV_MIN_LENGTH and secret in text)):
             count += text.count(secret)
             text = text.replace(secret, "<secret from the command line>")
     lowered = text.lower()
+    if type(lowered) is str:
+        contains = lowered.__contains__
+        if not any(map(contains, _ALL_MARKERS)):
+            return text, count
+    else:
+        # Preserve normal containment semantics for string subclasses.
+        def contains(marker):
+            return marker in lowered
     for label, pattern, group in _SHAPES:
-        if not any(marker in lowered for marker in _MARKERS[label]):
+        if not any(map(contains, _MARKERS[label])):
             continue
         if group == 0:
             def swap(match, label=label):
@@ -155,7 +168,18 @@ def _secret_flag(argument: str) -> tuple[str, str | None] | None:
     return None
 
 
-_argv_secrets: set[str] = set()
+_argv_secrets: tuple[frozenset[str], tuple[str, ...], object] = (
+    frozenset(), (), object()
+)
+
+
+def text_policy() -> tuple[object, object]:
+    """Return identity tokens for the current text detector inputs."""
+    return _environment[1], _argv_secrets[2]
+
+
+def same_text_policy(policy: tuple[object, object]) -> bool:
+    return policy[0] is _environment[1] and policy[1] is _argv_secrets[2]
 
 
 def register_argv_secrets(argv: list[str]) -> None:
@@ -164,11 +188,12 @@ def register_argv_secrets(argv: list[str]) -> None:
     argparse can separate ``--token VALUE`` (the value lands among the
     positionals), so the pairing is learned from the raw order, once.
     """
-    _argv_secrets.clear()
+    global _argv_secrets
+    secrets = set()
     hide_next = False
     for argument in argv:
         if hide_next and not argument.startswith("-"):
-            _argv_secrets.add(argument)
+            secrets.add(argument)
             hide_next = False
             continue
         hide_next = False
@@ -178,7 +203,9 @@ def register_argv_secrets(argv: list[str]) -> None:
             if value is None:
                 hide_next = True
             elif value:
-                _argv_secrets.add(value)
+                secrets.add(value)
+    ordered = tuple(sorted(secrets, key=len, reverse=True))
+    _argv_secrets = (frozenset(secrets), ordered, object())
 
 
 def redact_argv(arguments: list[str]) -> list[str]:
@@ -187,7 +214,7 @@ def redact_argv(arguments: list[str]) -> list[str]:
     result: list[str] = []
     hide_next = False
     for argument in arguments:
-        if argument in _argv_secrets:
+        if argument in _argv_secrets[0]:
             result.append(by_name_placeholder(argument))
             hide_next = False
             continue

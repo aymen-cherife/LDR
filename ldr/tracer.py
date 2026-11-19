@@ -15,8 +15,9 @@ import sys
 from dataclasses import dataclass, field
 from time import perf_counter_ns
 
-from .fingerprint import REDACTED, fingerprint
+from .fingerprint import REDACTED, fingerprint, fingerprint_details
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
+from .redact import same_text_policy, text_policy
 from .timing import CallTiming
 
 
@@ -95,6 +96,7 @@ class Recorder:
         self.focus_frame = focus_frame
         self.frame_prefix = ""
         self.call_stream = None
+        self._immutable_inputs = {}
         self.deep_functions = frozenset(deep_functions or ())
         self._deep_codes: set[object] = set()
         self._global_lines = False
@@ -218,13 +220,39 @@ class Recorder:
             if name in frame.f_locals and name not in ("self", "cls")
         }
 
-    def _argument_fingerprints(self, code, frame) -> dict[str, str]:
-        """Fingerprint the full value of each argument (same rule in every mode)."""
+    def _argument_fingerprints(self, code, frame, *, entering=False) -> dict[str, str]:
+        """Fingerprint each argument, reusing proven stable entry digests at exit."""
         result: dict[str, str] = {}
+        locals_ = frame.f_locals
+        remember = entering and self.call_stream is not None
+        policy = text_policy() if remember else None
+        reusable = {}
+        saved = self._immutable_inputs.pop(id(frame), None)
+        saved_policy, saved_values = saved if saved is not None else (None, {})
         for name in self._argument_names(code):
-            if name in frame.f_locals:
-                # The receiver has no preview, but its state is part of the call.
-                result[name] = fp_value(frame.f_locals[name], name)
+            if name not in locals_:
+                continue
+            value = locals_[name]
+            previous = saved_values.get(name)
+            if (
+                previous is not None
+                and value is previous[0]
+                and same_text_policy(saved_policy)
+            ):
+                result[name] = previous[1]
+            elif remember:
+                if is_secret_name(name):
+                    result[name] = REDACTED
+                    continue
+                token, immutable = fingerprint_details(value, partial_ok=name in _RECEIVERS)
+                if immutable:
+                    # Keep the original object alive for the identity check at exit.
+                    reusable[name] = (value, token)
+                result[name] = token
+            else:
+                result[name] = fp_value(value, name)
+        if reusable and same_text_policy(policy):
+            self._immutable_inputs[id(frame)] = (policy, reusable)
         return result
 
     @staticmethod
@@ -288,7 +316,7 @@ class Recorder:
         except Exception:
             arguments = {}
         try:
-            argument_fps = self._argument_fingerprints(code, frame)
+            argument_fps = self._argument_fingerprints(code, frame, entering=True)
         except Exception:
             argument_fps = {}
         node = Node(
@@ -361,7 +389,9 @@ class Recorder:
         if self.call_stream is None:
             return
         inputs = (
-            node.in_fp if node is not None else self._argument_fingerprints(code, frame)
+            node.in_fp
+            if node is not None
+            else self._argument_fingerprints(code, frame, entering=True)
         )
         preview = None
         if self.call_stream.keeping_details:
@@ -608,11 +638,20 @@ class Recorder:
                 return stack[:index], entry
         return None
 
-    def _close(self, code, frame, timing, out=None, error=None, out_fp=None, return_value=None):
+    def _close(self, code, frame, timing, *, error=None, return_value=None):
         matched = self._matching_stack(frame)
         if matched is None:
+            self._immutable_inputs.pop(id(frame), None)
             return
         parent_stack, entry = matched
+        node_retained = isinstance(entry, Node)
+        stream = self.call_stream
+        out = out_fp = None
+        if error is None:
+            if node_retained or (stream is not None and stream.keeping_details):
+                out = capture(return_value)
+            if node_retained or stream is not None:
+                out_fp = fp_value(return_value)
         if isinstance(entry, Node) and self._focus_matches(entry.frame_id):
             self._capture_state_transition(code, frame, None)
         if isinstance(entry, Node):
@@ -676,7 +715,7 @@ class Recorder:
                 )
                 return
             return sys.monitoring.DISABLE
-        self._close(code, frame, timing, out=capture(retval), out_fp=fp_value(retval), return_value=retval)
+        self._close(code, frame, timing, return_value=retval)
 
     def _on_yield(self, code, offset, retval):
         if not self._in_scope(code.co_filename) or self._skip(code):
@@ -861,3 +900,4 @@ class Recorder:
                     self._set_node_timing(entry, timing.snapshot(stopped, complete=False))
         self.suspended.clear()
         self._timings.clear()
+        self._immutable_inputs.clear()

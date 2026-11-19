@@ -67,6 +67,7 @@ class _Walk:
         self.budget = budget
         self.partial_ok = partial_ok
         self.partial = False  # some leaf could not be read; only its type is hashed
+        self.immutable = True
         self.active: list[int] = []
         self.visited = 0
 
@@ -91,15 +92,22 @@ class _Walk:
                 raise _Stop(REDACTED)
             self._text(b"s", value.encode("utf-8", "surrogatepass"), out)
         elif kind is bytes or kind is bytearray:
+            if kind is bytearray:
+                self.immutable = False
             if _looks_secret(bytes(value).decode("latin-1")):
                 raise _Stop(REDACTED)
             self._text(b"b" if kind is bytes else b"B", bytes(value), out)
         elif kind is decimal.Decimal:
+            self.immutable = False
             self._text(b"D", str(value).encode(), out)
         elif kind in (list, tuple, dict, set, frozenset):
+            if kind is not tuple and kind is not frozenset:
+                self.immutable = False
             self._container(kind, value, out, depth)
-        elif not self._known_leaf(kind, value, out, depth):
-            self._object(value, out, depth)
+        else:
+            self.immutable = False
+            if not self._known_leaf(kind, value, out, depth):
+                self._object(value, out, depth)
 
     def _known_leaf(self, kind: type, value: Any, out: hashlib.blake2b, depth: int) -> bool:
         """Exact standard types whose state we can read without user code."""
@@ -204,14 +212,23 @@ def fingerprint(value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool
     no preview to fall back on). Equal ``+`` digests mean the readable parts
     match; the unread parts are a stated gap.
     """
+    return fingerprint_details(value, budget, partial_ok=partial_ok)[0]
+
+
+def fingerprint_details(
+    value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool = False
+) -> tuple[str, bool]:
+    """Return the existing fingerprint and whether it can be reused for this object."""
     try:
         out = hashlib.blake2b(digest_size=DIGEST_BYTES)
         walk = _Walk(budget, partial_ok)
         walk.encode(value, out)
-        return out.hexdigest() + (PARTIAL_MARK if walk.partial else "")
+        return out.hexdigest() + (PARTIAL_MARK if walk.partial else ""), (
+            walk.immutable and not walk.partial
+        )
     except _Stop as stop:
-        return stop.status
+        return stop.status, False
     except RecursionError:
-        return UNKNOWN
+        return UNKNOWN, False
     except Exception:
-        return FAILED
+        return FAILED, False

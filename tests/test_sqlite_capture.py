@@ -75,6 +75,43 @@ def test_deep_capture_requires_budget_before_running_target(tmp_path):
     assert "target ran" not in result.stderr
 
 
+def test_exit_fingerprints_respect_mutation_rebinding_and_redaction_refresh(tmp_path):
+    (tmp_path / "app.py").write_text(
+        "from ldr.redact import load_environment\n"
+        "def unchanged(arg):\n"
+        "    return arg\n"
+        "def mutate_nested(arg):\n"
+        "    arg[0].append(2)\n"
+        "def rebind(arg):\n"
+        "    arg = (3, 'new')\n"
+        "def delete(arg):\n"
+        "    del arg\n"
+        "def refresh(arg):\n"
+        "    load_environment({'DEMO_API_TOKEN': arg[0]})\n"
+        "unchanged(('ordinary', frozenset((1, 2))))\n"
+        "mutate_nested(([1],))\n"
+        "rebind((4, 'old'))\n"
+        "delete((5, 'removed'))\n"
+        "refresh(('fixture-now-a-secret-45',))\n"
+    )
+    result = invoke(tmp_path, "run", "app.py")
+    assert result.returncode == 0, result.stdout + result.stderr
+    with sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3") as connection:
+        calls = {
+            frame.rsplit(":", 1)[1].split("#", 1)[0]: json.loads(payload)
+            for frame, payload in connection.execute("SELECT frame_id, payload FROM stream_calls")
+        }
+    assert calls["unchanged"]["entry"] == calls["unchanged"]["exit"] == {
+        "arg": fingerprint(("ordinary", frozenset((1, 2))))
+    }
+    assert calls["mutate_nested"]["entry"]["arg"] == fingerprint(([1],))
+    assert calls["mutate_nested"]["exit"]["arg"] == fingerprint(([1, 2],))
+    assert calls["rebind"]["entry"]["arg"] == fingerprint((4, "old"))
+    assert calls["rebind"]["exit"]["arg"] == fingerprint((3, "new"))
+    assert calls["delete"]["exit"] == {}
+    assert calls["refresh"]["exit"] == {"arg": "redacted"}
+
+
 def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, monkeypatch):
     secret = "fixture-local-env-secret"
     monkeypatch.setenv("DEEP_TEST_SECRET", secret)

@@ -114,6 +114,19 @@ def test_environment_secrets_are_matched_by_value_and_named():
         redact.load_environment()
 
 
+def test_shape_scan_runs_on_the_text_after_environment_replacement():
+    value = "synthetic-environment-value"
+    bearer = SECRET_PARTS["bearer-token"]
+    redact.load_environment({f"DEMO_API_TOKEN_fixture Bearer {bearer}": value})
+    try:
+        rendered, count = redact.redact(value)
+        assert count == 2
+        assert value not in rendered and bearer not in rendered
+        assert "<secret: bearer-token" in rendered
+    finally:
+        redact.load_environment()
+
+
 def test_exception_text_is_redacted_capped_and_never_raises():
     """Python's traceback and pytest call str(exc) anyway, so LDR keeps calling
     it, but guards it: no failure, bounded length, secrets removed."""
