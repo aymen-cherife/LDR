@@ -83,6 +83,29 @@ inspect --frame-id N` and open `captured_values` in `.ldr/last.json` to read
 the values. When both local runs retained a complete changed value, `--diff`
 can report the first differing item, such as `out[42]: 8 -> 9`.
 
+To see how locals evolve inside a function, set an explicit
+`max_trace_bytes` and a positive `max_deep_bytes` in `[tool.ldr.storage]`.
+`max_deep_bytes` defaults to off and is a shared allowance for serialized
+snapshots within the trace budget. Choose both limits for your workload.
+
+```sh
+ldr run app.py --deep calculate_total
+ldr show
+ldr show "app.py:10:calculate_total#1"
+```
+
+Repeat `--deep` to select more functions. Use a qualified name such as
+`Cart.total` or a project-relative selector such as `app.py:calculate_total`
+to narrow a match. Each snapshot records locals at the next line, return,
+yield, or exception unwind. Loop visits and generator continuations appear
+in order. Supported values use the same typed JSON format as full value
+retention. Redacted, unsupported, and partially captured values have explicit
+statuses. The run and each listed frame report observed and retained counts.
+
+`ldr show` reads SQLite without running the target. It defaults to the latest
+run. Copy a frame address from its listing and use `--run-id` to pin a run,
+`--offset` and `--limit` to page, and `--json` for structured output.
+
 Frame inspection and the JSON frame index show elapsed, own, traced child,
 and suspended wall time. Own time includes blocking or library work that
 LDR did not trace. The measurements include tracing overhead. A frame still

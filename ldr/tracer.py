@@ -76,6 +76,7 @@ class Recorder:
         focus_frame: str | None = None,
         max_state_steps: int = 200,
         max_calls_per_function: int = 8,
+        deep_functions: list[str] | None = None,
     ):
         if max_nodes < 1:
             raise ValueError("max_nodes must be at least 1")
@@ -94,6 +95,9 @@ class Recorder:
         self.focus_frame = focus_frame
         self.frame_prefix = ""
         self.call_stream = None
+        self.deep_functions = frozenset(deep_functions or ())
+        self._deep_codes: set[object] = set()
+        self._global_lines = False
         self._timings: dict[int, CallTiming] = {}
         self.max_state_steps = max_state_steps
         self.max_calls_per_function = max_calls_per_function
@@ -362,8 +366,19 @@ class Recorder:
         preview = None
         if self.call_stream.keeping_details:
             preview = node.in_ if node is not None else self._arguments(code, frame)
-        function = f"{self.frame_prefix}{self._source_id(code.co_filename)}:{code.co_qualname}"
-        self.call_stream.start(frame, frame_id, function, inputs, preview)
+        identity = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
+        function = f"{self.frame_prefix}{identity}"
+        deep = bool(self.deep_functions) and (
+            code.co_name in self.deep_functions
+            or code.co_qualname in self.deep_functions
+            or identity in self.deep_functions
+        )
+        if deep and code not in self._deep_codes:
+            if not self._global_lines:
+                mon = sys.monitoring
+                mon.set_local_events(self._tool_id, code, mon.events.LINE)
+            self._deep_codes.add(code)
+        self.call_stream.start(frame, frame_id, function, inputs, preview, deep=deep)
 
     def _finish_timing(self, frame, at):
         timing = self._timings.pop(id(frame), None)
@@ -514,6 +529,8 @@ class Recorder:
             return
         if self.call_stream is not None and self.call_stream.store.capture_lines:
             self.call_stream.record_line(id(frame), line_number)
+        if code in self._deep_codes:
+            self.call_stream.record_deep(frame, line_number, "line")
         if self.focus_frame:
             self._capture_state_transition(code, frame, line_number)
 
@@ -648,6 +665,8 @@ class Recorder:
             return sys.monitoring.DISABLE
         frame = sys._getframe(1)
         timing = self._finish_timing(frame, perf_counter_ns())
+        if code in self._deep_codes:
+            self.call_stream.record_deep(frame, None, "return")
         if code in self._suppressed_codes:
             if self.call_stream is not None:
                 preview = capture(retval) if self.call_stream.keeping_details else None
@@ -669,6 +688,8 @@ class Recorder:
         timing = self._timings.get(id(frame))
         if timing is not None:
             timing.pause(perf_counter_ns())
+        if code in self._deep_codes:
+            self.call_stream.record_deep(frame, None, "yield")
         matched = self._matching_stack(frame)
         if matched is None:
             return
@@ -684,6 +705,8 @@ class Recorder:
         except Exception:
             return
         fid = id(frame)
+        if code in self._deep_codes:
+            self.call_stream.resume_deep(frame)
         timing = self._timings.get(fid)
         if timing is not None:
             timing.resume(perf_counter_ns(), self._timing_parent(frame))
@@ -696,6 +719,8 @@ class Recorder:
             return
         frame = sys._getframe(1)
         timing = self._finish_timing(frame, perf_counter_ns())
+        if code in self._deep_codes:
+            self.call_stream.record_deep(frame, None, "unwind")
         if code in self._suppressed_codes:
             self._promote_suppressed(frame, exc)
             if self.call_stream is not None:
@@ -739,6 +764,8 @@ class Recorder:
         unsupported = python_version_message()
         if unsupported:
             raise RuntimeError(unsupported)
+        if self.deep_functions and self.call_stream is None:
+            raise RuntimeError("deep capture requires SQLite trace storage")
         mon = sys.monitoring
         tool_id = self._claim_tool_id()
         self._tool_id = tool_id
@@ -752,12 +779,19 @@ class Recorder:
             events.PY_UNWIND: self._on_unwind,
             events.RAISE: self._on_raise,
         }
-        if self.focus_frame or (self.call_stream is not None and self.call_stream.store.capture_lines):
+        self._global_lines = bool(
+            self.focus_frame
+            or (self.call_stream is not None and self.call_stream.store.capture_lines)
+        )
+        if self._global_lines or self.deep_functions:
             callbacks[events.LINE] = self._on_line
         try:
             for event, callback in callbacks.items():
                 mon.register_callback(tool_id, event, callback)
-            mon.set_events(tool_id, sum(callbacks))
+            mon.set_events(
+                tool_id,
+                sum(event for event in callbacks if self._global_lines or event != events.LINE),
+            )
             self._registered_events = list(callbacks)
         except Exception:
             try:
@@ -806,6 +840,10 @@ class Recorder:
         mon = sys.monitoring
         tool_id = self._tool_id
         mon.set_events(tool_id, 0)
+        if not self._global_lines:
+            for code in self._deep_codes:
+                mon.set_local_events(tool_id, code, 0)
+        self._deep_codes.clear()
         for event in self._registered_events:
             mon.register_callback(tool_id, event, None)
         mon.free_tool_id(tool_id)

@@ -655,6 +655,60 @@ def _print_result(text: str) -> None:
     print(text)
 
 
+def _show_deep(argv, ldr_dir):
+    parser = argparse.ArgumentParser(prog="ldr show")
+    parser.add_argument("frame", nargs="?", help="stored frame address, or omit to list frames")
+    parser.add_argument("--run-id", help="stored run ID (defaults to the latest run)")
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    if not 0 <= args.offset < 2**63 or not 0 < args.limit < 2**63:
+        parser.error("--offset must be nonnegative and --limit must be positive SQLite integers")
+    try:
+        run_id, evidence = TraceStore.read_deep(
+            ldr_dir, args.run_id, args.frame, offset=args.offset, limit=args.limit
+        )
+    except sqlite3.Error as exc:
+        print(f"Could not read saved deep capture ({capture_error(exc)}).", file=sys.stderr)
+        return 2
+    if run_id is None and (args.frame is not None or args.run_id is not None):
+        print("No matching saved run.", file=sys.stderr)
+        return 2
+    if evidence is None:
+        print(f"No saved deep capture for {args.frame} in run {run_id}.", file=sys.stderr)
+        return 2
+    if args.json:
+        key = "frames" if args.frame is None else "frame"
+        print(json.dumps({"run_id": run_id, key: evidence}))
+        return 0
+    lines = [f"Run {run_id}" if run_id else "No saved runs."]
+    if args.frame is None:
+        lines.extend(
+            f"{frame['frame_id']}  ({frame['retained']}/{frame['observed']} snapshots)"
+            for frame in evidence
+        )
+        if not evidence and run_id:
+            lines.append("No deep captures on this page.")
+    else:
+        lines.append(
+            f"{args.frame}  ({evidence['retained']}/{evidence['observed']} snapshots)"
+        )
+        for step in evidence["steps"]:
+            lines.append(f"Step {step['step']}, line {step['line']} ({step['event']})")
+            for name, local in step["locals"]:
+                value = (
+                    json.dumps(local["value"], ensure_ascii=False)
+                    if local["status"] == "complete"
+                    else f"<{local['status']}>"
+                )
+                lines.append(f"  {name} = {value}")
+            if not step["locals_complete"]:
+                lines.append("  <some locals omitted by the capture budget>")
+    _print_result(_limit_text("\n".join(lines), max_lines=sys.maxsize))
+    return 0
+
+
 def _noise_run(
     args,
     scope: list[str],
@@ -726,6 +780,8 @@ def main(argv=None) -> int:
     initial_cwd = os.path.realpath(os.getcwd())
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "show":
+        return _show_deep(argv[1:], ldr_dir)
     register_argv_secrets(argv)
     timeout_requested = any(a == "--timeout" or a.startswith("--timeout=") for a in argv)
     passthrough: list[str] = []
@@ -735,7 +791,7 @@ def main(argv=None) -> int:
 
     parser = argparse.ArgumentParser(prog="ldr")
     parser.add_argument("--version", action="version", version=f"ldr {__version__}")
-    parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect"])
+    parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect", "show"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("rest", nargs="*")
     parser.add_argument("--runner", choices=["auto", "run", "pytest", "module"], default="auto")
@@ -764,6 +820,10 @@ def main(argv=None) -> int:
         help="short frame id from the latest result; restores and reruns its invocation",
     )
     parser.add_argument("--max-state-steps", type=int, default=200)
+    parser.add_argument(
+        "--deep", action="append", default=[], metavar="FUNCTION",
+        help="save locals for a selected function (repeatable)",
+    )
     parser.add_argument("--timeout", type=float, default=300)
     args, unknown = parser.parse_known_args(argv)
     args.rest = list(args.rest) + unknown + passthrough
@@ -781,6 +841,11 @@ def main(argv=None) -> int:
         parser.error("--timeout must be a finite non-negative number")
 
     requested_mode = args.mode
+    if args.deep and (
+        requested_mode not in {"run", "pytest", "module", "verify"}
+        or any(not name.strip() for name in args.deep)
+    ):
+        parser.error("--deep requires a function name and a recording command")
     if args.frame_id is not None:
         if requested_mode != "inspect":
             parser.error("--frame-id is only valid with inspect")
@@ -853,9 +918,12 @@ def main(argv=None) -> int:
     store = None
     storage_warning = None
     try:
-        store = TraceStore.start(ldr_dir, invocation, *storage_settings(project_root))
+        settings = storage_settings(project_root, deep=bool(args.deep))
+        store = TraceStore.start(ldr_dir, invocation, *settings)
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
         storage_warning = capture_error(exc)
+        if args.deep:
+            parser.error(f"Could not start deep capture ({storage_warning})")
 
     recorder_options = {
         "scope": scope,
@@ -865,6 +933,7 @@ def main(argv=None) -> int:
         "focus_frame": args.frame if requested_mode == "inspect" else None,
         "max_state_steps": args.max_state_steps,
         "max_calls_per_function": args.max_calls_per_function,
+        "deep_functions": args.deep,
     }
     pytest_capture = None
 
@@ -942,6 +1011,17 @@ def main(argv=None) -> int:
             if store.max_value_bytes:
                 status["call_stream"]["value_bytes"] = store.value_bytes_used()
                 status["call_stream"]["max_value_bytes"] = store.max_value_bytes
+            if args.deep:
+                totals = store.deep_totals()
+                totals.update(
+                    (key, sum(summary["deep"][key] for summary in stream_summaries))
+                    for key in ("matched", "unfinished", "observed")
+                )
+                status["deep_capture"] = {
+                    "functions": args.deep,
+                    "max_bytes": store.max_deep_bytes,
+                    **totals,
+                }
             store.finish(status)
         except (OSError, sqlite3.Error) as exc:
             storage_warning = capture_error(exc)
@@ -972,6 +1052,13 @@ def main(argv=None) -> int:
         )
         if stream_status["write_failed"] or stream_status["summaries"] != stream_status["expected_workers"]:
             scope_warnings.append("Some call stream records could not be written.")
+    if deep_status := status.get("deep_capture"):
+        redaction_note += (
+            f"DEEP CAPTURE: {deep_status['retained']}/{deep_status['observed']} snapshots "
+            f"saved from {deep_status['frames']}/{deep_status['matched']} matched calls "
+            f"({deep_status['unfinished']} unfinished). "
+            f"Read with ldr show --run-id {store.run_id}\n"
+        )
     if (
         recorder.exit_code != 0
         and detected_roots

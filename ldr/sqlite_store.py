@@ -56,6 +56,21 @@ CREATE TABLE IF NOT EXISTS stream_values (
     PRIMARY KEY (run_id, worker, ordinal, phase, name),
     FOREIGN KEY (run_id, worker, ordinal) REFERENCES stream_calls(run_id, worker, ordinal)
 );
+CREATE TABLE IF NOT EXISTS stream_deep_budget (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id), used_bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS stream_deep_frames (
+    run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    observed INTEGER NOT NULL, retained INTEGER NOT NULL,
+    PRIMARY KEY (run_id, worker, ordinal),
+    FOREIGN KEY (run_id, worker, ordinal) REFERENCES stream_calls(run_id, worker, ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stream_deep_steps (
+    run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    step INTEGER NOT NULL, payload BLOB NOT NULL,
+    PRIMARY KEY (run_id, worker, ordinal, step),
+    FOREIGN KEY (run_id, worker, ordinal) REFERENCES stream_deep_frames(run_id, worker, ordinal)
+) WITHOUT ROWID;
 """
 VALUE_FIELDS = ("in", "out", "in_fp", "out_fp", "input_changes")
 
@@ -75,7 +90,7 @@ def _json(value):
     return json.dumps(value, separators=(",", ":"))
 
 
-def storage_settings(project_root):
+def storage_settings(project_root, *, deep=False):
     path = Path(project_root) / "pyproject.toml"
     try:
         with path.open("rb") as handle:
@@ -114,7 +129,19 @@ def storage_settings(project_root):
         raise ValueError(
             "[tool.ldr.storage] max_value_bytes requires an explicit max_trace_bytes at least as large"
         )
-    return batch_size, busy_timeout, max_trace_bytes, capture_lines, max_value_bytes
+    max_deep_bytes = settings.get("max_deep_bytes", 0)
+    if type(max_deep_bytes) is not int or not 0 <= max_deep_bytes < 2**63:
+        raise ValueError("[tool.ldr.storage] max_deep_bytes must be a nonnegative integer")
+    if deep and (
+        "max_trace_bytes" not in settings or not 0 < max_deep_bytes <= max_trace_bytes
+    ):
+        raise ValueError(
+            "--deep requires explicit [tool.ldr.storage] max_deep_bytes and max_trace_bytes "
+            "with 0 < max_deep_bytes <= max_trace_bytes"
+        )
+    return batch_size, busy_timeout, max_trace_bytes, capture_lines, max_value_bytes, (
+        max_deep_bytes if deep else 0
+    )
 
 
 def _call_rows(roots):
@@ -143,6 +170,7 @@ class TraceStore:
         max_trace_bytes=DEFAULT_TRACE_BYTES,
         capture_lines=False,
         max_value_bytes=0,
+        max_deep_bytes=0,
     ):
         self.path = path
         self.run_id = run_id
@@ -151,6 +179,7 @@ class TraceStore:
         self.max_trace_bytes = max_trace_bytes
         self.capture_lines = capture_lines
         self.max_value_bytes = max_value_bytes
+        self.max_deep_bytes = max_deep_bytes
 
     @classmethod
     def start(
@@ -162,6 +191,7 @@ class TraceStore:
         max_trace_bytes=DEFAULT_TRACE_BYTES,
         capture_lines=False,
         max_value_bytes=0,
+        max_deep_bytes=0,
     ):
         directory = Path(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -181,6 +211,7 @@ class TraceStore:
             max_trace_bytes,
             capture_lines,
             max_value_bytes,
+            max_deep_bytes,
         )
         with closing(store._connect(allow_mode_change=True)) as connection:
             # Two invocations can race to set the journal mode on a new database.
@@ -217,6 +248,10 @@ class TraceStore:
                         "INSERT INTO stream_value_budget (run_id) VALUES (?)",
                         (store.run_id,),
                     )
+                if store.max_deep_bytes:
+                    connection.execute(
+                        "INSERT INTO stream_deep_budget (run_id) VALUES (?)", (store.run_id,)
+                    )
         return store
 
     def append_stream(self, worker, rows):
@@ -226,7 +261,7 @@ class TraceStore:
                 "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (self.run_id,)
             ).fetchone()
             admitted = []
-            for ordinal, frame_id, parent, payload, _ in rows:
+            for ordinal, frame_id, parent, payload, _, _ in rows:
                 size = len(payload) + len(frame_id.encode("utf-8", "surrogatepass"))
                 if used + size > self.max_trace_bytes:
                     break
@@ -243,7 +278,7 @@ class TraceStore:
                     "SELECT used_bytes FROM stream_value_budget WHERE run_id = ?",
                     (self.run_id,),
                 ).fetchone()
-                for ordinal, _, _, _, values in rows[: len(admitted)]:
+                for ordinal, _, _, _, values, _ in rows[: len(admitted)]:
                     for phase, name, data in values:
                         if (
                             value_used + len(data) <= self.max_value_bytes
@@ -259,11 +294,107 @@ class TraceStore:
                     "UPDATE stream_value_budget SET used_bytes = ? WHERE run_id = ?",
                     (value_used, self.run_id),
                 )
+            deep_used = 0
+            if self.max_deep_bytes:
+                deep_used, added = self._append_deep(
+                    connection, worker, rows[: len(admitted)], self.max_trace_bytes - used
+                )
+                used += added
             connection.execute(
                 "UPDATE stream_budget SET used_bytes = ? WHERE run_id = ?",
                 (used, self.run_id),
             )
-        return len(admitted), value_used
+        return len(admitted), value_used, deep_used
+
+    def _append_deep(self, connection, worker, rows, available):
+        (used,) = connection.execute(
+            "SELECT used_bytes FROM stream_deep_budget WHERE run_id = ?", (self.run_id,)
+        ).fetchone()
+        limit = min(available, self.max_deep_bytes - used)
+        added = 0
+        for ordinal, _, _, _, _, timeline in rows:
+            if timeline is None:
+                continue
+            key = (self.run_id, worker, ordinal)
+            retained = []
+            for index, data in enumerate(timeline.steps, 1):
+                if added + len(data) > limit:
+                    break
+                retained.append((*key, index, data))
+                added += len(data)
+            connection.execute(
+                "INSERT INTO stream_deep_frames VALUES (?, ?, ?, ?, ?)",
+                (*key, timeline.observed, len(retained)),
+            )
+            connection.executemany(
+                "INSERT INTO stream_deep_steps VALUES (?, ?, ?, ?, ?)", retained
+            )
+        connection.execute(
+            "UPDATE stream_deep_budget SET used_bytes = ? WHERE run_id = ?",
+            (used + added, self.run_id),
+        )
+        return used + added, added
+
+    def deep_totals(self):
+        with closing(self._connect()) as connection:
+            stored, retained = connection.execute(
+                "SELECT count(*), coalesce(sum(retained), 0) FROM stream_deep_frames WHERE run_id = ?",
+                (self.run_id,),
+            ).fetchone()
+            (size,) = connection.execute(
+                "SELECT used_bytes FROM stream_deep_budget WHERE run_id = ?", (self.run_id,)
+            ).fetchone()
+        return {"frames": stored, "retained": retained, "bytes": size}
+
+    @staticmethod
+    def read_deep(directory, run_id, frame_id=None, *, offset=0, limit=20):
+        path = Path(directory, "traces.sqlite3").resolve().as_uri()
+        with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as connection:
+            row = (
+                connection.execute(
+                    "SELECT id FROM runs ORDER BY started_ns DESC, id DESC LIMIT 1"
+                ).fetchone()
+                if run_id is None
+                else connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+            )
+            if row is None:
+                return None, None if frame_id is not None else []
+            run_id = row[0]
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'stream_deep_frames'"
+            ).fetchone() is None:
+                return run_id, None if frame_id is not None else []
+            query = (
+                "SELECT c.frame_id, d.worker, d.ordinal, d.observed, d.retained "
+                "FROM stream_deep_frames AS d "
+                "JOIN stream_calls AS c USING (run_id, worker, ordinal) WHERE d.run_id = ?"
+            )
+            if frame_id is None:
+                rows = connection.execute(
+                    query + " ORDER BY c.frame_id LIMIT ? OFFSET ?", (run_id, limit, offset)
+                )
+                return run_id, [
+                    {"frame_id": frame, "observed": observed, "retained": retained}
+                    for frame, _, _, observed, retained in rows
+                ]
+            row = connection.execute(
+                query + " AND c.frame_id = ? LIMIT 1", (run_id, frame_id)
+            ).fetchone()
+            if row is None:
+                return run_id, None
+            _, worker, ordinal, observed, retained = row
+            steps = connection.execute(
+                "SELECT step, payload FROM stream_deep_steps "
+                "WHERE run_id = ? AND worker = ? AND ordinal = ? AND step > ? "
+                "ORDER BY step LIMIT ?",
+                (run_id, worker, ordinal, offset, limit),
+            )
+            return run_id, {
+                "frame_id": frame_id,
+                "observed": observed,
+                "retained": retained,
+                "steps": [{"step": step, **json.loads(data)} for step, data in steps],
+            }
 
     def frame_values(self, run_id, frame_id):
         with closing(self._connect()) as connection:

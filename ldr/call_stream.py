@@ -5,6 +5,7 @@ import sqlite3
 from hashlib import blake2b
 from threading import RLock
 
+from .deep import Timeline
 from .fingerprint import PARTIAL_MARK, REDACTED, is_digest
 from .node import capture
 from .value_capture import capture_value
@@ -31,16 +32,24 @@ class CallStream:
         self.finished = False
         self.value_bytes_in_flight = 0
         self.committed_value_bytes = 0
+        self.deep = {}
+        self.deep_started = 0
+        self.deep_observed = 0
+        self.deep_bytes_in_flight = 0
+        self.committed_deep_bytes = 0
 
     @property
     def keeping_details(self):
         return not (self.budget_exhausted or self.write_failed)
 
-    def start(self, frame, frame_id, function, inputs, preview):
+    def start(self, frame, frame_id, function, inputs, preview, *, deep=False):
         with self.lock:
             if self.finished:
                 return
             self.next_ordinal += 1
+            if deep:
+                self.deep_started += 1
+                self.deep[id(frame)] = Timeline()
             caller = frame.f_back
             parent = None
             while caller is not None and parent is None:
@@ -96,6 +105,27 @@ class CallStream:
         if entry is not None and entry[-1] is not None and self.keeping_details:
             entry[-1].setdefault(line, None)
 
+    def record_deep(self, frame, next_line, event):
+        with self.lock:
+            timeline = self.deep.get(id(frame))
+            if timeline is None:
+                return
+            limit = 0
+            if self.keeping_details:
+                limit = self.store.max_deep_bytes - (
+                    self.committed_deep_bytes + self.deep_bytes_in_flight
+                )
+            self.deep_bytes_in_flight += timeline.advance(frame, next_line, event, limit)
+
+    def resume_deep(self, frame):
+        with self.lock:
+            timeline = self.deep.get(id(frame))
+            if timeline is not None:
+                timeline.line = frame.f_lineno
+
+    def _release_deep(self, steps):
+        self.deep_bytes_in_flight -= sum(map(len, steps))
+
     def close(
         self,
         frame,
@@ -132,8 +162,13 @@ class CallStream:
             self.functions[function] = (digest, count + 1, unknown + (not comparable))
 
             entry_metadata, data = evidence or ({}, [])
+            timeline = self.deep.pop(id(frame), None)
+            steps = timeline.steps if timeline is not None else []
+            if timeline is not None:
+                self.deep_observed += timeline.observed
             if not self.keeping_details:
                 self._release_values(data)
+                self._release_deep(steps)
                 return
             fields = {
                 "entry": inputs,
@@ -171,12 +206,14 @@ class CallStream:
                 self.flush()
             if self.budget_exhausted or self.write_failed:
                 self._release_values(data)
+                self._release_deep(steps)
                 return
             if size > self.store.max_trace_bytes:
                 self.budget_exhausted = True
                 self._release_values(data)
+                self._release_deep(steps)
                 return
-            self.pending.append((ordinal, frame_id, parent, payload, data))
+            self.pending.append((ordinal, frame_id, parent, payload, data, timeline))
             self.pending_bytes += size
             if len(self.pending) >= self.store.batch_size:
                 self.flush()
@@ -184,15 +221,19 @@ class CallStream:
     def flush(self):
         if self.pending:
             try:
-                written, self.committed_value_bytes = self.store.append_stream(
-                    self.worker, self.pending
-                )
+                (
+                    written,
+                    self.committed_value_bytes,
+                    self.committed_deep_bytes,
+                ) = self.store.append_stream(self.worker, self.pending)
                 self.stored += written
                 self.budget_exhausted |= written < len(self.pending)
             except (OSError, sqlite3.Error):
                 self.write_failed = True
-            for _, _, _, _, data in self.pending:
+            for _, _, _, _, data, timeline in self.pending:
                 self._release_values(data)
+                if timeline is not None:
+                    self._release_deep(timeline.steps)
             self.pending.clear()
             self.pending_bytes = 0
 
@@ -213,7 +254,15 @@ class CallStream:
                     for key, (digest, count, unknown) in self.functions.items()
                 },
             }
+            if self.store.max_deep_bytes:
+                summary["deep"] = {
+                    "matched": self.deep_started,
+                    "unfinished": len(self.deep),
+                    "observed": self.deep_observed
+                    + sum(timeline.observed for timeline in self.deep.values()),
+                }
             self.active.clear()
+            self.deep.clear()
         try:
             self.store.finish_stream(self.worker, summary)
         except (OSError, sqlite3.Error):

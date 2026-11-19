@@ -115,7 +115,7 @@ def redact(text: str) -> tuple[str, int]:
     # A credential given on the command line is a secret wherever it shows up
     # (for example inside the argv list a traced function receives).
     for secret in sorted(_argv_secrets, key=len, reverse=True):
-        if len(secret) >= _ENV_MIN_LENGTH and secret in text:
+        if secret and (secret == text or (len(secret) >= _ENV_MIN_LENGTH and secret in text)):
             count += text.count(secret)
             text = text.replace(secret, "<secret from the command line>")
     lowered = text.lower()

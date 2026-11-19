@@ -67,6 +67,119 @@ def test_line_capture_requires_an_explicit_budget(tmp_path):
         storage_settings(tmp_path)
 
 
+def test_deep_capture_requires_budget_before_running_target(tmp_path):
+    (tmp_path / "app.py").write_text("raise AssertionError('target ran')\n")
+    result = invoke(tmp_path, "run", "app.py", "--deep", "target")
+    assert result.returncode == 2
+    assert "requires explicit" in result.stderr
+    assert "target ran" not in result.stderr
+
+
+def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, monkeypatch):
+    secret = "fixture-local-env-secret"
+    monkeypatch.setenv("DEEP_TEST_SECRET", secret)
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_deep_bytes = 10000\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "import os, sys\n"
+        "def leaf():\n"
+        "    unrelated = 42\n"
+        "def target():\n"
+        "    data = []; sys._getframe().f_locals[3] = True\n"
+        "    api_key = 'fixture-local-name-secret'\n"
+        "    blob = {'nested': os.environ['DEEP_TEST_SECRET']}; flag = sys.argv[-1]\n"
+        "    for n in range(2):\n"
+        "        data.append(n)\n"
+        "    del n\n"
+        "    leaf()\n"
+        "    return data\n"
+        "target()\n"
+    )
+    result = invoke(tmp_path, "run", "app.py", "--golden", "--", "--token", "qzx")
+    assert result.returncode == 0, result.stdout + result.stderr
+    result = invoke(
+        tmp_path, "run", "app.py", "--deep", "app.py:target", "--diff",
+        "--fail-on-change", "--", "--token", "qzx",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    status = report["status"]["deep_capture"]
+    assert status["observed"] == status["retained"]
+    assert status["matched"] == status["frames"] == 1
+    run_id = report["status"]["run_id"]
+    (tmp_path / "app.py").unlink()
+    frames = json.loads(invoke(tmp_path, "show", "--json", "--run-id", run_id).stdout)["frames"]
+    frame_id = frames[0]["frame_id"]
+    assert frame_id == "app.py:4:target#1"
+    steps = json.loads(invoke(tmp_path, "show", frame_id, "--json").stdout)["frame"]["steps"]
+    loop = [dict(step["locals"]) for step in steps if step["line"] == 9]
+    assert [locals_["data"]["value"] for locals_ in loop] == [[0], [0, 1]]
+    assert loop[0]["blob"] == loop[0]["api_key"] == {"status": "redacted"}
+    assert loop[0]["flag"] == {"status": "redacted"}
+    assert "n" not in dict(steps[-1]["locals"])
+    assert steps[-1]["event"] == "return"
+    page = invoke(tmp_path, "show", frame_id, "--json", "--offset", "1", "--limit", "1")
+    assert json.loads(page.stdout)["frame"]["steps"] == steps[1:2]
+    database = (tmp_path / ".ldr" / "traces.sqlite3").read_bytes()
+    assert secret.encode() not in database
+    assert b"fixture-local-name-secret" not in database
+    assert b"qzx" not in database
+
+
+def test_deep_capture_marks_yield_continuation_and_unwind(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_deep_bytes = 10000\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "def gen():\n"
+        "    received = yield 1\n"
+        "    raise ValueError(received)\n"
+        "g = gen()\n"
+        "next(g)\n"
+        "g.send(3)\n"
+    )
+    result = invoke(tmp_path, "run", "app.py", "--deep", "gen")
+    assert result.returncode == 1, result.stdout + result.stderr
+    shown = invoke(tmp_path, "show", "app.py:1:gen#1", "--json")
+    steps = json.loads(shown.stdout)["frame"]["steps"]
+    assert [(step["line"], step["event"]) for step in steps] == [
+        (2, "yield"), (2, "line"), (3, "unwind"),
+    ]
+    assert dict(steps[1]["locals"])["received"]["value"] == 3
+
+
+def test_deep_budget_is_shared_across_workers(tmp_path):
+    pytest.importorskip("xdist")
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.ldr.storage]\nbatch_size = 1\n"
+        "max_trace_bytes = 100000\nmax_deep_bytes = 170\n"
+    )
+    (tmp_path / "calc.py").write_text(
+        "def target(n):\n    value = 'x' * 1000; return n\n"
+    )
+    (tmp_path / "test_calc.py").write_text(
+        "from calc import target\n"
+        "def test_one():\n    assert target(1) == 1\n"
+        "def test_two():\n    assert target(2) == 2\n"
+    )
+    result = invoke(tmp_path, "pytest", "test_calc.py", "--deep", "target", "--", "-n", "2")
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    status = report["status"]["deep_capture"]
+    assert status["matched"] == status["frames"] == 2
+    assert status["observed"] == 2
+    assert status["retained"] == 1
+    assert 0 < status["bytes"] <= 170
+    with sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT count(DISTINCT worker) FROM stream_deep_frames"
+        ).fetchone() == (2,)
+        data, = connection.execute("SELECT payload FROM stream_deep_steps").fetchone()
+    assert len(data) == status["bytes"]
+    assert dict(json.loads(data)["locals"])["value"] == {"status": "partial"}
+
+
 def test_structural_values_explain_a_change_outside_the_preview(tmp_path):
     (tmp_path / "pyproject.toml").write_text(
         "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_value_bytes = 10000\n"

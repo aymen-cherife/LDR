@@ -11,6 +11,14 @@ class _Incomplete(Exception):
     pass
 
 
+class _Redacted(_Incomplete):
+    pass
+
+
+class _Unsupported(_Incomplete):
+    pass
+
+
 def _one_of(kind, types):
     return any(kind is candidate for candidate in types)
 
@@ -35,7 +43,7 @@ class _Encoder:
         if len(value) > self.limit - len(self.data):
             raise _Incomplete
         if contains_secret(value):
-            raise _Incomplete
+            raise _Redacted
 
     def encode(self, value):
         self.nodes += 1
@@ -87,7 +95,7 @@ class _Encoder:
         elif _one_of(kind, (list, tuple, dict, set, frozenset)):
             self.container(value, kind)
         else:
-            raise _Incomplete
+            raise _Unsupported
 
     def container(self, value, kind):
         marker = id(value)
@@ -123,7 +131,7 @@ class _Encoder:
                 if kind is dict:
                     key, element = item
                     if is_secret_name(key):
-                        raise _Incomplete
+                        raise _Redacted
                     self.write(b"[")
                     self.encode(key)
                     self.write(b",")
@@ -133,6 +141,22 @@ class _Encoder:
                     self.encode(item)
         self.write(b"]" if kind is list else b"]}")
         self.ancestors.pop()
+
+
+def encode_local(value, name, limit):
+    """Encode one local without collecting previews or fingerprints."""
+    if is_secret_name(name):
+        return b'{"status":"redacted"}'
+    encoder = _Encoder(limit)
+    try:
+        encoder.encode(value)
+    except _Redacted:
+        return b'{"status":"redacted"}'
+    except _Unsupported:
+        return b'{"status":"unsupported"}'
+    except (_Incomplete, RuntimeError, ValueError):
+        return b'{"status":"partial"}'
+    return b'{"status":"complete","value":' + bytes(encoder.data) + b"}"
 
 
 def capture_value(value, fingerprint, limit):
