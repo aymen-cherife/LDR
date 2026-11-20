@@ -279,6 +279,14 @@ class Recorder:
                 f"{self._source_id(code.co_filename)}:{code.co_qualname}", spent
             )
 
+    def _lines_wanted(self, code) -> bool:
+        """Hook point: whether to record which lines ran inside this function.
+
+        Reserved for a later feature that records executed lines for selected
+        functions. Nothing calls it yet, and it selects nothing.
+        """
+        return False
+
     @staticmethod
     def _argument_names(code) -> list[str]:
         names = list(code.co_varnames[: code.co_argcount + code.co_kwonlyargcount])
@@ -450,9 +458,6 @@ class Recorder:
             if node is not None
             else self._argument_fingerprints(code, frame, entering=True)
         )
-        preview = None
-        if self.call_stream.keeping_details:
-            preview = node.in_ if node is not None else self._arguments(code, frame)
         identity = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
         function = f"{self.frame_prefix}{identity}"
         deep = bool(self.deep_functions) and (
@@ -460,12 +465,17 @@ class Recorder:
             or code.co_qualname in self.deep_functions
             or identity in self.deep_functions
         )
+        # Only the first N calls of a function keep detail; the rest keep fingerprints.
+        detail = self.call_stream.note_call(function, deep)
+        preview = None
+        if detail:
+            preview = node.in_ if node is not None else self._arguments(code, frame)
         if deep and code not in self._deep_codes:
             if not self._global_lines:
                 mon = sys.monitoring
                 mon.set_local_events(self._tool_id, code, mon.events.LINE)
             self._deep_codes.add(code)
-        self.call_stream.start(frame, frame_id, function, inputs, preview, deep=deep)
+        self.call_stream.start(frame, frame_id, function, inputs, preview, deep=deep, detail=detail)
 
     def _finish_timing(self, frame, at):
         timing = self._timings.pop(id(frame), None)
@@ -740,7 +750,7 @@ class Recorder:
         stream = self.call_stream
         out = out_fp = None
         if error is None:
-            if node_retained or (stream is not None and stream.keeping_details):
+            if node_retained or (stream is not None and stream.detail_for(frame)):
                 out = capture(return_value)
             if node_retained or stream is not None:
                 walked = STATS.nodes
@@ -809,7 +819,7 @@ class Recorder:
             self.call_stream.record_deep(frame, None, "return")
         if code in self._suppressed_codes:
             if self.call_stream is not None:
-                preview = capture(retval) if self.call_stream.keeping_details else None
+                preview = capture(retval) if self.call_stream.detail_for(frame) else None
                 self.call_stream.close(
                     frame, self._argument_fingerprints(code, frame),
                     fp_value(retval), None, preview, timing, retval,

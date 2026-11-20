@@ -408,7 +408,7 @@ def test_late_unsampled_change_is_detected_at_and_below_storage_budget(
     tmp_path, max_trace_bytes
 ):
     (tmp_path / "pyproject.toml").write_text(
-        f"[tool.ldr.storage]\nbatch_size = 3\nmax_trace_bytes = {max_trace_bytes}\n"
+        f"[tool.ldr.storage]\nbatch_size = 3\nmax_trace_bytes = {max_trace_bytes}\nfirst_calls = 100\n"
     )
     program = tmp_path / "app.py"
     template = "def leaf(n):\n    return n + ({delta} if n == 37 else 0)\nfor i in range(50):\n    leaf(i)\n"

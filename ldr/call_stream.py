@@ -26,7 +26,10 @@ class CallStream:
         self.completed = 0
         self.functions = {}
         self.pending = []
+        self.pending_fp = []
         self.pending_bytes = 0
+        self.counts = {}
+        self.fingerprinted = 0
         self.stored = 0
         self.budget_exhausted = False
         self.write_failed = False
@@ -49,11 +52,20 @@ class CallStream:
         """Charge fingerprint work (nodes walked) to a function."""
         self.cost[function] = self.cost.get(function, 0) + nodes
 
+    def note_call(self, function, deep=False):
+        """Count a started call. True when it keeps detail: one of the first N of its function."""
+        count = self.counts[function] = self.counts.get(function, 0) + 1
+        return (deep or count <= self.store.first_calls) and self.keeping_details
+
+    def detail_for(self, frame):
+        entry = self.active.get(id(frame))
+        return entry is not None and entry[7]
+
     def frame_address(self, frame):
         entry = self.active.get(id(frame))
         return entry[2] if entry is not None else None
 
-    def start(self, frame, frame_id, function, inputs, preview, *, deep=False):
+    def start(self, frame, frame_id, function, inputs, preview, *, deep=False, detail=True):
         with self.lock:
             if self.finished:
                 return
@@ -67,7 +79,7 @@ class CallStream:
                 parent = self.active.get(id(caller))
                 caller = caller.f_back
             evidence = None
-            if self.store.max_value_bytes and self.keeping_details:
+            if self.store.max_value_bytes and detail:
                 evidence = self._argument_values(frame, inputs, "entry", preview or {})
             self.active[id(frame)] = (
                 self.next_ordinal,
@@ -77,7 +89,8 @@ class CallStream:
                 inputs,
                 preview,
                 evidence,
-                {} if self.store.capture_lines and self.keeping_details else None,
+                detail,
+                {} if self.store.capture_lines and detail else None,
             )
 
     def _value(self, data, phase, name, value, fingerprint, preview=None):
@@ -151,7 +164,7 @@ class CallStream:
             entry = self.active.pop(id(frame), None)
             if entry is None:
                 return
-            ordinal, parent, frame_id, function, inputs, preview, evidence, lines = (
+            ordinal, parent, frame_id, function, inputs, preview, evidence, detail, lines = (
                 entry
             )
             self.completed += 1
@@ -172,14 +185,27 @@ class CallStream:
             digest.update(signature)
             self.functions[function] = (digest, count + 1, unknown + (not comparable))
 
+            parts = [("in", name, token) for name, token in inputs.items()]
+            parts.extend(
+                ("out", name, token)
+                for name, token in exit_inputs.items()
+                if inputs.get(name) != token
+            )
+            if error is None:
+                parts.append(("ret", "", output))
+            self.pending_fp.append(
+                (ordinal, frame_id, parent, function, error.split(":", 1)[0] if error else None, parts)
+            )
             entry_metadata, data = evidence or ({}, [])
             timeline = self.deep.pop(id(frame), None)
             steps = timeline.steps if timeline is not None else []
             if timeline is not None:
                 self.deep_observed += timeline.observed
-            if not self.keeping_details:
+            if not (detail and self.keeping_details):
                 self._release_values(data)
                 self._release_deep(steps)
+                if len(self.pending_fp) >= self.store.batch_size:
+                    self.flush()
                 return
             fields = {
                 "entry": inputs,
@@ -226,18 +252,19 @@ class CallStream:
                 return
             self.pending.append((ordinal, frame_id, parent, payload, data, timeline))
             self.pending_bytes += size
-            if len(self.pending) >= self.store.batch_size:
+            if len(self.pending) >= self.store.batch_size or len(self.pending_fp) >= self.store.batch_size:
                 self.flush()
 
     def flush(self):
-        if self.pending:
+        if self.pending or self.pending_fp:
             try:
                 (
                     written,
                     self.committed_value_bytes,
                     self.committed_deep_bytes,
-                ) = self.store.append_stream(self.worker, self.pending)
+                ) = self.store.append_stream(self.worker, self.pending, self.pending_fp)
                 self.stored += written
+                self.fingerprinted += len(self.pending_fp)
                 self.budget_exhausted |= written < len(self.pending)
             except (OSError, sqlite3.Error):
                 self.write_failed = True
@@ -246,6 +273,7 @@ class CallStream:
                 if timeline is not None:
                     self._release_deep(timeline.steps)
             self.pending.clear()
+            self.pending_fp.clear()
             self.pending_bytes = 0
 
     def finish(self):
@@ -255,6 +283,9 @@ class CallStream:
             summary = {
                 "started": self.next_ordinal,
                 "stored": self.stored,
+                "fingerprinted": self.fingerprinted,
+                "first_calls": self.store.first_calls,
+                "last_calls": self.store.last_calls,
                 "unfinished": len(self.active),
                 "uncomparable": sum(
                     unknown for _, _, unknown in self.functions.values()

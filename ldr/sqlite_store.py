@@ -16,6 +16,10 @@ from .node import Node
 DEFAULT_BATCH_SIZE = 1000
 DEFAULT_BUSY_TIMEOUT = 30
 DEFAULT_TRACE_BYTES = 16 * 1024 * 1024
+# Phase 2 rule 2. Placeholders, TO MEASURE: detail for the first N calls of each
+# function, and (on demand, later) the last K.
+DEFAULT_FIRST_CALLS = 8
+DEFAULT_LAST_CALLS = 3
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, started_ns INTEGER NOT NULL, invocation TEXT NOT NULL, status TEXT
@@ -42,6 +46,18 @@ CREATE TABLE IF NOT EXISTS stream_calls (
     frame_id TEXT NOT NULL, parent INTEGER, payload BLOB NOT NULL,
     PRIMARY KEY (run_id, worker, ordinal)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stream_fp (
+    run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    frame_id TEXT NOT NULL, parent INTEGER, function TEXT NOT NULL, error TEXT,
+    PRIMARY KEY (run_id, worker, ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stream_fp_values (
+    run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    role TEXT NOT NULL, name TEXT NOT NULL, fp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS stream_fp_values_fp ON stream_fp_values(run_id, fp);
+CREATE INDEX IF NOT EXISTS stream_fp_values_call ON stream_fp_values(run_id, worker, ordinal);
+CREATE INDEX IF NOT EXISTS stream_fp_frame ON stream_fp(run_id, frame_id);
 CREATE TABLE IF NOT EXISTS stream_summary (
     run_id TEXT NOT NULL REFERENCES runs(id), worker TEXT NOT NULL, summary TEXT NOT NULL,
     PRIMARY KEY (run_id, worker)
@@ -116,6 +132,12 @@ def storage_settings(project_root, *, deep=False, boundary=False):
     max_trace_bytes = settings.get("max_trace_bytes", DEFAULT_TRACE_BYTES)
     capture_lines = settings.get("capture_lines", False)
     max_value_bytes = settings.get("max_value_bytes", 0)
+    first_calls = settings.get("first_calls", DEFAULT_FIRST_CALLS)
+    last_calls = settings.get("last_calls", DEFAULT_LAST_CALLS)
+    if type(first_calls) is not int or not 0 < first_calls < 2**31:
+        raise ValueError("[tool.ldr.storage] first_calls must be a positive integer")
+    if type(last_calls) is not int or not 0 <= last_calls < 2**31:
+        raise ValueError("[tool.ldr.storage] last_calls must be a nonnegative integer")
     for name, value in (
         ("batch_size", batch_size),
         ("busy_timeout", busy_timeout),
@@ -155,7 +177,7 @@ def storage_settings(project_root, *, deep=False, boundary=False):
         allowance[flag] = value if active else 0
     return (
         batch_size, busy_timeout, max_trace_bytes, capture_lines, max_value_bytes,
-        allowance["deep"], allowance["boundary"],
+        allowance["deep"], allowance["boundary"], first_calls, last_calls,
     )
 
 
@@ -187,6 +209,8 @@ class TraceStore:
         max_value_bytes=0,
         max_deep_bytes=0,
         max_boundary_bytes=0,
+        first_calls=DEFAULT_FIRST_CALLS,
+        last_calls=DEFAULT_LAST_CALLS,
     ):
         self.path = path
         self.run_id = run_id
@@ -197,6 +221,8 @@ class TraceStore:
         self.max_value_bytes = max_value_bytes
         self.max_deep_bytes = max_deep_bytes
         self.max_boundary_bytes = max_boundary_bytes
+        self.first_calls = first_calls
+        self.last_calls = last_calls
 
     @classmethod
     def start(
@@ -210,6 +236,8 @@ class TraceStore:
         max_value_bytes=0,
         max_deep_bytes=0,
         max_boundary_bytes=0,
+        first_calls=DEFAULT_FIRST_CALLS,
+        last_calls=DEFAULT_LAST_CALLS,
     ):
         directory = Path(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -231,6 +259,8 @@ class TraceStore:
             max_value_bytes,
             max_deep_bytes,
             max_boundary_bytes,
+            first_calls,
+            last_calls,
         )
         with closing(store._connect(allow_mode_change=True)) as connection:
             # Two invocations can race to set the journal mode on a new database.
@@ -277,9 +307,14 @@ class TraceStore:
                     )
         return store
 
-    def append_stream(self, worker, rows):
+    def append_stream(self, worker, rows, fingerprints=()):
+        """Write detail rows within the byte budget, and every fingerprint row.
+
+        The budget limits detail only. Per-call fingerprints are never dropped.
+        """
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._append_fingerprints(connection, worker, fingerprints)
             (used,) = connection.execute(
                 "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (self.run_id,)
             ).fetchone()
@@ -328,6 +363,15 @@ class TraceStore:
                 (used, self.run_id),
             )
         return len(admitted), value_used, deep_used
+
+    def _append_fingerprints(self, connection, worker, fingerprints):
+        calls = []
+        values = []
+        for ordinal, frame_id, parent, function, error, parts in fingerprints:
+            calls.append((self.run_id, worker, ordinal, frame_id, parent, function, error))
+            values.extend((self.run_id, worker, ordinal, role, name, fp) for role, name, fp in parts)
+        connection.executemany("INSERT INTO stream_fp VALUES (?, ?, ?, ?, ?, ?, ?)", calls)
+        connection.executemany("INSERT INTO stream_fp_values VALUES (?, ?, ?, ?, ?, ?)", values)
 
     def _append_deep(self, connection, worker, rows, available):
         (used,) = connection.execute(

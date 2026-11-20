@@ -1122,8 +1122,10 @@ def main(argv=None) -> int:
             stream_summaries = store.read_stream(store.run_id)
             status["call_stream"] = {
                 key: sum(summary[key] for summary in stream_summaries)
-                for key in ("started", "stored", "unfinished", "uncomparable", "write_failed")
+                for key in ("started", "stored", "fingerprinted", "unfinished", "uncomparable", "write_failed")
             }
+            status["call_stream"]["first_calls"] = store.first_calls
+            status["call_stream"]["last_calls"] = store.last_calls
             status["fingerprint"] = _fingerprint_status(stream_summaries)
             status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1
             status["call_stream"]["summaries"] = len(stream_summaries)
@@ -1178,7 +1180,8 @@ def main(argv=None) -> int:
     stream_status = status.get("call_stream")
     if stream_status:
         redaction_note += (
-            f"CALL STREAM: {stream_status['stored']} of {stream_status['started']} call(s) stored individually, "
+            f"CALL STREAM: {stream_status['fingerprinted']} of {stream_status['started']} call(s) fingerprinted, "
+            f"{stream_status['stored']} with detail (the first {stream_status['first_calls']} calls of each function), "
             f"{stream_status['unfinished']} unfinished, {stream_status['uncomparable']} with incomparable values.\n"
         )
         if fingerprint_status := status.get("fingerprint"):
