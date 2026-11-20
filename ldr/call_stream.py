@@ -7,7 +7,7 @@ from threading import RLock
 
 from .boundary import BoundaryStream
 from .deep import Timeline
-from .fingerprint import PARTIAL_MARK, REDACTED, is_digest
+from .fingerprint import PARTIAL_MARK, REDACTED, STATS, is_digest
 from .node import capture
 from .value_capture import capture_value
 
@@ -33,6 +33,7 @@ class CallStream:
         self.finished = False
         self.value_bytes_in_flight = 0
         self.committed_value_bytes = 0
+        self.cost = {}
         self.deep = {}
         self.deep_started = 0
         self.deep_observed = 0
@@ -43,6 +44,10 @@ class CallStream:
     @property
     def keeping_details(self):
         return not (self.budget_exhausted or self.write_failed)
+
+    def add_cost(self, function, nodes):
+        """Charge fingerprint work (nodes walked) to a function."""
+        self.cost[function] = self.cost.get(function, 0) + nodes
 
     def frame_address(self, frame):
         entry = self.active.get(id(frame))
@@ -255,6 +260,7 @@ class CallStream:
                     unknown for _, _, unknown in self.functions.values()
                 ),
                 "write_failed": self.write_failed,
+                "fingerprint": {"tmp_normalized": STATS.tmp_normalized, "cost": dict(self.cost)},
                 "functions": {
                     key: [digest.hexdigest(), count, unknown]
                     for key, (digest, count, unknown) in self.functions.items()

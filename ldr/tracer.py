@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass, field
 from time import perf_counter_ns
 
-from .fingerprint import REDACTED, fingerprint, fingerprint_details
+from .fingerprint import REDACTED, STATS, fingerprint, fingerprint_details
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
 from .redact import redact, same_text_policy, text_policy
 from .timing import CallTiming
@@ -232,6 +232,7 @@ class Recorder:
 
     def _argument_fingerprints(self, code, frame, *, entering=False) -> dict[str, str]:
         """Fingerprint each argument, reusing proven stable entry digests at exit."""
+        walked = STATS.nodes
         result: dict[str, str] = {}
         locals_ = frame.f_locals
         remember = entering and self.call_stream is not None
@@ -263,7 +264,16 @@ class Recorder:
                 result[name] = fp_value(value, name)
         if reusable and same_text_policy(policy):
             self._immutable_inputs[id(frame)] = (policy, reusable)
+        self._charge(code, walked)
         return result
+
+    def _charge(self, code, walked_before: int) -> None:
+        """Record the fingerprint work done since ``walked_before`` against this function."""
+        spent = STATS.nodes - walked_before
+        if spent and self.call_stream is not None:
+            self.call_stream.add_cost(
+                f"{self._source_id(code.co_filename)}:{code.co_qualname}", spent
+            )
 
     @staticmethod
     def _argument_names(code) -> list[str]:
@@ -729,7 +739,9 @@ class Recorder:
             if node_retained or (stream is not None and stream.keeping_details):
                 out = capture(return_value)
             if node_retained or stream is not None:
+                walked = STATS.nodes
                 out_fp = fp_value(return_value)
+                self._charge(code, walked)
         if isinstance(entry, Node) and self._focus_matches(
             entry.frame_id, self._entry_segment(entry)
         ):

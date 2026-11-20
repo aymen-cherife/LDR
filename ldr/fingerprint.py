@@ -17,6 +17,9 @@ import decimal
 import hashlib
 import types
 from dataclasses import dataclass
+import os
+import re
+import tempfile
 from typing import Any
 
 from .redact import contains_secret, is_secret_name
@@ -34,15 +37,16 @@ DIGEST_BYTES = 16
 
 @dataclass(frozen=True)
 class Budget:
-    """Hard per-value limits. Past either of them the result is ``unknown``.
+    """Per-value limits. Past one of them the result is ``unknown``.
 
     Deliberately no time budget: a wall-clock limit would make the same value
     ``complete`` in one run and ``unknown`` in the next, depending on machine
-    load, and fake a difference. No user code runs while reading a value, so node
-    count and depth already bound the cost (about 1 ms per 1,000 nodes).
+    load, and fake a difference. There is no node cap by default (Phase 2 rule
+    5): a large value is walked, and the cost is reported per function. The
+    depth limit stays as a guard. ``max_nodes`` remains for callers that set one.
     """
 
-    max_nodes: int = 10_000
+    max_nodes: int | None = None
     max_depth: int = 24
 
 
@@ -62,6 +66,62 @@ def is_digest(token: str | None) -> bool:
     return bool(token) and token not in STATUSES
 
 
+class _Stats:
+    """Process-wide counters, read by the recorder to report cost and gaps."""
+
+    __slots__ = ("nodes", "tmp_normalized")
+
+    def __init__(self) -> None:
+        self.nodes = 0
+        self.tmp_normalized = 0
+
+
+STATS = _Stats()
+
+# A homogeneous list or tuple at least this long is encoded without a Python call per item.
+FAST_PATH_MIN = 32
+
+_TMP_PLACEHOLDER = "<tmp>/…"
+
+
+def _temp_prefixes() -> list[str]:
+    root = tempfile.gettempdir()
+    found = {root.rstrip("\\/"), os.path.realpath(root).rstrip("\\/")}
+    return sorted((p for p in found if p), key=len, reverse=True)
+
+
+_TMP_PREFIXES = _temp_prefixes()
+_TMP_FOLD = os.name == "nt"
+_TMP_MIN = min((len(p) for p in _TMP_PREFIXES), default=1 << 30)
+_TMP_RE = (
+    re.compile(
+        "(?:" + "|".join(re.escape(p) for p in _TMP_PREFIXES) + ")"
+        + r"""(?:[\\/][^\s'"]*)?(?=[\s'"]|$)""",
+        re.IGNORECASE if _TMP_FOLD else 0,
+    )
+    if _TMP_PREFIXES
+    else None
+)
+_TMP_HINTS = [p.casefold() if _TMP_FOLD else p for p in _TMP_PREFIXES]
+
+
+def normalize_temp_paths(text: str) -> str:
+    """Replace every path under the temp directory with ``<tmp>/…``.
+
+    A temp path carries a name that differs on every run, so it could never
+    compare equal. Differences inside such a path are therefore not compared, and
+    the count is reported in the gaps line.
+    """
+    if _TMP_RE is None or len(text) < _TMP_MIN:
+        return text
+    probe = text.casefold() if _TMP_FOLD else text
+    if not any(hint in probe for hint in _TMP_HINTS):
+        return text
+    result, count = _TMP_RE.subn(_TMP_PLACEHOLDER, text)
+    STATS.tmp_normalized += count
+    return result
+
+
 class _Walk:
     def __init__(self, budget: Budget, partial_ok: bool = False) -> None:
         self.budget = budget
@@ -74,7 +134,9 @@ class _Walk:
     def encode(self, value: Any, out: hashlib.blake2b, depth: int = 0) -> None:
         self.visited += 1
         budget = self.budget
-        if depth > budget.max_depth or self.visited > budget.max_nodes:
+        if depth > budget.max_depth or (
+            budget.max_nodes is not None and self.visited > budget.max_nodes
+        ):
             raise _Stop(UNKNOWN)
         kind = type(value)
         if value is None:
@@ -90,7 +152,7 @@ class _Walk:
         elif kind is str:
             if _looks_secret(value):
                 raise _Stop(REDACTED)
-            self._text(b"s", value.encode("utf-8", "surrogatepass"), out)
+            self._text(b"s", normalize_temp_paths(value).encode("utf-8", "surrogatepass"), out)
         elif kind is bytes or kind is bytearray:
             if kind is bytearray:
                 self.immutable = False
@@ -161,6 +223,40 @@ class _Walk:
         finally:
             self.active.pop()
 
+    def _fast_items(self, value: Any, out: hashlib.blake2b, depth: int) -> bool:
+        """Encode a homogeneous run of ints, floats, bools or strings in bulk.
+
+        The bytes are the same as the per-item walk would write. Returns False,
+        having written nothing, when the items are not all one of those types.
+        """
+        kinds = set(map(type, value))
+        if len(kinds) != 1:
+            return False
+        item_kind = next(iter(kinds))
+        if item_kind is int:
+            body = "".join(["i%x;" % item for item in value]).encode()
+        elif item_kind is float:
+            body = "".join(["f" + item.hex() + ";" for item in value]).encode()
+        elif item_kind is bool:
+            body = "".join(["T" if item else "F" for item in value]).encode()
+        elif item_kind is str:
+            pieces = []
+            for item in value:
+                if _looks_secret(item):
+                    raise _Stop(REDACTED)
+                data = normalize_temp_paths(item).encode("utf-8", "surrogatepass")
+                pieces.append(b"s" + str(len(data)).encode() + b":" + data)
+            body = b"".join(pieces)
+        else:
+            return False
+        if depth + 1 > self.budget.max_depth:
+            raise _Stop(UNKNOWN)
+        self.visited += len(value)
+        if self.budget.max_nodes is not None and self.visited > self.budget.max_nodes:
+            raise _Stop(UNKNOWN)
+        out.update(body)
+        return True
+
     @staticmethod
     def _text(tag: bytes, data: bytes, out: hashlib.blake2b) -> None:
         out.update(tag + str(len(data)).encode() + b":" + data)
@@ -175,8 +271,9 @@ class _Walk:
         try:
             if kind is list or kind is tuple:
                 out.update((b"l" if kind is list else b"t") + str(len(value)).encode() + b"[")
-                for item in value:
-                    self.encode(item, out, depth + 1)
+                if len(value) < FAST_PATH_MIN or not self._fast_items(value, out, depth):
+                    for item in value:
+                        self.encode(item, out, depth + 1)
             elif kind is dict:
                 # Insertion order is part of the value.
                 out.update(b"d" + str(len(value)).encode() + b"{")
@@ -219,6 +316,7 @@ def fingerprint_details(
     value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool = False
 ) -> tuple[str, bool]:
     """Return the existing fingerprint and whether it can be reused for this object."""
+    walk = None
     try:
         out = hashlib.blake2b(digest_size=DIGEST_BYTES)
         walk = _Walk(budget, partial_ok)
@@ -232,3 +330,6 @@ def fingerprint_details(
         return UNKNOWN, False
     except Exception:
         return FAILED, False
+    finally:
+        if walk is not None:
+            STATS.nodes += walk.visited

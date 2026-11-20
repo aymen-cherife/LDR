@@ -6,6 +6,9 @@ import math
 from .fingerprint import DEFAULT_BUDGET, PARTIAL_MARK, REDACTED, is_digest
 from .redact import contains_secret, is_secret_name
 
+# Full value retention keeps its own node limit; the fingerprint walk has none.
+VALUE_NODE_LIMIT = 10_000
+
 
 class _Incomplete(Exception):
     pass
@@ -48,7 +51,7 @@ class _Encoder:
     def encode(self, value):
         self.nodes += 1
         if (
-            self.nodes > DEFAULT_BUDGET.max_nodes
+            self.nodes > VALUE_NODE_LIMIT
             or len(self.ancestors) > DEFAULT_BUDGET.max_depth
         ):
             raise _Incomplete

@@ -209,19 +209,24 @@ def test_objects_with_different_state_are_different_and_equal_state_is_equal():
 
 
 def test_budgets_make_oversized_values_unknown_not_slow_and_not_equal():
-    """Defect 3: a value past its budget is `unknown`, found out quickly."""
+    """Defect 3, as changed by Phase 2 rule 5: only the depth guard (or an explicit
+    node budget) makes a value `unknown`. A large value is walked, not skipped."""
     import time
 
     from ldr.fingerprint import Budget, fingerprint, is_digest
 
     assert is_digest(fingerprint(list(range(1000))))
+    assert is_digest(fingerprint(list(range(2_000_000))))
     assert fingerprint(list(range(100)), Budget(max_nodes=10)) == "unknown"
     assert is_digest(fingerprint(list(range(5)), Budget(max_nodes=10)))
     assert fingerprint([[[[1]]]], Budget(max_depth=2)) == "unknown"
     assert not hasattr(Budget(), "max_seconds")  # no time budget: see the next test
 
+    deep = 1
+    for _ in range(10_000):
+        deep = [deep]
     started = time.perf_counter()
-    assert fingerprint(list(range(2_000_000))) == "unknown"
+    assert fingerprint(deep) == "unknown"
     assert time.perf_counter() - started < 0.5
 
 
@@ -245,11 +250,16 @@ def test_a_fingerprint_never_depends_on_machine_load(monkeypatch):
 def test_unknown_values_are_reported_as_unknown_never_unchanged():
     import fixtures.values as v
 
-    huge_a = list(range(100_000))
-    huge_b = list(range(100_000))
-    huge_b[99_999] = -1
-    old = record(lambda: v.consume(huge_a))
-    new = record(lambda: v.consume(huge_b))
+    def nested(leaf):
+        value = [leaf]
+        for _ in range(40):  # deeper than the guard
+            value = [value]
+        return value
+
+    deep_a = nested(1)
+    deep_b = nested(2)
+    old = record(lambda: v.consume(deep_a))
+    new = record(lambda: v.consume(deep_b))
     assert old.roots[0].in_fp["items"] == "unknown"
 
     changes = diff_tree(old.roots[0], new.roots[0])
