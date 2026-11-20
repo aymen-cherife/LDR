@@ -66,7 +66,7 @@ def test_a_differing_call_beyond_the_first_eight_keeps_detail_without_a_rerun(tm
             )
         }
         flagged = connection.execute(
-            "SELECT frame_id FROM stream_fp WHERE run_id = ? AND reference = 'different'", (run_id,)
+            "SELECT frame_id FROM call_records WHERE run_id = ? AND reference = 'different'", (run_id,)
         ).fetchall()
     assert kept == {f"app.py:f#{n}" for n in range(1, 9)} | {"app.py:f#12"}
     assert flagged == [("app.py:f#12",)]

@@ -1,6 +1,7 @@
 """SQLite persistence for bounded, already-captured trace trees."""
 
 import json
+import marshal
 import os
 import sqlite3
 import tomllib
@@ -11,6 +12,7 @@ from pathlib import Path
 from time import monotonic, sleep, time_ns
 from uuid import uuid4
 
+from .fingerprint import is_digest
 from .node import Node
 
 DEFAULT_BATCH_SIZE = 1000
@@ -60,19 +62,17 @@ CREATE TABLE IF NOT EXISTS stream_calls (
     frame_id TEXT NOT NULL, parent INTEGER, payload BLOB NOT NULL,
     PRIMARY KEY (run_id, worker, ordinal)
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS stream_fp (
+CREATE TABLE IF NOT EXISTS call_records (
     run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
     frame_id TEXT NOT NULL, parent INTEGER, function TEXT NOT NULL, error TEXT,
-    reference TEXT,
+    reference TEXT, signature BLOB NOT NULL, parts BLOB NOT NULL,
     PRIMARY KEY (run_id, worker, ordinal)
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS stream_fp_values (
-    run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
-    role TEXT NOT NULL, name TEXT NOT NULL, fp TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS call_lookup (
+    run_id TEXT NOT NULL, fp TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    role TEXT NOT NULL, name TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS stream_fp_values_fp ON stream_fp_values(run_id, fp);
-CREATE INDEX IF NOT EXISTS stream_fp_values_call ON stream_fp_values(run_id, worker, ordinal);
-CREATE INDEX IF NOT EXISTS stream_fp_frame ON stream_fp(run_id, frame_id);
+CREATE INDEX IF NOT EXISTS call_lookup_fp ON call_lookup(run_id, fp);
 CREATE TABLE IF NOT EXISTS stream_summary (
     run_id TEXT NOT NULL REFERENCES runs(id), worker TEXT NOT NULL, summary TEXT NOT NULL,
     PRIMARY KEY (run_id, worker)
@@ -462,13 +462,29 @@ class TraceStore:
         )
 
     def _append_fingerprints(self, connection, worker, fingerprints):
-        calls = []
-        values = []
-        for ordinal, frame_id, parent, function, error, parts, reference in fingerprints:
-            calls.append((self.run_id, worker, ordinal, frame_id, parent, function, error, reference))
-            values.extend((self.run_id, worker, ordinal, role, name, fp) for role, name, fp in parts)
-        connection.executemany("INSERT INTO stream_fp VALUES (?, ?, ?, ?, ?, ?, ?, ?)", calls)
-        connection.executemany("INSERT INTO stream_fp_values VALUES (?, ?, ?, ?, ?, ?)", values)
+        """One packed record per call, and a lookup row per argument and return digest.
+
+        The lookup answers "which call's argument equals another call's return"
+        by fingerprint. Status words (unknown, redacted, ...) are not digests and
+        are left out of it, so they never match each other.
+        """
+        records = []
+        lookup = []
+        run_id = self.run_id
+        for ordinal, frame_id, parent, function, error, parts, reference, signature in fingerprints:
+            records.append(
+                (run_id, worker, ordinal, frame_id, parent, function, error, reference,
+                 signature, marshal.dumps(parts))
+            )
+            lookup.extend(
+                (run_id, fp, worker, ordinal, role, name)
+                for role, name, fp in parts
+                if role != "out" and is_digest(fp)
+            )
+        connection.executemany(
+            "INSERT INTO call_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records
+        )
+        connection.executemany("INSERT INTO call_lookup VALUES (?, ?, ?, ?, ?, ?)", lookup)
 
     def deep_totals(self):
         with closing(self._connect()) as connection:
@@ -657,37 +673,16 @@ class TraceStore:
             ).fetchone()
         return used
 
-    def read_reference(self, run_id, signature):
-        """Per-call signatures of a finished run: ``{address: (signature, function)}``.
-
-        ``signature`` turns one call's error type and fingerprint rows into a
-        comparable value, the same way the live call does.
-        """
-        reference = {}
+    def read_reference(self, run_id):
+        """Per-call signatures of a finished run: ``{address: (signature, function)}``."""
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                "SELECT c.worker, c.ordinal, c.frame_id, c.function, c.error, v.role, v.name, v.fp "
-                "FROM stream_fp c LEFT JOIN stream_fp_values v "
-                "ON v.run_id = c.run_id AND v.worker = c.worker AND v.ordinal = c.ordinal "
-                "WHERE c.run_id = ? ORDER BY c.worker, c.ordinal, v.rowid",
-                (run_id,),
-            )
-            current = None
-            parts = []
-
-            def close_call():
-                if current is not None:
-                    reference[current[2]] = (signature(parts, current[4]), current[3])
-
-            for worker, ordinal, frame_id, function, error, role, name, fp in rows:
-                key = (worker, ordinal, frame_id, function, error)
-                if current is None or key[:2] != current[:2]:
-                    close_call()
-                    current, parts = key, []
-                if role is not None:
-                    parts.append((role, name, fp))
-            close_call()
-        return reference
+            return {
+                frame_id: (bytes(signature), function)
+                for frame_id, function, signature in connection.execute(
+                    "SELECT frame_id, function, signature FROM call_records WHERE run_id = ?",
+                    (run_id,),
+                )
+            }
 
     def finish_stream(self, worker, summary):
         with closing(self._connect()) as connection, connection:

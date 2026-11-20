@@ -25,7 +25,7 @@ def stored(project):
             "SELECT id, status FROM runs ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         count = connection.execute(
-            "SELECT COUNT(*) FROM stream_fp WHERE run_id = ?", (run_id,)
+            "SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run_id,)
         ).fetchone()[0]
     return count, json.loads(status) if status else None
 

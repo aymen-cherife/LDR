@@ -135,7 +135,7 @@ def test_passing_the_fingerprint_ceiling_stops_the_run_and_says_so(tmp_path):
     incomplete = report["status"]["incomplete"]
     assert "50" in incomplete
     assert connection.execute(
-        "SELECT COUNT(*) FROM stream_fp WHERE run_id = ?", (run_id,)
+        "SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run_id,)
     ).fetchone()[0] <= 50
     assert "INCOMPLETE" in result.stdout
     assert report["snapshot"]["action"] == "unknown"

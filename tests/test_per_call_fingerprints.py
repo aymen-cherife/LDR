@@ -49,7 +49,7 @@ def run(tmp_path, settings="", source=APP):
 def test_every_call_has_fingerprint_rows_and_only_the_first_eight_have_detail(tmp_path):
     connection, run_id = run(tmp_path)
     fingerprinted = connection.execute(
-        "SELECT COUNT(*) FROM stream_fp WHERE run_id = ? AND frame_id LIKE 'app.py:f#%'", (run_id,)
+        "SELECT COUNT(*) FROM call_records WHERE run_id = ? AND frame_id LIKE 'app.py:f#%'", (run_id,)
     ).fetchone()[0]
     detailed = connection.execute(
         "SELECT COUNT(*) FROM stream_calls WHERE run_id = ? AND frame_id LIKE 'app.py:f#%'", (run_id,)
@@ -60,7 +60,7 @@ def test_every_call_has_fingerprint_rows_and_only_the_first_eight_have_detail(tm
 def test_the_twelfth_call_keeps_its_argument_and_return_fingerprints(tmp_path):
     connection, run_id = run(tmp_path)
     rows = connection.execute(
-        "SELECT v.role, v.name FROM stream_fp_values v JOIN stream_fp c "
+        "SELECT v.role, v.name FROM call_lookup v JOIN call_records c "
         "ON c.run_id = v.run_id AND c.worker = v.worker AND c.ordinal = v.ordinal "
         "WHERE c.run_id = ? AND c.frame_id = 'app.py:f#12' ORDER BY v.role",
         (run_id,),
@@ -71,10 +71,10 @@ def test_the_twelfth_call_keeps_its_argument_and_return_fingerprints(tmp_path):
 def test_an_argument_can_be_matched_to_another_calls_return_by_fingerprint(tmp_path):
     connection, run_id = run(tmp_path)
     matches = connection.execute(
-        "SELECT c1.frame_id, a.name, c2.frame_id FROM stream_fp_values a "
-        "JOIN stream_fp_values r ON r.run_id = a.run_id AND r.fp = a.fp AND r.role = 'ret' "
-        "JOIN stream_fp c1 ON c1.run_id = a.run_id AND c1.worker = a.worker AND c1.ordinal = a.ordinal "
-        "JOIN stream_fp c2 ON c2.run_id = r.run_id AND c2.worker = r.worker AND c2.ordinal = r.ordinal "
+        "SELECT c1.frame_id, a.name, c2.frame_id FROM call_lookup a "
+        "JOIN call_lookup r ON r.run_id = a.run_id AND r.fp = a.fp AND r.role = 'ret' "
+        "JOIN call_records c1 ON c1.run_id = a.run_id AND c1.worker = a.worker AND c1.ordinal = a.ordinal "
+        "JOIN call_records c2 ON c2.run_id = r.run_id AND c2.worker = r.worker AND c2.ordinal = r.ordinal "
         "WHERE a.run_id = ? AND a.role = 'in' AND c1.frame_id != c2.frame_id "
         "AND c1.frame_id LIKE 'app.py:use#%'",
         (run_id,),
@@ -93,7 +93,7 @@ def test_first_calls_is_a_setting(tmp_path):
 def test_an_exhausted_detail_budget_never_stops_the_fingerprints(tmp_path):
     connection, run_id = run(tmp_path, "max_trace_bytes = 1500\nfirst_calls = 100\n")
     fingerprinted = connection.execute(
-        "SELECT COUNT(*) FROM stream_fp WHERE run_id = ?", (run_id,)
+        "SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run_id,)
     ).fetchone()[0]
     detailed = connection.execute(
         "SELECT COUNT(*) FROM stream_calls WHERE run_id = ?", (run_id,)

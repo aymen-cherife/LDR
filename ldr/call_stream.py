@@ -77,7 +77,7 @@ class CallStream:
             self.flusher_ident = flusher.ident
         if store.reference_run:
             try:
-                self.reference = store.read_reference(store.reference_run, call_signature)
+                self.reference = store.read_reference(store.reference_run)
             except (OSError, sqlite3.Error) as exc:
                 self.reference_error = type(exc).__name__
 
@@ -251,8 +251,11 @@ class CallStream:
             if error is None:
                 parts.append(("ret", "", output))
             error_type = error.split(":", 1)[0] if error else None
-            state = self._compare(frame_id, function, parts, error_type, comparable)
-            self.pending_fp.append((ordinal, frame_id, parent, function, error_type, parts, state))
+            signature = call_signature(parts, error_type)
+            state = self._compare(frame_id, function, signature, comparable)
+            self.pending_fp.append(
+                (ordinal, frame_id, parent, function, error_type, parts, state, signature)
+            )
             mutated = [name for name, token in inputs.items() if exit_inputs.get(name) != token]
             reasons = []
             if detail in ("first call", "deep"):
@@ -357,7 +360,7 @@ class CallStream:
                 with self.boundaries.lock:
                     self.boundaries._flush()
 
-    def _compare(self, frame_id, function, parts, error_type, comparable):
+    def _compare(self, frame_id, function, signature, comparable):
         """Compare one finished call with the reference run's call at the same address."""
         if self.reference is None:
             return None
@@ -367,7 +370,7 @@ class CallStream:
             state = "new"
         else:
             counts["compared"] += 1
-            if known[0] != call_signature(parts, error_type):
+            if known[0] != signature:
                 state = "different"
             else:
                 state = "same" if comparable else "not_compared"
