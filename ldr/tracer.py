@@ -279,6 +279,14 @@ class Recorder:
                 f"{self._source_id(code.co_filename)}:{code.co_qualname}", spent
             )
 
+    def _late_preview(self, frame, mutated: list[str]) -> dict[str, str]:
+        """Argument previews read at return, with changed arguments marked."""
+        previews = self._arguments(frame.f_code, frame)
+        for name in mutated:
+            if name in previews:
+                previews[name] = "<mutated in call>"
+        return previews
+
     def _lines_wanted(self, code) -> bool:
         """Hook point: whether to record which lines ran inside this function.
 
@@ -960,6 +968,8 @@ class Recorder:
                 mon.free_tool_id(tool_id)
                 self._tool_id = None
             raise
+        if self.call_stream is not None:
+            self.call_stream.preview_of = self._late_preview
         self._active = True
 
     def _fold(self, nodes: list[Node]) -> list[Node]:

@@ -12,6 +12,15 @@ from .node import capture
 from .value_capture import capture_value
 
 
+def call_signature(parts, error):
+    """One comparable value for a call: its error type and fingerprint rows."""
+    digest = blake2b(digest_size=8)
+    digest.update((error or "").encode("utf-8", "surrogatepass"))
+    for role, name, token in parts:
+        digest.update(f"\x1f{role}\x1e{name}\x1e{token}".encode("utf-8", "surrogatepass"))
+    return digest.digest()
+
+
 def _encode(value):
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
 
@@ -43,6 +52,17 @@ class CallStream:
         self.deep_bytes_in_flight = 0
         self.committed_deep_bytes = 0
         self.boundaries = BoundaryStream(store, worker) if store.max_boundary_bytes else None
+        # The reference run's per-call signatures, loaded once, by address.
+        self.reference = None
+        self.reference_error = None
+        self.reference_counts = {"compared": 0, "same": 0, "different": 0, "new": 0, "not_compared": 0}
+        self.changed = {}
+        self.preview_of = None
+        if store.reference_run:
+            try:
+                self.reference = store.read_reference(store.reference_run, call_signature)
+            except (OSError, sqlite3.Error) as exc:
+                self.reference_error = type(exc).__name__
 
     @property
     def keeping_details(self):
@@ -193,9 +213,27 @@ class CallStream:
             )
             if error is None:
                 parts.append(("ret", "", output))
-            self.pending_fp.append(
-                (ordinal, frame_id, parent, function, error.split(":", 1)[0] if error else None, parts)
-            )
+            error_type = error.split(":", 1)[0] if error else None
+            state = self._compare(frame_id, function, parts, error_type, comparable)
+            self.pending_fp.append((ordinal, frame_id, parent, function, error_type, parts, state))
+            mutated = []
+            late = False
+            if state in ("different", "new") and not detail and self.keeping_details:
+                # Detail that was not captured at entry is built now. An argument that
+                # still has its entry fingerprint can be read from the frame; one that
+                # changed is marked, and its detail needs a rerun.
+                detail = late = True
+                mutated = [name for name, token in inputs.items() if exit_inputs.get(name) != token]
+                if self.preview_of is not None:
+                    preview = self.preview_of(frame, mutated)
+                if output_preview is None and error is None:
+                    output_preview = capture(return_value)
+                if self.store.max_value_bytes:
+                    unchanged = {n: t for n, t in inputs.items() if n not in mutated}
+                    evidence = self._argument_values(frame, unchanged, "entry", preview or {})
+                    evidence[0].update(
+                        {n: {"status": "mutated in call", "fingerprint": inputs[n]} for n in mutated}
+                    )
             entry_metadata, data = evidence or ({}, [])
             timeline = self.deep.pop(id(frame), None)
             steps = timeline.steps if timeline is not None else []
@@ -217,6 +255,10 @@ class CallStream:
                 "elapsed_ms": timing["elapsed_ms"] if timing else None,
                 "timing": timing,
             }
+            if late:
+                fields["detail_at"] = "return"
+                if mutated:
+                    fields["mutated_in_call"] = mutated
             if lines is not None:
                 fields["executed_lines"] = list(lines)
                 fields["completion_order"] = self.completed
@@ -254,6 +296,25 @@ class CallStream:
             self.pending_bytes += size
             if len(self.pending) >= self.store.batch_size or len(self.pending_fp) >= self.store.batch_size:
                 self.flush()
+
+    def _compare(self, frame_id, function, parts, error_type, comparable):
+        """Compare one finished call with the reference run's call at the same address."""
+        if self.reference is None:
+            return None
+        known = self.reference.pop(frame_id, None)
+        counts = self.reference_counts
+        if known is None:
+            state = "new"
+        else:
+            counts["compared"] += 1
+            if known[0] != call_signature(parts, error_type):
+                state = "different"
+            else:
+                state = "same" if comparable else "not_compared"
+        counts[state] += 1
+        if state in ("different", "new"):
+            self.changed[function] = self.changed.get(function, 0) + 1
+        return state
 
     def flush(self):
         if self.pending or self.pending_fp:
@@ -303,6 +364,18 @@ class CallStream:
                     "unfinished": len(self.deep),
                     "observed": self.deep_observed
                     + sum(timeline.observed for timeline in self.deep.values()),
+                }
+            if self.reference is not None or self.reference_error:
+                missing = self.reference if self.reference is not None and self.worker == "main" else None
+                changed = set(self.changed)
+                if missing:
+                    changed.update(function for _, function in missing.values())
+                summary["reference"] = {
+                    "run_id": self.store.reference_run,
+                    "error": self.reference_error,
+                    **self.reference_counts,
+                    "missing": len(missing) if missing is not None else None,
+                    "changed": sorted(changed),
                 }
             if self.boundaries is not None:
                 summary["boundaries"] = self.boundaries.finish()

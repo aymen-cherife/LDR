@@ -439,6 +439,31 @@ def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
     args.project_root = rerun.get("project_root")
 
 
+def _baseline_run(snapshot: str) -> str | None:
+    """The run a saved snapshot was recorded from, when that run kept per-call fingerprints."""
+    try:
+        with open(snapshot, encoding="utf-8") as handle:
+            status = json.load(handle).get("status", {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    if status.get("call_stream", {}).get("fingerprinted") is None:
+        return None
+    return status.get("run_id")
+
+
+def _reference_status(parts: list[dict]) -> dict[str, Any]:
+    """Add up each worker's comparison with the reference run."""
+    total = {key: sum(part[key] for part in parts) for key in ("compared", "same", "different", "new", "not_compared")}
+    counted = [part["missing"] for part in parts if part["missing"] is not None]
+    return {
+        "run_id": parts[0]["run_id"],
+        "error": next((part["error"] for part in parts if part["error"]), None),
+        **total,
+        "missing": sum(counted) if counted and len(counted) == len(parts) else None,
+        "changed": sorted({function for part in parts for function in part["changed"]}),
+    }
+
+
 def _fingerprint_status(summaries: list[dict]) -> dict[str, Any]:
     """Fingerprint work per function, largest first, and the normalization count."""
     cost: dict[str, int] = {}
@@ -1018,6 +1043,8 @@ def main(argv=None) -> int:
             project_root, deep=bool(args.deep), boundary=bool(args.boundary)
         )
         store = TraceStore.start(ldr_dir, invocation, *settings)
+        if not args.golden and requested_mode != "inspect":
+            store.reference_run = _baseline_run(golden_path)
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
         storage_warning = capture_error(exc)
         if args.deep or args.boundary:
@@ -1127,6 +1154,9 @@ def main(argv=None) -> int:
             status["call_stream"]["first_calls"] = store.first_calls
             status["call_stream"]["last_calls"] = store.last_calls
             status["fingerprint"] = _fingerprint_status(stream_summaries)
+            references = [item["reference"] for item in stream_summaries if "reference" in item]
+            if references:
+                status["reference"] = _reference_status(references)
             status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1
             status["call_stream"]["summaries"] = len(stream_summaries)
             status["call_stream"]["volatile_baseline"] = bool(args.learn_volatility)
@@ -1184,6 +1214,21 @@ def main(argv=None) -> int:
             f"{stream_status['stored']} with detail (the first {stream_status['first_calls']} calls of each function), "
             f"{stream_status['unfinished']} unfinished, {stream_status['uncomparable']} with incomparable values.\n"
         )
+        if reference_status := status.get("reference"):
+            if reference_status["error"]:
+                redaction_note += (
+                    "REFERENCE: the baseline run's fingerprints could not be read "
+                    f"({reference_status['error']}), so calls were not compared while recording.\n"
+                )
+            else:
+                missing = reference_status["missing"]
+                redaction_note += (
+                    f"REFERENCE: run {reference_status['run_id'][:8]}: "
+                    f"{reference_status['compared']} call(s) compared, {reference_status['same']} same, "
+                    f"{reference_status['different']} differ, {reference_status['new']} new, "
+                    f"{'not counted' if missing is None else missing} missing. "
+                    "Calls that differ keep full detail.\n"
+                )
         if fingerprint_status := status.get("fingerprint"):
             if fingerprint_status["tmp_normalized"]:
                 redaction_note += (
@@ -1390,10 +1435,20 @@ def main(argv=None) -> int:
                     and not baseline_status.get("call_stream", {}).get("volatile_baseline")
                     and stream_status["summaries"] == stream_status["expected_workers"]
                 ):
+                    reference = status.get("reference")
                     try:
-                        baseline_stream = store.read_stream(baseline_status["run_id"])
-                        if len(baseline_stream) == baseline_status["call_stream"]["expected_workers"]:
-                            stream_changes = changed_functions(baseline_stream, stream_summaries)
+                        if (
+                            reference
+                            and not reference["error"]
+                            and reference["run_id"] == baseline_status["run_id"]
+                        ):
+                            # Every call was compared with the baseline's while it was recorded.
+                            if not stream_status["unfinished"] and not stream_status["write_failed"]:
+                                stream_changes = reference["changed"]
+                        else:
+                            baseline_stream = store.read_stream(baseline_status["run_id"])
+                            if len(baseline_stream) == baseline_status["call_stream"]["expected_workers"]:
+                                stream_changes = changed_functions(baseline_stream, stream_summaries)
                     except sqlite3.Error:
                         scope_warnings.append("Could not read baseline call stream fingerprints.")
                 snapshot_action = "compared"

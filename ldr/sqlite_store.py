@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS stream_calls (
 CREATE TABLE IF NOT EXISTS stream_fp (
     run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
     frame_id TEXT NOT NULL, parent INTEGER, function TEXT NOT NULL, error TEXT,
+    reference TEXT,
     PRIMARY KEY (run_id, worker, ordinal)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS stream_fp_values (
@@ -211,6 +212,7 @@ class TraceStore:
         max_boundary_bytes=0,
         first_calls=DEFAULT_FIRST_CALLS,
         last_calls=DEFAULT_LAST_CALLS,
+        reference_run=None,
     ):
         self.path = path
         self.run_id = run_id
@@ -223,6 +225,8 @@ class TraceStore:
         self.max_boundary_bytes = max_boundary_bytes
         self.first_calls = first_calls
         self.last_calls = last_calls
+        # The run whose per-call fingerprints each live call is compared with.
+        self.reference_run = reference_run
 
     @classmethod
     def start(
@@ -367,10 +371,10 @@ class TraceStore:
     def _append_fingerprints(self, connection, worker, fingerprints):
         calls = []
         values = []
-        for ordinal, frame_id, parent, function, error, parts in fingerprints:
-            calls.append((self.run_id, worker, ordinal, frame_id, parent, function, error))
+        for ordinal, frame_id, parent, function, error, parts, reference in fingerprints:
+            calls.append((self.run_id, worker, ordinal, frame_id, parent, function, error, reference))
             values.extend((self.run_id, worker, ordinal, role, name, fp) for role, name, fp in parts)
-        connection.executemany("INSERT INTO stream_fp VALUES (?, ?, ?, ?, ?, ?, ?)", calls)
+        connection.executemany("INSERT INTO stream_fp VALUES (?, ?, ?, ?, ?, ?, ?, ?)", calls)
         connection.executemany("INSERT INTO stream_fp_values VALUES (?, ?, ?, ?, ?, ?)", values)
 
     def _append_deep(self, connection, worker, rows, available):
@@ -581,6 +585,38 @@ class TraceStore:
                 (self.run_id,),
             ).fetchone()
         return used
+
+    def read_reference(self, run_id, signature):
+        """Per-call signatures of a finished run: ``{address: (signature, function)}``.
+
+        ``signature`` turns one call's error type and fingerprint rows into a
+        comparable value, the same way the live call does.
+        """
+        reference = {}
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT c.worker, c.ordinal, c.frame_id, c.function, c.error, v.role, v.name, v.fp "
+                "FROM stream_fp c LEFT JOIN stream_fp_values v "
+                "ON v.run_id = c.run_id AND v.worker = c.worker AND v.ordinal = c.ordinal "
+                "WHERE c.run_id = ? ORDER BY c.worker, c.ordinal, v.rowid",
+                (run_id,),
+            )
+            current = None
+            parts = []
+
+            def close_call():
+                if current is not None:
+                    reference[current[2]] = (signature(parts, current[4]), current[3])
+
+            for worker, ordinal, frame_id, function, error, role, name, fp in rows:
+                key = (worker, ordinal, frame_id, function, error)
+                if current is None or key[:2] != current[:2]:
+                    close_call()
+                    current, parts = key, []
+                if role is not None:
+                    parts.append((role, name, fp))
+            close_call()
+        return reference
 
     def finish_stream(self, worker, summary):
         with closing(self._connect()) as connection, connection:
