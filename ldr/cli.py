@@ -7,6 +7,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import runpy
 import shlex
 import signal
@@ -20,6 +21,7 @@ from typing import Any
 
 from . import __version__
 from . import environment as run_environment
+from .interpreter import CHILD_MARKER, RUNNING, SELECTED_BY, run_in_child
 from .diff import (
     EQUAL_READABLE,
     align,
@@ -772,7 +774,8 @@ def _noise_run(
     fd, noise_path = tempfile.mkstemp(prefix="noise-", suffix=".json", dir=ldr_dir)
     os.close(fd)
     os.unlink(noise_path)
-    environment = dict(os.environ, LDR_NOISE_RUN=noise_path)
+    # This process is already the child: the noise run must not start another.
+    environment = dict(os.environ, LDR_NOISE_RUN=noise_path, **{CHILD_MARKER: "1"})
     command = [
         sys.executable,
         "-m",
@@ -828,10 +831,14 @@ def main(argv=None) -> int:
     if unsupported:
         print(unsupported, file=sys.stderr)
         return 2
+    # Set by the parent that started this process. The target must not see either.
+    is_child = os.environ.pop(CHILD_MARKER, None) == "1"
+    selected_by = os.environ.pop(SELECTED_BY, None) or RUNNING
     total_started = time.perf_counter()
     initial_cwd = os.path.realpath(os.getcwd())
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)
     argv = list(sys.argv[1:] if argv is None else argv)
+    launch_argv = list(argv)
     if argv and argv[0] == "show":
         return _show_saved(argv[1:], ldr_dir)
     register_argv_secrets(argv)
@@ -938,6 +945,10 @@ def main(argv=None) -> int:
         project_root = _infer_project_root(args.mode, args.target, args.rest, initial_cwd)
     args.project_root = project_root
     args.initial_cwd = initial_cwd
+
+    if not is_child:
+        # The target always runs in a child process, in the project's interpreter.
+        return run_in_child(launch_argv, project_root)
 
     if args.mode == "pytest" and importlib.util.find_spec("pytest") is None:
         message = "LDR cannot run pytest because pytest is not installed in this Python environment."
@@ -1065,6 +1076,11 @@ def main(argv=None) -> int:
     status["commit"] = git_state(project_root)
     if environment is not None:
         status["environment"] = run_environment.summarize(environment)
+    status["interpreter"] = {
+        "path": sys.executable,
+        "version": platform.python_version(),
+        "selected_by": selected_by,
+    }
     if store is not None:
         status["run_id"] = store.run_id
         try:
