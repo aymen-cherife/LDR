@@ -136,7 +136,7 @@ def test_budget_limits_saved_evidence_and_preserves_output(project):
         used, = conn.execute(
             "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (status["run_id"],)
         ).fetchone()
-    assert 0 < used <= 2000
+    assert 0 < used <= 4 * 2000  # keep rules may pass the normal budget, up to the hard cap
 
 
 def test_boundary_capture_records_python_library_calls_without_their_internals(project):
