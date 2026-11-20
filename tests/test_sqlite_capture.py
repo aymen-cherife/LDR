@@ -148,7 +148,7 @@ def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, m
     (tmp_path / "app.py").unlink()
     frames = json.loads(invoke(tmp_path, "show", "--json", "--run-id", run_id).stdout)["frames"]
     frame_id = frames[0]["frame_id"]
-    assert frame_id == "app.py:4:target#1"
+    assert frame_id == "app.py:target#1"
     steps = json.loads(invoke(tmp_path, "show", frame_id, "--json").stdout)["frame"]["steps"]
     loop = [dict(step["locals"]) for step in steps if step["line"] == 9]
     assert [locals_["data"]["value"] for locals_ in loop] == [[0], [0, 1]]
@@ -178,7 +178,7 @@ def test_deep_capture_marks_yield_continuation_and_unwind(tmp_path):
     )
     result = invoke(tmp_path, "run", "app.py", "--deep", "gen")
     assert result.returncode == 1, result.stdout + result.stderr
-    shown = invoke(tmp_path, "show", "app.py:1:gen#1", "--json")
+    shown = invoke(tmp_path, "show", "app.py:gen#1", "--json")
     steps = json.loads(shown.stdout)["frame"]["steps"]
     assert [(step["line"], step["event"]) for step in steps] == [
         (2, "yield"), (2, "line"), (3, "unwind"),

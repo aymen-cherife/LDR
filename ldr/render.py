@@ -492,8 +492,7 @@ def render_inspection(
         if node.state_truncated:
             lines.append("[state-step budget reached; remaining transitions omitted]")
         if command_target:
-            base = node.frame_id.split("#")[0] if "#" in node.frame_id else node.frame_id
-            wildcard = f"{base}#*"
+            wildcard = f"{node.code_id}#*"
             lines.extend(
                 (
                     "",

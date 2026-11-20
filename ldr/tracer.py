@@ -36,6 +36,8 @@ class _Shadow:
     code: object
     fid: int
     frame_id: str = ""
+    segment: str = ""
+    seen: dict[str, int] | None = None
     children: list[Node] = field(default_factory=list)
     preserve_children: bool = False
 
@@ -124,6 +126,11 @@ class Recorder:
         self._synthetic_objects: dict[int, BaseException] = {}
         self._synthetic_order: list[int] = []
         self._invocation_counts: dict[str, int] = {}
+        # Address state: calls with no recorded caller count under the current
+        # test root (or the run, outside pytest).
+        self._root_counts: dict[str, int] = {}
+        self._test_root = ""
+        self._test_code = None
         self._registered_events: list[int] = []
 
     _NOISE = ("<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>", "<lambda>", "<module>")
@@ -296,17 +303,50 @@ class Recorder:
             if before != after:
                 entry.input_changes[name] = {"before": before, "after": after}
 
-    def _next_frame_id(self, code) -> tuple[str, int]:
-        source_id = self._source_id(code.co_filename)
-        key = f"{source_id}:{code.co_firstlineno}:{code.co_qualname}"
+    def begin_test(self, root: str, code=None, partition: str = "") -> None:
+        """Make ``root`` (a pytest node id) the root of the addresses that follow.
+
+        ``code`` is the test function's code object: its own frame is the root
+        itself. ``partition`` keys the per-function rolling digests.
+        """
+        self._test_root = root
+        self._test_code = code
+        self._root_counts = {}
+        self.frame_prefix = partition
+
+    @staticmethod
+    def _entry_segment(entry: Node | _Shadow | None) -> str:
+        if entry is None:
+            return ""
+        return entry.segment if isinstance(entry, _Shadow) else entry.__dict__.get("_segment", "")
+
+    def _next_frame_id(self, code, parent: Node | _Shadow | None) -> tuple[str, str, int]:
+        """Address ``file:qualname#n`` along the call path, without the definition line.
+
+        ``n`` is the nth call of that function under the same parent. The
+        second value is the call's own path segment; the third counts the
+        function's calls across the whole run, for sampling.
+        """
+        key = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
         ordinal = self._invocation_counts.get(key, 0) + 1
         self._invocation_counts[key] = ordinal
-        if not self.frame_prefix:
-            return f"{key}#{ordinal}", ordinal
-        test_key = self.frame_prefix + key
-        test_ordinal = self._invocation_counts.get(test_key, 0) + 1
-        self._invocation_counts[test_key] = test_ordinal
-        return f"{test_key}#{test_ordinal}", ordinal
+        if parent is None:
+            seen = self._root_counts
+            base = self._test_root
+        else:
+            if isinstance(parent, _Shadow):
+                if parent.seen is None:
+                    parent.seen = {}
+                seen = parent.seen
+            else:
+                seen = parent.__dict__.setdefault("_seen", {})
+            base = parent.frame_id
+        number = seen.get(key, 0) + 1
+        seen[key] = number
+        segment = f"{key}#{number}"
+        if parent is None and code is self._test_code and number == 1 and base:
+            return base, segment, ordinal
+        return (f"{base}/{segment}" if base else segment), segment, ordinal
 
     def _sample_repeated_call(self, ordinal: int) -> bool:
         """Keep early calls and exponentially spaced samples from hot functions."""
@@ -369,11 +409,11 @@ class Recorder:
         else:
             stack[-1].children.append(node)
 
-    def _focus_matches(self, frame_id: str) -> bool:
+    def _focus_matches(self, frame_id: str, segment: str) -> bool:
         if not self.focus_frame:
             return False
         if self.focus_frame.endswith("#*"):
-            return frame_id.startswith(self.focus_frame[:-1])
+            return segment.startswith(self.focus_frame[:-1])
         return frame_id == self.focus_frame
 
     def _timing_parent(self, frame):
@@ -442,15 +482,16 @@ class Recorder:
             return
         at = perf_counter_ns()
         stack = _stack.get()
-        frame_id, ordinal = self._next_frame_id(code)
+        parent = stack[-1] if stack else None
+        frame_id, segment, ordinal = self._next_frame_id(code, parent)
         if code in self._suppressed_codes:
             self._start_capture(code, frame, frame_id, at)
             return
-        focused = self._focus_matches(frame_id)
+        focused = self._focus_matches(frame_id, segment)
         direct_focus = bool(
             self.focus_frame
-            and stack
-            and self._focus_matches(self._entry_frame_id(stack[-1]))
+            and parent is not None
+            and self._focus_matches(self._entry_frame_id(parent), self._entry_segment(parent))
         )
         sampled_repeat = self._sample_repeated_call(ordinal) and not (focused or direct_focus)
         if sampled_repeat:
@@ -459,6 +500,7 @@ class Recorder:
             self.sampled_nodes += 1
             self.truncated = True
             entry = self._new_shadow(code, frame, frame_id, preserve_children=True)
+            entry.segment = segment
         elif (
             (self.n_nodes < self.max_nodes and len(stack) < self.max_depth)
             or focused
@@ -470,6 +512,7 @@ class Recorder:
                 frame_id,
                 detailed=focused,
             )
+            entry.__dict__["_segment"] = segment
             self._attach(entry, stack)
             self.n_nodes += 1
             if focused:
@@ -500,6 +543,7 @@ class Recorder:
                     return
                 return mon.DISABLE
             entry = self._new_shadow(code, frame, frame_id)
+            entry.segment = segment
         self._start_capture(code, frame, frame_id, at, entry if isinstance(entry, Node) else None)
         _stack.set(stack + (entry,))
 
@@ -572,7 +616,9 @@ class Recorder:
         if matched is None:
             return
         _, entry = matched
-        if not isinstance(entry, Node) or not self._focus_matches(entry.frame_id):
+        if not isinstance(entry, Node) or not self._focus_matches(
+            entry.frame_id, self._entry_segment(entry)
+        ):
             return
         current = self._state_locals(frame)
         previous = entry.__dict__.get("_state_locals")
@@ -684,7 +730,9 @@ class Recorder:
                 out = capture(return_value)
             if node_retained or stream is not None:
                 out_fp = fp_value(return_value)
-        if isinstance(entry, Node) and self._focus_matches(entry.frame_id):
+        if isinstance(entry, Node) and self._focus_matches(
+            entry.frame_id, self._entry_segment(entry)
+        ):
             self._capture_state_transition(code, frame, None)
         if isinstance(entry, Node):
             self._finish_mutable_argument_evidence(entry, frame)

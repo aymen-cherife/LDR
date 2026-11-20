@@ -91,7 +91,7 @@ snapshots within the trace budget. Choose both limits for your workload.
 ```sh
 ldr run app.py --deep calculate_total
 ldr show
-ldr show "app.py:10:calculate_total#1"
+ldr show "app.py:calculate_total#1"
 ```
 
 Repeat `--deep` to select more functions. Use a qualified name such as
@@ -101,6 +101,12 @@ yield, or exception unwind. Loop visits and generator continuations appear
 in order. Supported values use the same typed JSON format as full value
 retention. Redacted, unsupported, and partially captured values have explicit
 statuses. The run and each listed frame report observed and retained counts.
+
+A call's address is its path of `file:qualname#n` segments from the root, where
+`n` counts calls of that function under the same parent, for example
+`app.py:outer#2/app.py:inner#1`. Under pytest the root is the test node id.
+The definition line is not part of an address, so an address survives an edit
+that moves the function. Use `file:qualname#*` to select every call of a function.
 
 `ldr show` reads SQLite without running the target. It defaults to the latest
 run. Copy a frame address from its listing and use `--run-id` to pin a run,
@@ -152,7 +158,7 @@ rerun. This explicit form remains available for advanced use:
 
 ```bash
 ldr inspect tests/test_orders.py::test_refund \
-  --frame 'src/orders.py:42:calculate_refund#*' \
+  --frame 'src/orders.py:calculate_refund#*' \
   --only src tests
 ```
 

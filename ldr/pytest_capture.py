@@ -1,5 +1,6 @@
 """Run LDR's recorder in the processes that execute pytest tests."""
 
+import re
 import sqlite3
 
 import pytest
@@ -9,12 +10,25 @@ from .sqlite_store import TraceStore
 from .tracer import Recorder
 
 
+def _test_key(root) -> str:
+    """The node id at the front of a root's address: ``path::name`` up to the next ``/``."""
+    match = re.match(r"(?:[^/:]+/)*[^/]*?::[^/]*", root.frame_id)
+    return match.group(0) if match else root.frame_id
+
+
 class RuntimeCapture:
     def __init__(self, recorder):
         self.recorder = recorder
         self.exception = None
 
+    def begin_test(self, item, prefix="", partition=""):
+        """Make the test's node id the root of its call addresses."""
+        function = getattr(item, "function", None)
+        code = getattr(function, "__code__", None)
+        self.recorder.begin_test(f"{prefix}{item.nodeid}", code, partition)
+
     def pytest_runtest_protocol(self, item, nextitem):
+        self.begin_test(item)
         if not self.recorder._active:
             self.recorder.start()
 
@@ -32,18 +46,13 @@ class WorkerCapture(RuntimeCapture):
         self.name = config.workerinput["workerid"]
         self.recorder.call_stream = CallStream(self.store, self.name)
         self.prefix = f"{self.name}/" if settings["replicated"] else ""
-        self.item_positions = {}
-
-    def pytest_collection_finish(self, session):
-        self.item_positions = {
-            item: position for position, item in enumerate(session.items)
-        }
 
     def pytest_runtest_protocol(self, item, nextitem):
-        self.recorder.frame_prefix = (
-            f"{self.prefix}test-{self.item_positions[item]:09d}/"
-        )
-        super().pytest_runtest_protocol(item, nextitem)
+        # The node id is stable however pytest assigns tests to workers. Only a
+        # replicated run, where every worker runs every test, needs the worker name.
+        self.begin_test(item, self.prefix, f"{self.prefix}{item.nodeid}/")
+        if not self.recorder._active:
+            self.recorder.start()
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_sessionfinish(self, session, exitstatus):
@@ -116,5 +125,6 @@ class ControllerCapture(RuntimeCapture):
             self.recorder.truncated |= summary.pop("truncated")
             for key, value in summary.items():
                 setattr(self.recorder, key, getattr(self.recorder, key) + value)
-        self.recorder.roots.sort(key=lambda root: root.frame_id.split("/", 1)[0])
+        # Stable across worker assignment: group a test's roots, in recorded order.
+        self.recorder.roots.sort(key=_test_key)
         return [name for name, state in self.workers.items() if state == "incomplete"]

@@ -348,7 +348,8 @@ class Node:
 
     @property
     def code_id(self) -> str:
-        return f"{self.source_id or self.file}:{self.line}:{self.name}"
+        # The definition line is metadata, not identity: it moves when the file is edited.
+        return f"{self.source_id or self.file}:{self.name}"
 
     @property
     def location(self) -> str:

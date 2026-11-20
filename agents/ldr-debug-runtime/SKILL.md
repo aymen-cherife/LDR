@@ -41,7 +41,7 @@ focused rerun:
 
 ```bash
 ldr inspect tests/test_feature.py::test_case \
-  --frame 'src/feature.py:42:calculate#*' \
+  --frame 'src/feature.py:calculate#*' \
   --only src tests
 ```
 

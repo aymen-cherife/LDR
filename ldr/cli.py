@@ -1186,7 +1186,7 @@ def main(argv=None) -> int:
             for root in recorder.roots
             for node in root.walk()
             if (
-                node.frame_id.startswith(args.frame[:-1])
+                f"{node.code_id}#" == args.frame[:-1]
                 if args.frame.endswith("#*")
                 else node.frame_id == args.frame
             )

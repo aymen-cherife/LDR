@@ -342,7 +342,7 @@ def test_repeat_sampling_preserves_late_causal_success_before_assertion(tmp_path
         if function["function"] == "calculate"
     )
     assert calculate["sample_frame_ids"] == [
-        "test_hot_then_cause.py:3:calculate#1"
+        "test_hot_then_cause.py::test_hot_then_cause/test_hot_then_cause.py:calculate#1"
     ]
     assert "calculate(value=3) -> 6" in (tmp_path / ".ldr" / "last.txt").read_text()
 
@@ -379,7 +379,10 @@ def test_sampled_hot_parent_does_not_discard_novel_causal_child(tmp_path):
         for function in payload["frame_index"]["functions"]
         if function["function"] == "calculate"
     )
-    assert calculate["sample_frame_ids"] == ["test_sampled_parent.py:3:calculate#1"]
+    assert calculate["sample_frame_ids"] == [
+        "test_sampled_parent.py::test_sampled_parent"
+        "/test_sampled_parent.py:wrapper#1001/test_sampled_parent.py:calculate#1"
+    ]
     assert "calculate(value=3) -> 6" in (tmp_path / ".ldr" / "last.txt").read_text()
 
 
