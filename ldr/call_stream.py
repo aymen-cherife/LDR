@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+import threading
+import time
 from hashlib import blake2b
 from threading import RLock
 
@@ -11,6 +13,11 @@ from .fingerprint import PARTIAL_MARK, REDACTED, STATS, is_digest
 from .sqlite_store import DETAIL_RANK
 from .node import capture
 from .value_capture import capture_value
+
+
+# A sending child flushes a partial batch at least this often, so a hard death
+# loses at most about this much recording (or one batch).
+FLUSH_INTERVAL = 0.1
 
 
 def call_signature(parts, error):
@@ -63,6 +70,11 @@ class CallStream:
         self.reference_counts = {"compared": 0, "same": 0, "different": 0, "new": 0, "not_compared": 0}
         self.changed = {}
         self.preview_of = None
+        self.flusher_ident = None
+        if getattr(store, "remote", False):
+            flusher = threading.Thread(target=self._flush_periodically, name="ldr-flush", daemon=True)
+            flusher.start()
+            self.flusher_ident = flusher.ident
         if store.reference_run:
             try:
                 self.reference = store.read_reference(store.reference_run, call_signature)
@@ -332,6 +344,19 @@ class CallStream:
             if len(self.pending) >= self.store.batch_size or len(self.pending_fp) >= self.store.batch_size:
                 self.flush()
 
+    def _flush_periodically(self):
+        """Send what is pending every FLUSH_INTERVAL. Runs on a thread LDR does not record."""
+        while True:
+            time.sleep(FLUSH_INTERVAL)
+            with self.lock:
+                if self.finished:
+                    return
+                if self.pending or self.pending_fp:
+                    self.flush()
+            if self.boundaries is not None:
+                with self.boundaries.lock:
+                    self.boundaries._flush()
+
     def _compare(self, frame_id, function, parts, error_type, comparable):
         """Compare one finished call with the reference run's call at the same address."""
         if self.reference is None:
@@ -365,7 +390,7 @@ class CallStream:
                 for reason, number in dropped.items():
                     self.dropped[reason] = self.dropped.get(reason, 0) + number
                 self.budget_exhausted |= "first N" in dropped
-            except (OSError, sqlite3.Error):
+            except (OSError, EOFError, sqlite3.Error):
                 self.write_failed = True
             for _, _, _, _, data, timeline, _ in self.pending:
                 self._release_values(data)

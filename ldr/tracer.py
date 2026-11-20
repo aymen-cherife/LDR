@@ -12,6 +12,7 @@ import inspect
 import linecache
 import os
 import sys
+from _thread import get_ident
 from dataclasses import dataclass, field
 from time import perf_counter_ns
 
@@ -140,6 +141,7 @@ class Recorder:
         # Address state: calls with no recorded caller count under the current
         # test root (or the run, outside pytest).
         self._halted = False
+        self._quiet_thread = None
         self._root_counts: dict[str, int] = {}
         self._test_root = ""
         self._test_code = None
@@ -520,6 +522,8 @@ class Recorder:
             node.ms = timing["elapsed_ms"]
 
     def _on_start(self, code, offset):
+        if get_ident() == self._quiet_thread:
+            return  # LDR's own sending thread is never recorded
         mon = sys.monitoring
         if not self._in_scope(code.co_filename):
             if self.boundaries is None or self._skip(code):
@@ -998,6 +1002,7 @@ class Recorder:
             raise
         if self.call_stream is not None:
             self.call_stream.preview_of = self._late_preview
+            self._quiet_thread = self.call_stream.flusher_ident
         self._active = True
 
     def _fold(self, nodes: list[Node]) -> list[Node]:

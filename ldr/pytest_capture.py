@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from .call_stream import CallStream
-from .sqlite_store import TraceStore
+from .sink import store_from_settings
 from .tracer import Recorder
 
 
@@ -53,7 +53,7 @@ class WorkerCapture(RuntimeCapture):
     def __init__(self, config, settings):
         super().__init__(Recorder(**settings["recorder"]))
         self.config = config
-        self.store = TraceStore(**settings["store"])
+        self.store = store_from_settings(settings["store"])
         self.name = config.workerinput["workerid"]
         self.recorder.call_stream = CallStream(self.store, self.name)
         self.prefix = f"{self.name}/" if settings["replicated"] else ""
@@ -106,7 +106,7 @@ class ControllerCapture(RuntimeCapture):
             return
         node.workerinput["ldr_capture"] = {
             "recorder": self.options,
-            "store": vars(self.store),
+            "store": self.store.settings(),
             "replicated": node.config.getoption("dist") == "each",
         }
 

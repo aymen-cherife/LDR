@@ -84,13 +84,27 @@ def run_in_child(argv: list[str], project_root: str) -> int:
             file=sys.stderr,
         )
         return 2
+    from .sink import ENV as SINK_ENV, Sink
+
+    # The child sends its records here and this process writes them.
+    sink = Sink()
     environ[CHILD_MARKER] = "1"
     environ[SELECTED_BY] = how
+    environ[SINK_ENV] = sink.token
     try:
         process = subprocess.Popen([python, "-m", "ldr.cli", *argv], env=environ)
     except OSError as exc:
         print(f"LDR could not start {python}: {exc}", file=sys.stderr)
+        sink.close(2)
         return 2
+    code = _wait(process)
+    message = sink.close(code)
+    if message:
+        print(message, file=sys.stderr)
+    return code
+
+
+def _wait(process) -> int:
     while True:
         try:
             return process.wait()

@@ -205,6 +205,13 @@ def storage_settings(project_root, *, deep=False, boundary=False):
     )
 
 
+def _timeline(timeline):
+    """``(observed, steps)`` from a deep timeline, or the tuple a child sent."""
+    if isinstance(timeline, (tuple, list)):
+        return timeline[0], timeline[1]
+    return timeline.observed, timeline.steps
+
+
 def _call_rows(roots):
     ordinal = 0
 
@@ -344,70 +351,115 @@ class TraceStore:
                     )
         return store
 
-    def append_stream(self, worker, rows, fingerprints=()):
-        """Write every fingerprint row, and detail rows within graded byte limits.
+    def plan_detail(self, rows, used, value_used, deep_used):
+        """Decide which detail rows, value bodies and deep steps fit, without writing.
 
-        Detail that kept only because it is one of the first N must fit the normal
+        Detail kept only because it is one of the first N must fit the normal
         budget (``max_trace_bytes``). Each keep rule has a higher limit, up to
         ``hard_cap_bytes`` for exceptions, so when space runs out the lower
-        priorities are dropped first. Drops are counted by reason.
+        priorities are dropped first. The writer and a child that only sends its
+        records use this same plan, so both reach the same counts.
         """
+        span = max(0, self.hard_cap_bytes - self.max_trace_bytes)
+        kept = []
+        dropped = {}
+        for row in rows:
+            ordinal, frame_id, parent, payload, _, _, reason = row
+            size = len(payload) + len(frame_id.encode("utf-8", "surrogatepass"))
+            limit = self.max_trace_bytes + span * DETAIL_RANK.get(reason, 0) // 4
+            if used + size > limit:
+                dropped[reason] = dropped.get(reason, 0) + 1
+                continue
+            used += size
+            kept.append(row)
+        values = []
+        if self.max_value_bytes:
+            for ordinal, _, _, _, data, _, _ in kept:
+                for phase, name, blob in data:
+                    if (
+                        value_used + len(blob) <= self.max_value_bytes
+                        and used + len(blob) <= self.hard_cap_bytes
+                    ):
+                        values.append((ordinal, phase, name, blob))
+                        used += len(blob)
+                        value_used += len(blob)
+        deep = []
+        if self.max_deep_bytes:
+            limit = min(self.hard_cap_bytes - used, self.max_deep_bytes - deep_used)
+            added = 0
+            for ordinal, _, _, _, _, timeline, _ in kept:
+                if timeline is None:
+                    continue
+                observed, steps = _timeline(timeline)
+                retained = []
+                for data in steps:
+                    if added + len(data) > limit:
+                        break
+                    retained.append(data)
+                    added += len(data)
+                deep.append((ordinal, observed, retained))
+            deep_used += added
+            used += added
+        return kept, dropped, values, deep, used, value_used, deep_used
+
+    def append_stream(self, worker, rows, fingerprints=()):
+        """Write every fingerprint row, and the detail that fits (see ``plan_detail``)."""
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             self._append_fingerprints(connection, worker, fingerprints)
-            (used,) = connection.execute(
-                "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (self.run_id,)
-            ).fetchone()
-            span = max(0, self.hard_cap_bytes - self.max_trace_bytes)
-            admitted = []
-            kept = []
-            dropped = {}
-            for row in rows:
-                ordinal, frame_id, parent, payload, _, _, reason = row
-                size = len(payload) + len(frame_id.encode("utf-8", "surrogatepass"))
-                limit = self.max_trace_bytes + span * DETAIL_RANK.get(reason, 0) // 4
-                if used + size > limit:
-                    dropped[reason] = dropped.get(reason, 0) + 1
-                    continue
-                used += size
-                admitted.append((self.run_id, worker, ordinal, frame_id, parent, payload))
-                kept.append(row)
-            connection.executemany(
-                "INSERT INTO stream_calls VALUES (?, ?, ?, ?, ?, ?)", admitted
+            used, value_used, deep_used = self._budgets(connection)
+            kept, dropped, values, deep, used, value_used, deep_used = self.plan_detail(
+                rows, used, value_used, deep_used
             )
-            value_used = 0
+            connection.executemany(
+                "INSERT INTO stream_calls VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (self.run_id, worker, ordinal, frame_id, parent, payload)
+                    for ordinal, frame_id, parent, payload, _, _, _ in kept
+                ],
+            )
             if self.max_value_bytes:
-                (value_used,) = connection.execute(
-                    "SELECT used_bytes FROM stream_value_budget WHERE run_id = ?",
-                    (self.run_id,),
-                ).fetchone()
-                for ordinal, _, _, _, values, _, _ in kept:
-                    for phase, name, data in values:
-                        if (
-                            value_used + len(data) <= self.max_value_bytes
-                            and used + len(data) <= self.hard_cap_bytes
-                        ):
-                            connection.execute(
-                                "INSERT INTO stream_values VALUES (?, ?, ?, ?, ?, ?)",
-                                (self.run_id, worker, ordinal, phase, name, data),
-                            )
-                            used += len(data)
-                            value_used += len(data)
+                connection.executemany(
+                    "INSERT INTO stream_values VALUES (?, ?, ?, ?, ?, ?)",
+                    [(self.run_id, worker, *value) for value in values],
+                )
                 connection.execute(
                     "UPDATE stream_value_budget SET used_bytes = ? WHERE run_id = ?",
                     (value_used, self.run_id),
                 )
-            deep_used = 0
             if self.max_deep_bytes:
-                deep_used, added = self._append_deep(
-                    connection, worker, kept, self.hard_cap_bytes - used
+                for ordinal, observed, retained in deep:
+                    key = (self.run_id, worker, ordinal)
+                    connection.execute(
+                        "INSERT INTO stream_deep_frames VALUES (?, ?, ?, ?, ?)",
+                        (*key, observed, len(retained)),
+                    )
+                    connection.executemany(
+                        "INSERT INTO stream_deep_steps VALUES (?, ?, ?, ?, ?)",
+                        [(*key, index, data) for index, data in enumerate(retained, 1)],
+                    )
+                connection.execute(
+                    "UPDATE stream_deep_budget SET used_bytes = ? WHERE run_id = ?",
+                    (deep_used, self.run_id),
                 )
-                used += added
             connection.execute(
                 "UPDATE stream_budget SET used_bytes = ? WHERE run_id = ?",
                 (used, self.run_id),
             )
-        return len(admitted), value_used, deep_used, dropped
+        return len(kept), value_used, deep_used, dropped
+
+    def _budgets(self, connection):
+        def read(table):
+            row = connection.execute(
+                f"SELECT used_bytes FROM {table} WHERE run_id = ?", (self.run_id,)
+            ).fetchone()
+            return row[0] if row else 0
+
+        return (
+            read("stream_budget"),
+            read("stream_value_budget") if self.max_value_bytes else 0,
+            read("stream_deep_budget") if self.max_deep_bytes else 0,
+        )
 
     def _append_fingerprints(self, connection, worker, fingerprints):
         calls = []
@@ -417,35 +469,6 @@ class TraceStore:
             values.extend((self.run_id, worker, ordinal, role, name, fp) for role, name, fp in parts)
         connection.executemany("INSERT INTO stream_fp VALUES (?, ?, ?, ?, ?, ?, ?, ?)", calls)
         connection.executemany("INSERT INTO stream_fp_values VALUES (?, ?, ?, ?, ?, ?)", values)
-
-    def _append_deep(self, connection, worker, rows, available):
-        (used,) = connection.execute(
-            "SELECT used_bytes FROM stream_deep_budget WHERE run_id = ?", (self.run_id,)
-        ).fetchone()
-        limit = min(available, self.max_deep_bytes - used)
-        added = 0
-        for ordinal, _, _, _, _, timeline, _ in rows:
-            if timeline is None:
-                continue
-            key = (self.run_id, worker, ordinal)
-            retained = []
-            for index, data in enumerate(timeline.steps, 1):
-                if added + len(data) > limit:
-                    break
-                retained.append((*key, index, data))
-                added += len(data)
-            connection.execute(
-                "INSERT INTO stream_deep_frames VALUES (?, ?, ?, ?, ?)",
-                (*key, timeline.observed, len(retained)),
-            )
-            connection.executemany(
-                "INSERT INTO stream_deep_steps VALUES (?, ?, ?, ?, ?)", retained
-            )
-        connection.execute(
-            "UPDATE stream_deep_budget SET used_bytes = ? WHERE run_id = ?",
-            (used + added, self.run_id),
-        )
-        return used + added, added
 
     def deep_totals(self):
         with closing(self._connect()) as connection:
@@ -458,6 +481,17 @@ class TraceStore:
             ).fetchone()
         return {"frames": stored, "retained": retained, "bytes": size}
 
+    def plan_boundaries(self, rows, used, boundary_used):
+        limit = min(self.max_trace_bytes - used, self.max_boundary_bytes - boundary_used)
+        added = 0
+        admitted = []
+        for ordinal, payload in rows:
+            if added + len(payload) > limit:
+                continue
+            added += len(payload)
+            admitted.append((ordinal, payload))
+        return admitted, added
+
     def append_boundaries(self, worker, rows):
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -467,15 +501,11 @@ class TraceStore:
             (boundary_used,) = connection.execute(
                 "SELECT used_bytes FROM stream_boundary_budget WHERE run_id = ?", (self.run_id,)
             ).fetchone()
-            limit = min(self.max_trace_bytes - used, self.max_boundary_bytes - boundary_used)
-            added = 0
-            admitted = []
-            for ordinal, payload in rows:
-                if added + len(payload) > limit:
-                    continue
-                added += len(payload)
-                admitted.append((self.run_id, worker, ordinal, payload))
-            connection.executemany("INSERT INTO stream_boundaries VALUES (?, ?, ?, ?)", admitted)
+            admitted, added = self.plan_boundaries(rows, used, boundary_used)
+            connection.executemany(
+                "INSERT INTO stream_boundaries VALUES (?, ?, ?, ?)",
+                [(self.run_id, worker, ordinal, payload) for ordinal, payload in admitted],
+            )
             connection.execute(
                 "UPDATE stream_budget SET used_bytes = ? WHERE run_id = ?", (used + added, self.run_id)
             )
@@ -693,12 +723,15 @@ class TraceStore:
         return connection
 
     def save_worker(self, worker, roots, summary):
+        self.save_worker_rows(worker, _call_rows(roots), summary)
+
+    def save_worker_rows(self, worker, rows, summary):
+        rows = iter(rows)
         with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
                     "INSERT INTO workers VALUES (?, ?, NULL)", (self.run_id, worker)
                 )
-            rows = _call_rows(roots)
             while batch := list(islice(rows, self.batch_size)):
                 with connection:
                     connection.executemany(
@@ -741,6 +774,13 @@ class TraceStore:
                 nodes[ordinal] = node
                 (roots if parent is None else nodes[parent].children).append(node)
             return roots, json.loads(row[0])
+
+    def settings(self):
+        """Constructor arguments, so another process can open the same run."""
+        return {key: value for key, value in vars(self).items() if not key.startswith("_")}
+
+    def close(self):
+        """Nothing to wait for: this store writes directly."""
 
     def finish(self, status):
         with closing(self._connect()) as connection, connection:

@@ -22,6 +22,7 @@ from typing import Any
 from . import __version__
 from . import environment as run_environment
 from .interpreter import CHILD_MARKER, RUNNING, SELECTED_BY, run_in_child
+from .sink import ENV as SINK_ENV, RemoteStore, sink_from_environment
 from .diff import (
     EQUAL_READABLE,
     align,
@@ -825,6 +826,8 @@ def _noise_run(
     os.unlink(noise_path)
     # This process is already the child: the noise run must not start another.
     environment = dict(os.environ, LDR_NOISE_RUN=noise_path, **{CHILD_MARKER: "1"})
+    if getattr(args, "sink", None):
+        environment[SINK_ENV] = args.sink
     command = [
         sys.executable,
         "-m",
@@ -883,6 +886,7 @@ def main(argv=None) -> int:
     # Set by the parent that started this process. The target must not see either.
     is_child = os.environ.pop(CHILD_MARKER, None) == "1"
     selected_by = os.environ.pop(SELECTED_BY, None) or RUNNING
+    sink = sink_from_environment()
     total_started = time.perf_counter()
     initial_cwd = os.path.realpath(os.getcwd())
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)
@@ -1042,7 +1046,13 @@ def main(argv=None) -> int:
         settings = storage_settings(
             project_root, deep=bool(args.deep), boundary=bool(args.boundary)
         )
-        store = TraceStore.start(ldr_dir, invocation, *settings)
+        # In the child, the parent writes: records go to it over the sink.
+        store = (
+            RemoteStore.start_remote(sink, ldr_dir, invocation, *settings)
+            if sink
+            else TraceStore.start(ldr_dir, invocation, *settings)
+        )
+        args.sink = sink
         if not args.golden and requested_mode != "inspect":
             store.reference_run = _baseline_run(golden_path)
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:

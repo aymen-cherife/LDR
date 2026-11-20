@@ -93,7 +93,7 @@ class BoundaryStream:
                 written, self.used_bytes, self.remaining_trace_bytes,
             ) = self.store.append_boundaries(self.worker, self.pending)
             self.stored += written
-        except (OSError, sqlite3.Error):
+        except (OSError, EOFError, sqlite3.Error):
             self.write_failed = True
         self.buffered_bytes -= sum(len(payload) for _, payload in self.pending)
         self.pending.clear()
