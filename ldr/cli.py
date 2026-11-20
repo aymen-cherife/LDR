@@ -439,6 +439,14 @@ def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
     args.project_root = rerun.get("project_root")
 
 
+def _home_as_tilde(path: str) -> str:
+    """Show the home directory as ``~``, so a user name does not reach the output."""
+    home = os.path.expanduser("~")
+    if home != "~" and os.path.normcase(path).startswith(os.path.normcase(home) + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
 def _status(recorder: Recorder) -> dict[str, Any]:
     return {
         "ok": recorder.exit_code == 0 and not recorder.crashed,
@@ -1077,7 +1085,7 @@ def main(argv=None) -> int:
     if environment is not None:
         status["environment"] = run_environment.summarize(environment)
     status["interpreter"] = {
-        "path": sys.executable,
+        "path": _home_as_tilde(sys.executable),
         "version": platform.python_version(),
         "selected_by": selected_by,
     }

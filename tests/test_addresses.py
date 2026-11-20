@@ -142,3 +142,21 @@ def test_under_pytest_the_root_is_the_test_node_id(tmp_path):
     assert "test_cart.py::test_checkout/cart.py:checkout#1/cart.py:apply_discount#1" in addresses
     # Each test is its own root, so the ordinal restarts under it.
     assert "test_cart.py::test_checkout_again/cart.py:checkout#1" in addresses
+
+
+def test_slashes_and_hashes_in_a_node_id_are_percent_encoded_in_its_segment(tmp_path):
+    (tmp_path / "test_p.py").write_text(
+        "import pytest\n\n\ndef helper(value):\n    return value\n\n\n"
+        "@pytest.mark.parametrize('value', ['a/b', 'c#d', 'e%f'])\n"
+        "def test_x(value):\n    assert helper(value) == value\n",
+        encoding="utf-8",
+    )
+    launch(tmp_path, "pytest", "test_p.py")
+    addresses = stored_addresses(tmp_path)
+    roots = {address for address in addresses if "/" not in address.replace("test_p.py", "")}
+    assert roots == {
+        "test_p.py::test_x[a%2Fb]",
+        "test_p.py::test_x[c%23d]",
+        "test_p.py::test_x[e%25f]",
+    }
+    assert "test_p.py::test_x[a%2Fb]/test_p.py:helper#1" in addresses

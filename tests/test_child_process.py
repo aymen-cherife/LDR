@@ -91,7 +91,9 @@ def test_the_interpreter_path_and_version_are_recorded(tmp_path):
     (tmp_path / "app.py").write_text("print('hi')\n", encoding="utf-8")
     launch(tmp_path, "run", "app.py")
     interpreter = last_status(tmp_path)["interpreter"]
-    assert Path(interpreter["path"]).resolve() == Path(sys.executable).resolve()
+    assert "~" in interpreter["path"] or str(Path.home()) not in sys.executable
+    assert str(Path.home()) not in interpreter["path"]
+    assert Path(os.path.expanduser(interpreter["path"])).resolve() == Path(sys.executable).resolve()
     assert interpreter["version"].startswith(f"{sys.version_info.major}.{sys.version_info.minor}")
     assert interpreter["selected_by"]
 
@@ -112,7 +114,7 @@ def test_the_project_environment_is_used_when_ldr_runs_from_elsewhere(project_ve
     shown = next(l for l in out.splitlines() if l.startswith("EXE")).split(" ", 1)[1]
     assert Path(shown).resolve() == python.resolve()
     interpreter = last_status(root)["interpreter"]
-    assert Path(interpreter["path"]).resolve() == python.resolve()
+    assert Path(os.path.expanduser(interpreter["path"])).resolve() == python.resolve()
     assert interpreter["selected_by"] == ".venv"
 
 

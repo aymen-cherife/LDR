@@ -10,6 +10,17 @@ from .sqlite_store import TraceStore
 from .tracer import Recorder
 
 
+def encode_node_id(node_id: str) -> str:
+    """Keep the file path, and percent-encode ``%``, ``/`` and ``#`` after it.
+
+    Those characters separate the segments of an address, so they must not
+    appear inside the test's own segment.
+    """
+    path, separator, rest = node_id.partition("::")
+    rest = rest.replace("%", "%25").replace("/", "%2F").replace("#", "%23")
+    return path + separator + rest
+
+
 def _test_key(root) -> str:
     """The node id at the front of a root's address: ``path::name`` up to the next ``/``."""
     match = re.match(r"(?:[^/:]+/)*[^/]*?::[^/]*", root.frame_id)
@@ -25,7 +36,7 @@ class RuntimeCapture:
         """Make the test's node id the root of its call addresses."""
         function = getattr(item, "function", None)
         code = getattr(function, "__code__", None)
-        self.recorder.begin_test(f"{prefix}{item.nodeid}", code, partition)
+        self.recorder.begin_test(f"{prefix}{encode_node_id(item.nodeid)}", code, partition)
 
     def pytest_runtest_protocol(self, item, nextitem):
         self.begin_test(item)
@@ -50,7 +61,7 @@ class WorkerCapture(RuntimeCapture):
     def pytest_runtest_protocol(self, item, nextitem):
         # The node id is stable however pytest assigns tests to workers. Only a
         # replicated run, where every worker runs every test, needs the worker name.
-        self.begin_test(item, self.prefix, f"{self.prefix}{item.nodeid}/")
+        self.begin_test(item, self.prefix, f"{self.prefix}{encode_node_id(item.nodeid)}/")
         if not self.recorder._active:
             self.recorder.start()
 
