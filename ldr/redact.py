@@ -35,10 +35,22 @@ _SECRET_NAME = re.compile(
 )
 
 
+_name_cache: dict[str, bool] = {}
+
+
 def is_secret_name(name: object) -> bool:
-    if not isinstance(name, str):
-        return False
-    return bool(_SECRET_NAME.search(_CAMEL.sub("_", name)))
+    if type(name) is not str:
+        if not isinstance(name, str):
+            return False
+        return bool(_SECRET_NAME.search(_CAMEL.sub("_", name)))
+    # Names depend on nothing but themselves, so a bounded in-memory cache is exact.
+    found = _name_cache.get(name)
+    if found is None:
+        found = bool(_SECRET_NAME.search(_CAMEL.sub("_", name)))
+        if len(_name_cache) >= 65_536:
+            _name_cache.clear()
+        _name_cache[name] = found
+    return found
 
 
 # (label, pattern, group to replace). Group 0 replaces the whole match.

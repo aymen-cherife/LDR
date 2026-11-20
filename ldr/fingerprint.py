@@ -19,10 +19,11 @@ import types
 from dataclasses import dataclass
 import os
 import re
+import struct
 import tempfile
 from typing import Any
 
-from .redact import contains_secret, is_secret_name
+from .redact import contains_secret, is_secret_name, same_text_policy, text_policy
 from .structure import read, type_identity, type_label
 
 UNSUPPORTED = "unsupported"  # a type we do not read structurally (yet)
@@ -58,8 +59,69 @@ class _Stop(Exception):
         self.status = status
 
 
+# Remembered answers for small immutable values, in memory only. Each cache is
+# bounded and is emptied whenever the redaction inputs (environment or argv
+# secrets) change, so a remembered answer is always the answer the uncached path
+# would give now.
+CACHE = True
+CACHE_LIMIT = 65_536
+SHORT_TEXT = 256
+_secret_cache: dict[str, bool] = {}
+_value_cache: dict = {}
+_cache_policy = None
+
+
+def _current_caches():
+    global _cache_policy
+    if _cache_policy is None or not same_text_policy(_cache_policy):
+        _secret_cache.clear()
+        _value_cache.clear()
+        _cache_policy = text_policy()
+
+
 def _looks_secret(text: str) -> bool:
-    return contains_secret(text)
+    if not CACHE or len(text) > SHORT_TEXT:
+        return contains_secret(text)
+    _current_caches()
+    found = _secret_cache.get(text)
+    if found is None:
+        found = contains_secret(text)
+        if len(_secret_cache) >= CACHE_LIMIT:
+            _secret_cache.clear()
+        _secret_cache[text] = found
+    return found
+
+
+def _scalar_key(value):
+    """A key that separates every value the walk separates: type plus value.
+
+    Floats are keyed by their bytes, so 0.0 and -0.0 differ and NaN equals
+    itself. ``True`` and ``1`` differ because the type is part of the key.
+    """
+    kind = type(value)
+    if kind is int:
+        return (int, value) if -(1 << 63) <= value < (1 << 63) else None
+    if kind is bool or value is None:
+        return (kind, value)
+    if kind is float:
+        return (float, struct.pack("<d", value))
+    if kind is str:
+        return (str, value) if len(value) <= SHORT_TEXT else None
+    return None
+
+
+def _cache_key(value):
+    if type(value) is tuple:
+        if len(value) > 8:
+            return None
+        keys = []
+        for item in value:
+            key = _scalar_key(item)
+            if key is None:
+                return None
+            keys.append(key)
+        return (tuple, tuple(keys))
+    return _scalar_key(value)
 
 
 def is_digest(token: str | None) -> bool:
@@ -316,6 +378,27 @@ def fingerprint_details(
     value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool = False
 ) -> tuple[str, bool]:
     """Return the existing fingerprint and whether it can be reused for this object."""
+    if CACHE and budget is DEFAULT_BUDGET:
+        key = _cache_key(value)
+        if key is not None:
+            _current_caches()
+            key = (key, partial_ok)
+            found = _value_cache.get(key)
+            if found is not None:
+                return found
+            normalized = STATS.tmp_normalized
+            found = _fingerprint_details(value, budget, partial_ok)
+            # A normalized temp path is counted for the gaps line on every
+            # occurrence, so it is never answered from the cache.
+            if STATS.tmp_normalized == normalized:
+                if len(_value_cache) >= CACHE_LIMIT:
+                    _value_cache.clear()
+                _value_cache[key] = found
+            return found
+    return _fingerprint_details(value, budget, partial_ok)
+
+
+def _fingerprint_details(value: Any, budget: Budget, partial_ok: bool) -> tuple[str, bool]:
     walk = None
     try:
         out = hashlib.blake2b(digest_size=DIGEST_BYTES)
