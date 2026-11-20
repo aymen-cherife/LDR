@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS call_lookup (
     role TEXT NOT NULL, name TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS call_lookup_fp ON call_lookup(run_id, fp);
+-- Records arrive here without indexes and move to the tables above once per run.
+CREATE TABLE IF NOT EXISTS call_records_stage (
+    run_id TEXT, worker TEXT, ordinal INTEGER, frame_id TEXT, parent INTEGER,
+    function TEXT, error TEXT, reference TEXT, signature BLOB, parts BLOB
+);
+CREATE TABLE IF NOT EXISTS call_lookup_stage (
+    run_id TEXT, fp TEXT, worker TEXT, ordinal INTEGER, role TEXT, name TEXT
+);
 CREATE TABLE IF NOT EXISTS stream_summary (
     run_id TEXT NOT NULL REFERENCES runs(id), worker TEXT NOT NULL, summary TEXT NOT NULL,
     PRIMARY KEY (run_id, worker)
@@ -482,9 +490,30 @@ class TraceStore:
                 if role != "out" and is_digest(fp)
             )
         connection.executemany(
-            "INSERT INTO call_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records
+            "INSERT INTO call_records_stage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records
         )
-        connection.executemany("INSERT INTO call_lookup VALUES (?, ?, ?, ?, ?, ?)", lookup)
+        connection.executemany("INSERT INTO call_lookup_stage VALUES (?, ?, ?, ?, ?, ?)", lookup)
+
+    def build_lookup(self):
+        """Move this run's staged records into the indexed tables, in index order.
+
+        Inserting in key order into an indexed table is much cheaper than
+        keeping the indexes current on every batch while the program runs.
+        """
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO call_records SELECT * FROM call_records_stage "
+                "WHERE run_id = ? ORDER BY worker, ordinal",
+                (self.run_id,),
+            )
+            connection.execute(
+                "INSERT INTO call_lookup SELECT * FROM call_lookup_stage "
+                "WHERE run_id = ? ORDER BY fp",
+                (self.run_id,),
+            )
+            connection.execute("DELETE FROM call_records_stage WHERE run_id = ?", (self.run_id,))
+            connection.execute("DELETE FROM call_lookup_stage WHERE run_id = ?", (self.run_id,))
 
     def deep_totals(self):
         with closing(self._connect()) as connection:
@@ -777,8 +806,10 @@ class TraceStore:
     def close(self):
         """Nothing to wait for: this store writes directly."""
 
-    def finish(self, status):
+    def finish(self, status, *, build=True):
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 "UPDATE runs SET status = ? WHERE id = ?", (_json(status), self.run_id)
             )
+        if build:
+            self.build_lookup()

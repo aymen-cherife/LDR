@@ -145,7 +145,8 @@ class Sink:
                 _, worker, rows, summary = message
                 store.save_worker_rows(worker, rows, summary)
             elif kind == "finish":
-                store.finish(message[1])
+                # The indexed tables are built once the child has ended (see close).
+                store.finish(message[1], build=False)
                 run.finished = True
         except (OSError, sqlite3.Error):
             with run.lock:
@@ -161,6 +162,11 @@ class Sink:
             self.listener.close()
         except OSError:
             pass
+        for each in self.runs.values():
+            try:
+                each.store.build_lookup()
+            except (OSError, sqlite3.Error):
+                pass
         run = self.runs.get(self.main_run) if self.main_run else None
         if run is None or run.finished:
             return None
@@ -180,7 +186,7 @@ class Sink:
             "may be missing after that address."
         )
         try:
-            run.store.finish(status)
+            run.store.finish(status, build=False)
         except (OSError, sqlite3.Error):
             pass
         _write_died_result(run.directory, status, message)
@@ -284,7 +290,7 @@ class RemoteStore(TraceStore):
         self._send(("worker", worker, list(_call_rows(roots)), summary))
         self.sync()
 
-    def finish(self, status):
+    def finish(self, status, *, build=True):
         self._send(("finish", status))
         self.sync()
 
