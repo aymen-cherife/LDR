@@ -1151,6 +1151,15 @@ def main(argv=None) -> int:
                 key: sum(summary[key] for summary in stream_summaries)
                 for key in ("started", "stored", "fingerprinted", "unfinished", "uncomparable", "write_failed")
             }
+            dropped: dict[str, int] = {}
+            for summary in stream_summaries:
+                for reason, number in summary.get("dropped", {}).items():
+                    dropped[reason] = dropped.get(reason, 0) + number
+            status["call_stream"]["dropped"] = dropped
+            incomplete = next((s["incomplete"] for s in stream_summaries if s.get("incomplete")), None)
+            if incomplete:
+                status["incomplete"] = incomplete
+                scope_warnings.append(f"INCOMPLETE: {incomplete}.")
             status["call_stream"]["first_calls"] = store.first_calls
             status["call_stream"]["last_calls"] = store.last_calls
             status["fingerprint"] = _fingerprint_status(stream_summaries)
@@ -1214,6 +1223,14 @@ def main(argv=None) -> int:
             f"{stream_status['stored']} with detail (the first {stream_status['first_calls']} calls of each function), "
             f"{stream_status['unfinished']} unfinished, {stream_status['uncomparable']} with incomparable values.\n"
         )
+        if stream_status["dropped"]:
+            lost = ", ".join(f"{number} {reason}" for reason, number in sorted(stream_status["dropped"].items()))
+            redaction_note += (
+                f"DETAIL DROPPED: {lost} call(s) lost their detail because the detail budget "
+                "(max_trace_bytes, up to hard_cap_bytes) was reached. Their fingerprints are kept.\n"
+            )
+        if status.get("incomplete"):
+            redaction_note += f"INCOMPLETE: {status['incomplete']}.\n"
         if reference_status := status.get("reference"):
             if reference_status["error"]:
                 redaction_note += (
@@ -1362,10 +1379,14 @@ def main(argv=None) -> int:
     display_scope = _display_scope(scope, initial_cwd)
     rerun = _rerun_payload(args, scope, initial_cwd, project_root)
     try:
-        if missing_workers and (args.golden or args.diff):
+        if (missing_workers or status.get("incomplete")) and (args.golden or args.diff):
             comparison_unknown = True
             snapshot_action = "unknown"
-            text = "COMPARISON UNKNOWN: at least one pytest worker trace is missing."
+            text = (
+                "COMPARISON UNKNOWN: at least one pytest worker trace is missing."
+                if missing_workers
+                else "COMPARISON UNKNOWN: the run is incomplete, so it was neither saved nor compared."
+            )
         elif args.golden:
             if args.learn_volatility:
                 second = _noise_run(args, scope, invocation, recorder, ldr_dir)

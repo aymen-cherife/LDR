@@ -8,6 +8,7 @@ from threading import RLock
 from .boundary import BoundaryStream
 from .deep import Timeline
 from .fingerprint import PARTIAL_MARK, REDACTED, STATS, is_digest
+from .sqlite_store import DETAIL_RANK
 from .node import capture
 from .value_capture import capture_value
 
@@ -46,6 +47,10 @@ class CallStream:
         self.value_bytes_in_flight = 0
         self.committed_value_bytes = 0
         self.cost = {}
+        self.shapes = {}
+        self.dropped = {}
+        self.started_calls = 0
+        self.incomplete = None
         self.deep = {}
         self.deep_started = 0
         self.deep_observed = 0
@@ -66,16 +71,35 @@ class CallStream:
 
     @property
     def keeping_details(self):
-        return not (self.budget_exhausted or self.write_failed)
+        return not self.write_failed
 
     def add_cost(self, function, nodes):
         """Charge fingerprint work (nodes walked) to a function."""
         self.cost[function] = self.cost.get(function, 0) + nodes
 
     def note_call(self, function, deep=False):
-        """Count a started call. True when it keeps detail: one of the first N of its function."""
+        """Count a started call and say why it keeps detail from entry, if it does.
+
+        The first call of a function, a selected (deep) function and the first N
+        calls keep detail. Past the ceiling the run stops: ``incomplete`` is set.
+        """
+        self.started_calls += 1
+        if self.started_calls > self.store.max_recorded_calls and self.incomplete is None:
+            limit = self.store.max_recorded_calls
+            self.incomplete = (
+                f"recording stopped after {limit} calls: the fingerprint ceiling "
+                f"(max_recorded_calls = {limit}) was reached, so later calls are not recorded"
+            )
+        if self.incomplete or self.write_failed:
+            return None
         count = self.counts[function] = self.counts.get(function, 0) + 1
-        return (deep or count <= self.store.first_calls) and self.keeping_details
+        if count == 1:
+            return "first call"
+        if deep:
+            return "deep"
+        if count <= self.store.first_calls and not self.budget_exhausted:
+            return "first N"
+        return None
 
     def detail_for(self, frame):
         entry = self.active.get(id(frame))
@@ -179,6 +203,7 @@ class CallStream:
         output_preview,
         timing,
         return_value=None,
+        shape=None,
     ):
         with self.lock:
             entry = self.active.pop(id(frame), None)
@@ -216,14 +241,27 @@ class CallStream:
             error_type = error.split(":", 1)[0] if error else None
             state = self._compare(frame_id, function, parts, error_type, comparable)
             self.pending_fp.append((ordinal, frame_id, parent, function, error_type, parts, state))
-            mutated = []
+            mutated = [name for name, token in inputs.items() if exit_inputs.get(name) != token]
+            reasons = []
+            if detail in ("first call", "deep"):
+                reasons.append(detail)
+            if shape is not None:
+                seen = self.shapes.setdefault(function, set())
+                if shape not in seen:
+                    seen.add(shape)
+                    if detail != "first call":
+                        reasons.append("new shape")
+            if state in ("different", "new"):
+                reasons.append("differs from reference")
+            if error is not None:
+                reasons.append("exception")
+            primary = max([*reasons, detail] if detail else reasons, key=lambda r: DETAIL_RANK[r], default=None)
             late = False
-            if state in ("different", "new") and not detail and self.keeping_details:
+            if not detail and reasons and self.keeping_details:
                 # Detail that was not captured at entry is built now. An argument that
                 # still has its entry fingerprint can be read from the frame; one that
                 # changed is marked, and its detail needs a rerun.
                 detail = late = True
-                mutated = [name for name, token in inputs.items() if exit_inputs.get(name) != token]
                 if self.preview_of is not None:
                     preview = self.preview_of(frame, mutated)
                 if output_preview is None and error is None:
@@ -255,10 +293,12 @@ class CallStream:
                 "elapsed_ms": timing["elapsed_ms"] if timing else None,
                 "timing": timing,
             }
+            if reasons:
+                fields["kept"] = reasons
             if late:
                 fields["detail_at"] = "return"
-                if mutated:
-                    fields["mutated_in_call"] = mutated
+            if mutated:
+                fields["mutated_in_call"] = mutated
             if lines is not None:
                 fields["executed_lines"] = list(lines)
                 fields["completion_order"] = self.completed
@@ -283,16 +323,11 @@ class CallStream:
             size = len(payload) + len(frame_id.encode("utf-8", "surrogatepass"))
             if self.pending_bytes + size > self.store.max_trace_bytes:
                 self.flush()
-            if self.budget_exhausted or self.write_failed:
+            if self.write_failed:
                 self._release_values(data)
                 self._release_deep(steps)
                 return
-            if size > self.store.max_trace_bytes:
-                self.budget_exhausted = True
-                self._release_values(data)
-                self._release_deep(steps)
-                return
-            self.pending.append((ordinal, frame_id, parent, payload, data, timeline))
+            self.pending.append((ordinal, frame_id, parent, payload, data, timeline, primary))
             self.pending_bytes += size
             if len(self.pending) >= self.store.batch_size or len(self.pending_fp) >= self.store.batch_size:
                 self.flush()
@@ -323,13 +358,16 @@ class CallStream:
                     written,
                     self.committed_value_bytes,
                     self.committed_deep_bytes,
+                    dropped,
                 ) = self.store.append_stream(self.worker, self.pending, self.pending_fp)
                 self.stored += written
                 self.fingerprinted += len(self.pending_fp)
-                self.budget_exhausted |= written < len(self.pending)
+                for reason, number in dropped.items():
+                    self.dropped[reason] = self.dropped.get(reason, 0) + number
+                self.budget_exhausted |= "first N" in dropped
             except (OSError, sqlite3.Error):
                 self.write_failed = True
-            for _, _, _, _, data, timeline in self.pending:
+            for _, _, _, _, data, timeline, _ in self.pending:
                 self._release_values(data)
                 if timeline is not None:
                     self._release_deep(timeline.steps)
@@ -345,6 +383,8 @@ class CallStream:
                 "started": self.next_ordinal,
                 "stored": self.stored,
                 "fingerprinted": self.fingerprinted,
+                "dropped": dict(self.dropped),
+                "incomplete": self.incomplete,
                 "first_calls": self.store.first_calls,
                 "last_calls": self.store.last_calls,
                 "unfinished": len(self.active),

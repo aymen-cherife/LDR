@@ -22,6 +22,17 @@ from .timing import CallTiming
 
 
 _RECEIVERS = ("self", "cls")
+_SIZED = (str, bytes, bytearray, list, tuple, dict, set, frozenset)
+
+
+def shape_of(value) -> tuple[str, int | None]:
+    """A return value's shape: its type and, for built-in containers, a size bucket.
+
+    The bucket is the bit length of the size (placeholder boundaries, TO MEASURE).
+    Only exact built-in types are measured, so no user code runs.
+    """
+    kind = type(value)
+    return (kind.__name__, len(value).bit_length() if kind in _SIZED else None)
 
 
 def fp_value(value, name: str | None = None) -> str:
@@ -128,6 +139,7 @@ class Recorder:
         self._invocation_counts: dict[str, int] = {}
         # Address state: calls with no recorded caller count under the current
         # test root (or the run, outside pytest).
+        self._halted = False
         self._root_counts: dict[str, int] = {}
         self._test_root = ""
         self._test_code = None
@@ -278,6 +290,12 @@ class Recorder:
             self.call_stream.add_cost(
                 f"{self._source_id(code.co_filename)}:{code.co_qualname}", spent
             )
+
+    def _halt(self) -> None:
+        """Stop receiving events, keeping what was recorded. The run is marked incomplete."""
+        if self._tool_id is not None and not self._halted:
+            sys.monitoring.set_events(self._tool_id, 0)
+            self._halted = True
 
     def _late_preview(self, frame, mutated: list[str]) -> dict[str, str]:
         """Argument previews read at return, with changed arguments marked."""
@@ -475,6 +493,9 @@ class Recorder:
         )
         # Only the first N calls of a function keep detail; the rest keep fingerprints.
         detail = self.call_stream.note_call(function, deep)
+        if self.call_stream.incomplete:
+            self._halt()
+            return
         preview = None
         if detail:
             preview = node.in_ if node is not None else self._arguments(code, frame)
@@ -774,7 +795,14 @@ class Recorder:
         _stack.set(parent_stack)
         if self.call_stream is not None:
             self.call_stream.close(
-                frame, self._argument_fingerprints(code, frame), out_fp, error, out, timing, return_value,
+                frame,
+                self._argument_fingerprints(code, frame),
+                out_fp,
+                error,
+                out,
+                timing,
+                return_value,
+                shape_of(return_value) if error is None else None,
             )
 
         if isinstance(entry, _Shadow):
