@@ -7,6 +7,7 @@ from .redact import redact
 from .value_capture import encode_local
 
 
+_ENCODER = json.JSONEncoder(separators=(",", ":"))
 _COMPLETE_VALUE_OVERHEAD = len(b'{"status":"complete","value":}')
 
 
@@ -34,7 +35,7 @@ def encode_bindings(bindings, limit):
 
 
 def _snapshot(frame, line, event, limit):
-    prefix = json.dumps({"line": line, "event": event}, separators=(",", ":"))
+    prefix = _ENCODER.encode({"line": line, "event": event})
     header = prefix[:-1].encode() + b',"locals":'
     complete = b',"locals_complete":true}'
     partial = b',"locals_complete":false}'

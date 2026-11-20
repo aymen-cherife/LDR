@@ -9,6 +9,9 @@ from .redact import contains_secret, is_secret_name
 # Full value retention keeps its own node limit; the fingerprint walk has none.
 VALUE_NODE_LIMIT = 10_000
 
+# Shared, so each value does not build its own encoder. Same bytes as json.dumps.
+_ENCODER = json.JSONEncoder(separators=(",", ":"), allow_nan=False)
+
 
 class _Incomplete(Exception):
     pass
@@ -27,7 +30,7 @@ def _one_of(kind, types):
 
 
 def _json(value):
-    return json.dumps(value, separators=(",", ":"), allow_nan=False).encode()
+    return _ENCODER.encode(value).encode()
 
 
 class _Encoder:

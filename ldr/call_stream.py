@@ -29,8 +29,13 @@ def call_signature(parts, error):
     return digest.digest()
 
 
+# One encoder for every record: json.dumps with non-default options builds a new
+# encoder on each call. The output is byte-for-byte the same.
+_ENCODER = json.JSONEncoder(separators=(",", ":"), sort_keys=True)
+
+
 def _encode(value):
-    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return _ENCODER.encode(value).encode()
 
 
 class CallStream:
