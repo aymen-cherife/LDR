@@ -19,6 +19,7 @@ import tomllib
 from typing import Any
 
 from . import __version__
+from . import environment as run_environment
 from .diff import (
     EQUAL_READABLE,
     align,
@@ -31,7 +32,7 @@ from .diff import (
 )
 from .gitinfo import describe_commit, describe_outcome, git_state
 from .node import Node, capture, capture_error, count_redacted
-from .redact import redact_argv, register_argv_secrets
+from .redact import redact, redact_argv, register_argv_secrets
 from .render import render_call_chain, render_diff, render_inspection, render_run
 from .store import (
     SCHEMA_VERSION,
@@ -655,35 +656,85 @@ def _print_result(text: str) -> None:
     print(text)
 
 
-def _show_deep(argv, ldr_dir):
+def _show_saved(argv, ldr_dir):
     parser = argparse.ArgumentParser(prog="ldr show")
     parser.add_argument("frame", nargs="?", help="stored frame address, or omit to list frames")
     parser.add_argument("--run-id", help="stored run ID (defaults to the latest run)")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--boundaries", action="store_true", help="list saved library calls")
+    parser.add_argument(
+        "--environment", action="store_true", help="show the run's recorded environment"
+    )
     args = parser.parse_args(argv)
     if not 0 <= args.offset < 2**63 or not 0 < args.limit < 2**63:
         parser.error("--offset must be nonnegative and --limit must be positive SQLite integers")
+    if args.boundaries and args.environment:
+        parser.error("--boundaries and --environment show different evidence; pick one")
+    if (args.boundaries or args.environment) and args.frame is not None:
+        parser.error("--boundaries and --environment take no frame argument")
     try:
-        run_id, evidence = TraceStore.read_deep(
-            ldr_dir, args.run_id, args.frame, offset=args.offset, limit=args.limit
-        )
+        if args.environment:
+            run_id, evidence = TraceStore.read_environment(ldr_dir, args.run_id)
+        elif args.boundaries:
+            run_id, evidence = TraceStore.read_boundaries(
+                ldr_dir, args.run_id, offset=args.offset, limit=args.limit
+            )
+        else:
+            run_id, evidence = TraceStore.read_deep(
+                ldr_dir, args.run_id, args.frame, offset=args.offset, limit=args.limit
+            )
     except sqlite3.Error as exc:
-        print(f"Could not read saved deep capture ({capture_error(exc)}).", file=sys.stderr)
+        print(f"Could not read saved capture ({capture_error(exc)}).", file=sys.stderr)
         return 2
     if run_id is None and (args.frame is not None or args.run_id is not None):
         print("No matching saved run.", file=sys.stderr)
+        return 2
+    if args.environment and evidence is None:
+        print(
+            f"No environment was recorded for run {run_id}." if run_id else "No saved runs.",
+            file=sys.stderr,
+        )
         return 2
     if evidence is None:
         print(f"No saved deep capture for {args.frame} in run {run_id}.", file=sys.stderr)
         return 2
     if args.json:
-        key = "frames" if args.frame is None else "frame"
+        key = (
+            "environment" if args.environment
+            else "boundaries" if args.boundaries
+            else ("frames" if args.frame is None else "frame")
+        )
         print(json.dumps({"run_id": run_id, key: evidence}))
         return 0
     lines = [f"Run {run_id}" if run_id else "No saved runs."]
-    if args.frame is None:
+    if args.environment:
+        python, system = evidence["python"], evidence["platform"]
+        lines.append(f"Python {python['version']} ({python['implementation']})")
+        lines.append(f"Platform: {system['system']} {system['release']} ({system['tag']})")
+        lines.append(f"Packages ({len(evidence['packages'])}):")
+        lines.extend(f"  {name} {version}" for name, version in evidence["packages"].items())
+        lines.append(
+            f"Environment variable names ({len(evidence['variables'])}); "
+            "values are never recorded:"
+        )
+        lines.append("  " + ", ".join(evidence["variables"]))
+    elif args.boundaries:
+        for call in evidence:
+            site = call["caller"]
+            lines.append(
+                f"{call['module']}.{call['function']} {call['outcome']} "
+                f"at {site['file']}:{site['line']}"
+            )
+            lines.extend(f"  {name} = {_show_value(value)}" for name, value in call["arguments"])
+            if not call["arguments_complete"]:
+                lines.append("  <some arguments omitted by the capture budget>")
+            result = call.get("result", call.get("exception"))
+            lines.append(f"  {call['outcome']} {_show_value(result)}")
+        if not evidence and run_id:
+            lines.append("No saved library calls on this page.")
+    elif args.frame is None:
         lines.extend(
             f"{frame['frame_id']}  ({frame['retained']}/{frame['observed']} snapshots)"
             for frame in evidence
@@ -697,16 +748,17 @@ def _show_deep(argv, ldr_dir):
         for step in evidence["steps"]:
             lines.append(f"Step {step['step']}, line {step['line']} ({step['event']})")
             for name, local in step["locals"]:
-                value = (
-                    json.dumps(local["value"], ensure_ascii=False)
-                    if local["status"] == "complete"
-                    else f"<{local['status']}>"
-                )
-                lines.append(f"  {name} = {value}")
+                lines.append(f"  {name} = {_show_value(local)}")
             if not step["locals_complete"]:
                 lines.append("  <some locals omitted by the capture budget>")
     _print_result(_limit_text("\n".join(lines), max_lines=sys.maxsize))
     return 0
+
+
+def _show_value(evidence):
+    if evidence["status"] == "complete":
+        return json.dumps(evidence["value"], ensure_ascii=False)
+    return f"<{evidence['status']}>"
 
 
 def _noise_run(
@@ -781,7 +833,7 @@ def main(argv=None) -> int:
     ldr_dir = os.path.join(initial_cwd, LDR_DIR)
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "show":
-        return _show_deep(argv[1:], ldr_dir)
+        return _show_saved(argv[1:], ldr_dir)
     register_argv_secrets(argv)
     timeout_requested = any(a == "--timeout" or a.startswith("--timeout=") for a in argv)
     passthrough: list[str] = []
@@ -824,6 +876,10 @@ def main(argv=None) -> int:
         "--deep", action="append", default=[], metavar="FUNCTION",
         help="save locals for a selected function (repeatable)",
     )
+    parser.add_argument(
+        "--boundary", action="append", default=[], metavar="MODULE",
+        help="save direct calls from the project into a Python module (repeatable)",
+    )
     parser.add_argument("--timeout", type=float, default=300)
     args, unknown = parser.parse_known_args(argv)
     args.rest = list(args.rest) + unknown + passthrough
@@ -846,6 +902,11 @@ def main(argv=None) -> int:
         or any(not name.strip() for name in args.deep)
     ):
         parser.error("--deep requires a function name and a recording command")
+    if args.boundary and (
+        requested_mode not in {"run", "pytest", "module", "verify"}
+        or any(not all(part.isidentifier() for part in name.split(".")) for name in args.boundary)
+    ):
+        parser.error("--boundary requires a dotted module name and a recording command")
     if args.frame_id is not None:
         if requested_mode != "inspect":
             parser.error("--frame-id is only valid with inspect")
@@ -918,12 +979,14 @@ def main(argv=None) -> int:
     store = None
     storage_warning = None
     try:
-        settings = storage_settings(project_root, deep=bool(args.deep))
+        settings = storage_settings(
+            project_root, deep=bool(args.deep), boundary=bool(args.boundary)
+        )
         store = TraceStore.start(ldr_dir, invocation, *settings)
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
         storage_warning = capture_error(exc)
-        if args.deep:
-            parser.error(f"Could not start deep capture ({storage_warning})")
+        if args.deep or args.boundary:
+            parser.error(f"Could not start optional capture ({storage_warning})")
 
     recorder_options = {
         "scope": scope,
@@ -934,8 +997,15 @@ def main(argv=None) -> int:
         "max_state_steps": args.max_state_steps,
         "max_calls_per_function": args.max_calls_per_function,
         "deep_functions": args.deep,
+        "boundary_modules": args.boundary,
     }
     pytest_capture = None
+    # Read before the target runs, so the record is the environment it started in.
+    environment = None
+    try:
+        environment = run_environment.capture_environment()
+    except Exception as exc:
+        scope_warnings.append(f"Environment record unavailable ({capture_error(exc)}).")
 
     def go(recorder):
         nonlocal pytest_capture
@@ -993,9 +1063,19 @@ def main(argv=None) -> int:
     }
     status["redacted_values"] = count_redacted(recorder.roots)
     status["commit"] = git_state(project_root)
+    if environment is not None:
+        status["environment"] = run_environment.summarize(environment)
     if store is not None:
         status["run_id"] = store.run_id
         try:
+            if environment is not None:
+                try:
+                    store.save_environment(environment)
+                except (OSError, sqlite3.Error) as exc:
+                    # The record is secondary evidence: do not lose the call stream over it.
+                    scope_warnings.append(
+                        f"Environment record could not be saved ({capture_error(exc)})."
+                    )
             if not pytest_capture or not pytest_capture.workers:
                 recorder.call_stream.finish()
                 store.save_worker("main", recorder.roots, {})
@@ -1021,6 +1101,16 @@ def main(argv=None) -> int:
                     "functions": args.deep,
                     "max_bytes": store.max_deep_bytes,
                     **totals,
+                }
+            if args.boundary:
+                status["boundary_capture"] = {
+                    "modules": [redact(module)[0] for module in args.boundary],
+                    "max_bytes": store.max_boundary_bytes,
+                    "bytes": store.boundary_bytes_used(),
+                    **{
+                        key: sum(summary["boundaries"][key] for summary in stream_summaries)
+                        for key in ("started", "stored", "unfinished", "write_failed")
+                    },
                 }
             store.finish(status)
         except (OSError, sqlite3.Error) as exc:
@@ -1059,6 +1149,14 @@ def main(argv=None) -> int:
             f"({deep_status['unfinished']} unfinished). "
             f"Read with ldr show --run-id {store.run_id}\n"
         )
+    if boundary_status := status.get("boundary_capture"):
+        redaction_note += (
+            f"LIBRARY CALLS: {boundary_status['stored']}/{boundary_status['started']} saved "
+            f"({boundary_status['unfinished']} unfinished). "
+            f"Read with ldr show --boundaries --run-id {store.run_id}\n"
+        )
+        if boundary_status["write_failed"]:
+            scope_warnings.append("Some library call records could not be written.")
     if (
         recorder.exit_code != 0
         and detected_roots
@@ -1160,6 +1258,7 @@ def main(argv=None) -> int:
     baseline_sampled = 0
     unstable: list[dict[str, str]] = []
     comparison_unknown = False
+    environment_comparison = None
     stream_changes = []
     findings = []
     snapshot_action = "none"
@@ -1276,13 +1375,39 @@ def main(argv=None) -> int:
             if unstable:
                 text += "\n\n" + render_unstable(unstable)
             baseline_sampled = baseline_status.get("sampled_repetitions", 0)
+            environment_note = ""
+            if environment is not None:
+                baseline_record = None
+                if (
+                    store is not None
+                    and baseline_status.get("run_id")
+                    and baseline_status.get("environment")
+                ):
+                    try:
+                        baseline_record = store.load_environment(baseline_status["run_id"])
+                    except (OSError, sqlite3.Error, ValueError):
+                        scope_warnings.append("Could not read the baseline environment record.")
+                environment_comparison = run_environment.comparison(
+                    baseline_status.get("environment"),
+                    status["environment"],
+                    baseline_record,
+                    environment,
+                )
+                environment_note = run_environment.render_comparison(
+                    environment_comparison, status["environment"]
+                )
             if baseline_status:
                 text = (
                     f"BASELINE: outcome {describe_outcome(baseline_status)}, commit "
                     f"{describe_commit(baseline_status.get('commit'))}. "
                     f"THIS RUN: outcome {describe_outcome(status)}, commit "
-                    f"{describe_commit(status['commit'])}.\n\n" + text
+                    f"{describe_commit(status['commit'])}.\n"
+                    + environment_note
+                    + "\n"
+                    + text
                 )
+            elif environment_note:
+                text = environment_note + "\n" + text
         else:
             text = render_run(
                 recorder.roots,
@@ -1368,6 +1493,7 @@ def main(argv=None) -> int:
             ),
             "unstable_fields": unstable[:50],
         },
+        "environment_comparison": environment_comparison,
         "frame_index": frame_index_payload,
         "suggestions": suggestions,
         "scope": {

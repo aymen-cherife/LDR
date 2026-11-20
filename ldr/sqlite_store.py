@@ -71,6 +71,16 @@ CREATE TABLE IF NOT EXISTS stream_deep_steps (
     PRIMARY KEY (run_id, worker, ordinal, step),
     FOREIGN KEY (run_id, worker, ordinal) REFERENCES stream_deep_frames(run_id, worker, ordinal)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stream_boundary_budget (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id), used_bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS stream_boundaries (
+    run_id TEXT NOT NULL REFERENCES runs(id), worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    payload BLOB NOT NULL, PRIMARY KEY (run_id, worker, ordinal)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS run_environment (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id), payload TEXT NOT NULL
+);
 """
 VALUE_FIELDS = ("in", "out", "in_fp", "out_fp", "input_changes")
 
@@ -90,7 +100,7 @@ def _json(value):
     return json.dumps(value, separators=(",", ":"))
 
 
-def storage_settings(project_root, *, deep=False):
+def storage_settings(project_root, *, deep=False, boundary=False):
     path = Path(project_root) / "pyproject.toml"
     try:
         with path.open("rb") as handle:
@@ -129,18 +139,23 @@ def storage_settings(project_root, *, deep=False):
         raise ValueError(
             "[tool.ldr.storage] max_value_bytes requires an explicit max_trace_bytes at least as large"
         )
-    max_deep_bytes = settings.get("max_deep_bytes", 0)
-    if type(max_deep_bytes) is not int or not 0 <= max_deep_bytes < 2**63:
-        raise ValueError("[tool.ldr.storage] max_deep_bytes must be a nonnegative integer")
-    if deep and (
-        "max_trace_bytes" not in settings or not 0 < max_deep_bytes <= max_trace_bytes
-    ):
-        raise ValueError(
-            "--deep requires explicit [tool.ldr.storage] max_deep_bytes and max_trace_bytes "
-            "with 0 < max_deep_bytes <= max_trace_bytes"
-        )
-    return batch_size, busy_timeout, max_trace_bytes, capture_lines, max_value_bytes, (
-        max_deep_bytes if deep else 0
+    allowance = {}
+    for flag, active in (("deep", deep), ("boundary", boundary)):
+        name = f"max_{flag}_bytes"
+        value = settings.get(name, 0)
+        if type(value) is not int or not 0 <= value < 2**63:
+            raise ValueError(f"[tool.ldr.storage] {name} must be a nonnegative integer")
+        if active and (
+            "max_trace_bytes" not in settings or not 0 < value <= max_trace_bytes
+        ):
+            raise ValueError(
+                f"--{flag} requires explicit [tool.ldr.storage] {name} and max_trace_bytes "
+                f"with 0 < {name} <= max_trace_bytes"
+            )
+        allowance[flag] = value if active else 0
+    return (
+        batch_size, busy_timeout, max_trace_bytes, capture_lines, max_value_bytes,
+        allowance["deep"], allowance["boundary"],
     )
 
 
@@ -171,6 +186,7 @@ class TraceStore:
         capture_lines=False,
         max_value_bytes=0,
         max_deep_bytes=0,
+        max_boundary_bytes=0,
     ):
         self.path = path
         self.run_id = run_id
@@ -180,6 +196,7 @@ class TraceStore:
         self.capture_lines = capture_lines
         self.max_value_bytes = max_value_bytes
         self.max_deep_bytes = max_deep_bytes
+        self.max_boundary_bytes = max_boundary_bytes
 
     @classmethod
     def start(
@@ -192,6 +209,7 @@ class TraceStore:
         capture_lines=False,
         max_value_bytes=0,
         max_deep_bytes=0,
+        max_boundary_bytes=0,
     ):
         directory = Path(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -212,6 +230,7 @@ class TraceStore:
             capture_lines,
             max_value_bytes,
             max_deep_bytes,
+            max_boundary_bytes,
         )
         with closing(store._connect(allow_mode_change=True)) as connection:
             # Two invocations can race to set the journal mode on a new database.
@@ -251,6 +270,10 @@ class TraceStore:
                 if store.max_deep_bytes:
                     connection.execute(
                         "INSERT INTO stream_deep_budget (run_id) VALUES (?)", (store.run_id,)
+                    )
+                if store.max_boundary_bytes:
+                    connection.execute(
+                        "INSERT INTO stream_boundary_budget (run_id) VALUES (?)", (store.run_id,)
                     )
         return store
 
@@ -346,17 +369,109 @@ class TraceStore:
             ).fetchone()
         return {"frames": stored, "retained": retained, "bytes": size}
 
+    def append_boundaries(self, worker, rows):
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            (used,) = connection.execute(
+                "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (self.run_id,)
+            ).fetchone()
+            (boundary_used,) = connection.execute(
+                "SELECT used_bytes FROM stream_boundary_budget WHERE run_id = ?", (self.run_id,)
+            ).fetchone()
+            limit = min(self.max_trace_bytes - used, self.max_boundary_bytes - boundary_used)
+            added = 0
+            admitted = []
+            for ordinal, payload in rows:
+                if added + len(payload) > limit:
+                    continue
+                added += len(payload)
+                admitted.append((self.run_id, worker, ordinal, payload))
+            connection.executemany("INSERT INTO stream_boundaries VALUES (?, ?, ?, ?)", admitted)
+            connection.execute(
+                "UPDATE stream_budget SET used_bytes = ? WHERE run_id = ?", (used + added, self.run_id)
+            )
+            connection.execute(
+                "UPDATE stream_boundary_budget SET used_bytes = ? WHERE run_id = ?",
+                (boundary_used + added, self.run_id),
+            )
+        return len(admitted), boundary_used + added, self.max_trace_bytes - used - added
+
+    def boundary_bytes_used(self):
+        with closing(self._connect()) as connection:
+            (used,) = connection.execute(
+                "SELECT used_bytes FROM stream_boundary_budget WHERE run_id = ?", (self.run_id,)
+            ).fetchone()
+        return used
+
+    @staticmethod
+    def _find_run(connection, run_id):
+        return (
+            connection.execute(
+                "SELECT id FROM runs ORDER BY started_ns DESC, id DESC LIMIT 1"
+            ).fetchone()
+            if run_id is None
+            else connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        )
+
+    @staticmethod
+    def read_boundaries(directory, run_id, *, offset, limit):
+        path = Path(directory, "traces.sqlite3").resolve().as_uri()
+        with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as connection:
+            row = TraceStore._find_run(connection, run_id)
+            if row is None:
+                return None, []
+            run_id = row[0]
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'stream_boundaries'"
+            ).fetchone() is None:
+                return run_id, []
+            rows = connection.execute(
+                "SELECT worker, ordinal, payload FROM stream_boundaries WHERE run_id = ? "
+                "ORDER BY worker, ordinal LIMIT ? OFFSET ?", (run_id, limit, offset)
+            )
+            return run_id, [
+                {"worker": worker, "ordinal": ordinal, **json.loads(payload)}
+                for worker, ordinal, payload in rows
+            ]
+
+    def save_environment(self, record):
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO run_environment VALUES (?, ?)",
+                (self.run_id, _json(record)),
+            )
+
+    def load_environment(self, run_id):
+        """One run's environment record, or None when it was not saved."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT payload FROM run_environment WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    @staticmethod
+    def read_environment(directory, run_id):
+        """Read-only lookup for ``ldr show``: (run id, record or None)."""
+        path = Path(directory, "traces.sqlite3").resolve().as_uri()
+        with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as connection:
+            row = TraceStore._find_run(connection, run_id)
+            if row is None:
+                return None, None
+            run_id = row[0]
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_environment'"
+            ).fetchone() is None:
+                return run_id, None
+            saved = connection.execute(
+                "SELECT payload FROM run_environment WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return run_id, json.loads(saved[0]) if saved else None
+
     @staticmethod
     def read_deep(directory, run_id, frame_id=None, *, offset=0, limit=20):
         path = Path(directory, "traces.sqlite3").resolve().as_uri()
         with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as connection:
-            row = (
-                connection.execute(
-                    "SELECT id FROM runs ORDER BY started_ns DESC, id DESC LIMIT 1"
-                ).fetchone()
-                if run_id is None
-                else connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
-            )
+            row = TraceStore._find_run(connection, run_id)
             if row is None:
                 return None, None if frame_id is not None else []
             run_id = row[0]

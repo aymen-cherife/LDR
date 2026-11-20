@@ -10,20 +10,15 @@ from .value_capture import encode_local
 _COMPLETE_VALUE_OVERHEAD = len(b'{"status":"complete","value":}')
 
 
-def _snapshot(frame, line, event, limit):
-    # Locals are pairs so redacted names cannot overwrite one another.
-    prefix = json.dumps({"line": line, "event": event}, separators=(",", ":"))
-    data = bytearray(prefix[:-1].encode() + b',"locals":[')
-    complete = b'],"locals_complete":true}'
-    partial = b'],"locals_complete":false}'
-    if len(data) + len(partial) > limit:
-        return None
+def encode_bindings(bindings, limit):
+    # Pairs keep redacted names from overwriting one another.
+    data = bytearray(b"[")
     count = 0
-    for name, value in frame.f_locals.items():
+    for name, value in bindings:
         if type(name) is not str:
             continue
         key = json.dumps(redact(name)[0]).encode()
-        available = limit - len(data) - len(partial) - len(key) - 4
+        available = limit - len(data) - len(key) - 5
         if available < 0:
             break
         evidence = encode_local(value, name, max(0, available - _COMPLETE_VALUE_OVERHEAD))
@@ -34,8 +29,20 @@ def _snapshot(frame, line, event, limit):
         data.extend(b"[" + key + b"," + evidence + b"]")
         count += 1
     else:
-        return bytes(data + complete)
-    return bytes(data + partial)
+        return bytes(data + b"]"), True
+    return bytes(data + b"]"), False
+
+
+def _snapshot(frame, line, event, limit):
+    prefix = json.dumps({"line": line, "event": event}, separators=(",", ":"))
+    header = prefix[:-1].encode() + b',"locals":'
+    complete = b',"locals_complete":true}'
+    partial = b',"locals_complete":false}'
+    available = limit - len(header) - len(partial)
+    if available < len(b"[]"):
+        return None
+    data, fully_listed = encode_bindings(frame.f_locals.items(), available)
+    return header + data + (complete if fully_listed else partial)
 
 
 @dataclass(slots=True)

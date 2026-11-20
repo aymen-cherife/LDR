@@ -5,6 +5,7 @@ import sqlite3
 from hashlib import blake2b
 from threading import RLock
 
+from .boundary import BoundaryStream
 from .deep import Timeline
 from .fingerprint import PARTIAL_MARK, REDACTED, is_digest
 from .node import capture
@@ -37,10 +38,15 @@ class CallStream:
         self.deep_observed = 0
         self.deep_bytes_in_flight = 0
         self.committed_deep_bytes = 0
+        self.boundaries = BoundaryStream(store, worker) if store.max_boundary_bytes else None
 
     @property
     def keeping_details(self):
         return not (self.budget_exhausted or self.write_failed)
+
+    def frame_address(self, frame):
+        entry = self.active.get(id(frame))
+        return entry[2] if entry is not None else None
 
     def start(self, frame, frame_id, function, inputs, preview, *, deep=False):
         with self.lock:
@@ -261,6 +267,8 @@ class CallStream:
                     "observed": self.deep_observed
                     + sum(timeline.observed for timeline in self.deep.values()),
                 }
+            if self.boundaries is not None:
+                summary["boundaries"] = self.boundaries.finish()
             self.active.clear()
             self.deep.clear()
         try:

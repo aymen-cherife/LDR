@@ -137,3 +137,112 @@ def test_budget_limits_saved_evidence_and_preserves_output(project):
             "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (status["run_id"],)
         ).fetchone()
     assert 0 < used <= 2000
+
+
+def test_boundary_capture_records_python_library_calls_without_their_internals(project):
+    config = project / "pyproject.toml"
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write("max_boundary_bytes = 10000\n")
+    plain = export(launch(project, "app.py"), project)
+    traced = launch(
+        project, "-m", "ldr", "run", "app.py", "--golden",
+        "--boundary", "urllib.parse", "--boundary", "json",
+    )
+    assert export(traced, project) == plain
+    status_file = project / ".ldr" / "last.json"
+    saved = status_file.read_bytes()
+    status = json.loads(saved)["status"]
+    boundary = status["boundary_capture"]
+    assert boundary["stored"] == boundary["started"]
+    assert boundary["unfinished"] == 0
+    assert 0 < boundary["bytes"] <= 10000
+    show = ("-m", "ldr", "show", "--boundaries", "--run-id", status["run_id"], "--json")
+    calls = json.loads(launch(project, *show))["boundaries"]
+    assert boundary["stored"] == len(calls)
+    assert all(call["caller"]["file"] == "app.py" for call in calls)
+    application_calls = [call for call in calls if call["caller"]["frame_id"] is not None]
+    assert [(call["module"], call["function"]) for call in application_calls] == [
+        ("urllib.parse", "parse_qsl"), ("json", "dumps"), ("json", "dumps")
+    ]
+    parse, write, _ = application_calls
+    assert ":pricing_options#" in parse["caller"]["frame_id"]
+    assert parse["result"] == {"status": "redacted"}
+    assert dict(parse["arguments"])["qs"] == {"status": "redacted"}
+    assert json.loads(write["result"]["value"]) == plain
+    page = json.loads(launch(project, *show, "--offset", str(calls.index(write)), "--limit", "1"))
+    assert page["boundaries"] == [write]
+    assert status_file.read_bytes() == saved
+    for file in ("traces.sqlite3", "last.json", "last.txt"):
+        assert EXPORT_KEY.encode() not in (project / ".ldr" / file).read_bytes()
+
+    launch(project, "-m", "ldr", "run", "app.py", "--diff", "--fail-on-change")
+    assert json.loads(status_file.read_bytes())["behavior"]["changed"] is False
+    assert json.loads(launch(project, "-m", "ldr", "show", "--boundaries", "--json"))[
+        "boundaries"
+    ] == []
+
+
+def test_boundary_capture_requires_a_configured_budget(project):
+    (project / "app.py").write_text("print('APP RAN')\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-m", "ldr", "run", "app.py", "--boundary", "json"],
+        cwd=project,
+        env=dict(os.environ, PYTHONPATH=str(REPO)),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 2
+    assert "--boundary requires explicit" in result.stderr
+    assert "APP RAN" not in result.stdout
+
+
+def test_boundary_capture_reports_handled_library_exception_without_its_message(project):
+    with (project / "pyproject.toml").open("a", encoding="utf-8") as handle:
+        handle.write("max_boundary_bytes = 10000\n")
+    (project / "app.py").write_text(
+        "import json, os\n"
+        "def accepts_json():\n"
+        "    try:\n"
+        "        json.loads(os.environ['EXPORT_API_KEY'])\n"
+        "    except json.JSONDecodeError:\n"
+        "        return False\n"
+        "assert not accepts_json()\n",
+        encoding="utf-8",
+    )
+    launch(project, "-m", "ldr", "run", "app.py", "--boundary", "json")
+    result = launch(project, "-m", "ldr", "show", "--boundaries", "--json")
+    call, = json.loads(result)["boundaries"]
+    assert call["function"] == "loads"
+    assert call["outcome"] == "raised"
+    assert call["exception"] == {"status": "complete", "value": "JSONDecodeError"}
+    assert dict(call["arguments"])["s"] == {"status": "redacted"}
+    assert EXPORT_KEY.encode() not in (project / ".ldr/traces.sqlite3").read_bytes()
+
+
+def test_boundary_budget_is_shared_across_pytest_workers(project):
+    pytest.importorskip("xdist")
+    (project / "pyproject.toml").write_text(
+        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_boundary_bytes = 850\n",
+        encoding="utf-8",
+    )
+    (project / "test_calls.py").write_text(
+        "import urllib.parse\n"
+        "def test_first():\n"
+        "    assert urllib.parse.parse_qsl('rate=100') == [('rate', '100')]\n"
+        "def test_second():\n"
+        "    assert urllib.parse.parse_qsl('rate=120') == [('rate', '120')]\n",
+        encoding="utf-8",
+    )
+    launch(
+        project, "-m", "ldr", "pytest", "test_calls.py",
+        "--boundary", "urllib.parse", "--", "-n", "2",
+    )
+    report = json.loads((project / ".ldr/last.json").read_bytes())
+    status = report["status"]["boundary_capture"]
+    assert report["status"]["trace_workers"] == ["gw0", "gw1"]
+    assert status["started"] == 2
+    assert status["stored"] == 1
+    with sqlite3.connect(project / ".ldr/traces.sqlite3") as conn:
+        size, = conn.execute("SELECT sum(length(payload)) FROM stream_boundaries").fetchone()
+    assert size == status["bytes"] <= 850

@@ -17,7 +17,7 @@ from time import perf_counter_ns
 
 from .fingerprint import REDACTED, fingerprint, fingerprint_details
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
-from .redact import same_text_policy, text_policy
+from .redact import redact, same_text_policy, text_policy
 from .timing import CallTiming
 
 
@@ -78,6 +78,7 @@ class Recorder:
         max_state_steps: int = 200,
         max_calls_per_function: int = 8,
         deep_functions: list[str] | None = None,
+        boundary_modules: list[str] | None = None,
     ):
         if max_nodes < 1:
             raise ValueError("max_nodes must be at least 1")
@@ -98,6 +99,8 @@ class Recorder:
         self.call_stream = None
         self._immutable_inputs = {}
         self.deep_functions = frozenset(deep_functions or ())
+        self.boundary_modules = tuple(boundary_modules or ())
+        self.boundaries = None
         self._deep_codes: set[object] = set()
         self._global_lines = False
         self._timings: dict[int, CallTiming] = {}
@@ -425,7 +428,13 @@ class Recorder:
 
     def _on_start(self, code, offset):
         mon = sys.monitoring
-        if not self._in_scope(code.co_filename) or self._skip(code):
+        if not self._in_scope(code.co_filename):
+            if self.boundaries is None or self._skip(code):
+                return mon.DISABLE
+            self._start_boundary(code, sys._getframe(1))
+            # This code can be called directly from the project on another invocation.
+            return
+        if self._skip(code):
             return mon.DISABLE
         try:
             frame = sys._getframe(1)
@@ -493,6 +502,29 @@ class Recorder:
             entry = self._new_shadow(code, frame, frame_id)
         self._start_capture(code, frame, frame_id, at, entry if isinstance(entry, Node) else None)
         _stack.set(stack + (entry,))
+
+    def _start_boundary(self, code, frame):
+        caller = frame.f_back
+        if caller is None or not self._in_scope(caller.f_code.co_filename):
+            return
+        module = frame.f_globals.get("__name__")
+        if type(module) is not str or not any(
+            module == selected or module.startswith(selected + ".")
+            for selected in self.boundary_modules
+        ):
+            return
+        address = self.call_stream.frame_address(caller)
+        source = self._display_path(caller.f_code.co_filename)
+        site = {
+            "file": redact(source)[0],
+            "line": caller.f_lineno,
+            "frame_id": redact(address)[0] if address is not None else None,
+        }
+        locals_ = frame.f_locals
+        bindings = (
+            (name, locals_[name]) for name in self._argument_names(code) if name in locals_
+        )
+        self.boundaries.start(id(frame), module, code.co_qualname, site, bindings)
 
     @staticmethod
     def _state_locals(frame) -> dict[str, str]:
@@ -700,7 +732,12 @@ class Recorder:
                 _mark_handled(child)
 
     def _on_return(self, code, offset, retval):
-        if not self._in_scope(code.co_filename) or self._skip(code):
+        if not self._in_scope(code.co_filename):
+            if self.boundaries is None or self._skip(code):
+                return sys.monitoring.DISABLE
+            self.boundaries.close(id(sys._getframe(1)), retval)
+            return
+        if self._skip(code):
             return sys.monitoring.DISABLE
         frame = sys._getframe(1)
         timing = self._finish_timing(frame, perf_counter_ns())
@@ -754,7 +791,11 @@ class Recorder:
             _stack.set(_stack.get() + (entry,))
 
     def _on_unwind(self, code, offset, exc):
-        if not self._in_scope(code.co_filename) or self._skip(code):
+        if not self._in_scope(code.co_filename):
+            if self.boundaries is not None and not self._skip(code):
+                self.boundaries.close(id(sys._getframe(1)), exc, raised=True)
+            return
+        if self._skip(code):
             return
         frame = sys._getframe(1)
         timing = self._finish_timing(frame, perf_counter_ns())
@@ -805,6 +846,10 @@ class Recorder:
             raise RuntimeError(unsupported)
         if self.deep_functions and self.call_stream is None:
             raise RuntimeError("deep capture requires SQLite trace storage")
+        if self.boundary_modules:
+            if self.call_stream is None or self.call_stream.boundaries is None:
+                raise RuntimeError("boundary capture requires SQLite trace storage")
+            self.boundaries = self.call_stream.boundaries
         mon = sys.monitoring
         tool_id = self._claim_tool_id()
         self._tool_id = tool_id

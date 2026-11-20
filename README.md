@@ -106,6 +106,35 @@ statuses. The run and each listed frame report observed and retained counts.
 run. Copy a frame address from its listing and use `--run-id` to pin a run,
 `--offset` and `--limit` to page, and `--json` for structured output.
 
+To save direct calls from project code into selected Python library modules,
+set `max_boundary_bytes` and `max_trace_bytes` explicitly in
+`[tool.ldr.storage]`. The boundary allowance is shared across workers and
+counts toward the trace budget. Use `--boundary` once per module or package.
+
+```sh
+ldr run app.py --boundary urllib.parse --boundary json
+ldr show --boundaries
+ldr show --boundaries --run-id RUN_ID --json
+```
+
+Each saved call includes the project call site, redacted bound arguments,
+and the return value or exception type. A module-level site uses the file
+and line as its address. Library internals and native calls such as
+`sqlite3.Connection.execute` are outside this capture mode. The run reports
+how many calls were observed, saved, and still unfinished.
+
+Each run also saves its environment: the Python and platform versions, the
+installed package versions, and the names of environment variables. Variable
+values are never recorded. When you compare against a baseline, the output
+states that the environment is the same or lists what changed, so a
+dependency bump is not mistaken for a code change. An environment change
+alone does not make `--fail-on-change` exit with code 3.
+
+```sh
+ldr show --environment
+ldr show --environment --run-id RUN_ID --json
+```
+
 Frame inspection and the JSON frame index show elapsed, own, traced child,
 and suspended wall time. Own time includes blocking or library work that
 LDR did not trace. The measurements include tracing overhead. A frame still
