@@ -133,7 +133,11 @@ class Recorder:
         self._test_code = None
         self._registered_events: list[int] = []
 
-    _NOISE = ("<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>", "<lambda>", "<module>")
+    # Only module frames are skipped. List, dict and set comprehensions are
+    # inlined into their parent on Python 3.12+ and have no frame. Generator
+    # expressions and lambdas are recorded as calls and folded in the default view.
+    _NOISE = ("<module>",)
+    _FOLDED = ("<genexpr>", "<lambda>")
 
     def _skip(self, code) -> bool:
         return code.co_name in self._NOISE or not (code.co_flags & inspect.CO_OPTIMIZED)
@@ -948,7 +952,19 @@ class Recorder:
             raise
         self._active = True
 
+    def _fold(self, nodes: list[Node]) -> list[Node]:
+        """Replace generator-expression and lambda calls by their children."""
+        result: list[Node] = []
+        for node in nodes:
+            node.children = self._fold(node.children)
+            if node.name.rsplit(".", 1)[-1] in self._FOLDED:
+                result.extend(node.children)
+            else:
+                result.append(node)
+        return result
+
     def finalize(self, success: bool, escaped_exception: BaseException | None = None) -> None:
+        self.roots = self._fold(self.roots)
         if success:
             for root in self.roots:
                 _mark_handled(root)
