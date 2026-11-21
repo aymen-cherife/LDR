@@ -112,6 +112,8 @@ class Recorder:
         self.frame_prefix = ""
         self.call_stream = None
         self._immutable_inputs = {}
+        # Per live recorded call: (frame, receiver object or None, receiver not re-read).
+        self._receivers: dict[int, tuple[object, object, bool]] = {}
         self.deep_functions = frozenset(deep_functions or ())
         self.boundary_modules = tuple(boundary_modules or ())
         self.boundaries = None
@@ -261,8 +263,23 @@ class Recorder:
         reusable = {}
         saved = self._immutable_inputs.pop(id(frame), None)
         saved_policy, saved_values = saved if saved is not None else (None, {})
+        # A receiver that is the same object as the calling call's receiver is read by
+        # that call (at its entry and exit), not again here. The first parameter only.
+        receiver = code.co_varnames[0] if code.co_argcount and code.co_varnames[0] in _RECEIVERS else None
+        skipped = None
+        if remember:
+            held = locals_.get(receiver) if receiver is not None else None
+            skipped = receiver is not None and held is not None and held is self._caller_receiver(frame)
+            self._receivers[id(frame)] = (frame, held, skipped)
+            if skipped:
+                self.call_stream.receivers_shared += 1
+        elif receiver is not None:
+            known = self._receivers.pop(id(frame), None)
+            skipped = known is not None and known[0] is frame and known[2]
         for name in self._argument_names(code):
             if name not in locals_:
+                continue
+            if skipped and name == receiver:
                 continue
             value = locals_[name]
             previous = saved_values.get(name)
@@ -287,6 +304,18 @@ class Recorder:
             self._immutable_inputs[id(frame)] = (policy, reusable)
         self._charge(code, walked)
         return result
+
+    def _caller_receiver(self, frame):
+        """The receiver of the nearest recorded call that is running this one, or None."""
+        caller = frame.f_back
+        for _ in range(64):
+            if caller is None:
+                return None
+            known = self._receivers.get(id(caller))
+            if known is not None and known[0] is caller:
+                return known[1]
+            caller = caller.f_back
+        return None
 
     def _charge(self, code, walked_before: int) -> None:
         """Record the fingerprint work done since ``walked_before`` against this function."""
@@ -793,6 +822,7 @@ class Recorder:
         matched = self._matching_stack(frame)
         if matched is None:
             self._immutable_inputs.pop(id(frame), None)
+            self._receivers.pop(id(frame), None)
             return
         parent_stack, entry = matched
         node_retained = isinstance(entry, Node)
@@ -1096,3 +1126,4 @@ class Recorder:
         self.suspended.clear()
         self._timings.clear()
         self._immutable_inputs.clear()
+        self._receivers.clear()

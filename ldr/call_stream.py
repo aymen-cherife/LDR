@@ -47,6 +47,7 @@ class CallStream:
         self.next_ordinal = 0
         self.completed = 0
         self.uncomparable = 0
+        self.receivers_shared = 0
         self.pending = []
         self.pending_fp = []
         self.pending_bytes = 0
@@ -415,7 +416,11 @@ class CallStream:
                 "unfinished": len(self.active),
                 "uncomparable": self.uncomparable,
                 "write_failed": self.write_failed,
-                "fingerprint": {"tmp_normalized": STATS.tmp_normalized, "cost": dict(self.cost)},
+                "fingerprint": {
+                    "tmp_normalized": STATS.tmp_normalized,
+                    "receivers_shared": self.receivers_shared,
+                    "cost": dict(self.cost),
+                },
             }
             if self.store.max_deep_bytes:
                 summary["deep"] = {

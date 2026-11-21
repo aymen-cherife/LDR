@@ -469,14 +469,17 @@ def _fingerprint_status(summaries: list[dict]) -> dict[str, Any]:
     """Fingerprint work per function, largest first, and the normalization count."""
     cost: dict[str, int] = {}
     normalized = 0
+    shared = 0
     for summary in summaries:
         details = summary.get("fingerprint") or {}
         normalized += details.get("tmp_normalized", 0)
+        shared += details.get("receivers_shared", 0)
         for function, nodes in details.get("cost", {}).items():
             cost[function] = cost.get(function, 0) + nodes
     ranked = sorted(cost.items(), key=lambda item: (-item[1], item[0]))[:10]
     return {
         "tmp_normalized": normalized,
+        "receivers_shared": shared,
         "cost": [{"function": function, "nodes": nodes} for function, nodes in ranked],
     }
 
@@ -1257,6 +1260,12 @@ def main(argv=None) -> int:
                     "Calls that differ keep full detail.\n"
                 )
         if fingerprint_status := status.get("fingerprint"):
+            if fingerprint_status["receivers_shared"]:
+                redaction_note += (
+                    f"FINGERPRINTS: {fingerprint_status['receivers_shared']} call(s) share their "
+                    "receiver (self/cls) with the call that made them; it is read by that call, "
+                    "so a change to it is located one level up.\n"
+                )
             if fingerprint_status["tmp_normalized"]:
                 redaction_note += (
                     f"FINGERPRINTS: {fingerprint_status['tmp_normalized']} path(s) under the temp "
