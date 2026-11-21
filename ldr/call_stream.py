@@ -424,6 +424,7 @@ class CallStream:
                 "unfinished": len(self.active),
                 "uncomparable": self.uncomparable,
                 "write_failed": self.write_failed,
+                "calls": dict(sorted(self.counts.items(), key=lambda item: (-item[1], item[0]))[:50]),
                 "fingerprint": {
                     "tmp_normalized": STATS.tmp_normalized,
                     "receivers_shared": self.receivers_shared,

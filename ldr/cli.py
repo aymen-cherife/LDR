@@ -21,7 +21,7 @@ from typing import Any
 
 from . import __version__
 from . import environment as run_environment
-from . import rerun as rerun_detail, reproduce
+from . import rerun as rerun_detail, reproduce, slowdown as slowdown_report
 from .interpreter import CHILD_MARKER, RUNNING, SELECTED_BY, run_in_child
 from .sink import ENV as SINK_ENV, RemoteStore, sink_from_environment
 from .diff import (
@@ -522,6 +522,43 @@ def _mode_label(args) -> str:
     return "; ".join(parts) or "default"
 
 
+def _record_baseline(args, ldr_dir: str, key: str) -> int:
+    """Run the target once with no recording and keep the time (rule 16)."""
+    code = 0
+    started = time.perf_counter()
+    try:
+        if args.mode == "run":
+            sys.argv = [args.target] + args.rest
+            runpy.run_path(args.target, run_name="__main__")
+        elif args.mode == "module":
+            sys.argv = [args.target] + args.rest
+            runpy.run_module(args.target, run_name="__main__", alter_sys=True)
+        else:
+            import pytest
+
+            code = int(pytest.main([args.target, *args.rest, "-q", "-p", "no:cacheprovider"]))
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    seconds = time.perf_counter() - started
+    files: dict[str, str] = {}
+    try:
+        with open(os.path.join(ldr_dir, "last.json"), encoding="utf-8") as handle:
+            previous = json.load(handle).get("status", {})
+        if previous.get("invocation_key") == key:
+            files = previous.get("files", {})
+    except (OSError, ValueError):
+        pass
+    slowdown_report.write_baseline(
+        ldr_dir, key,
+        {"seconds": seconds, "files": files, "python": platform.python_version(), "exit_code": code},
+    )
+    note = "" if files else (
+        " It has no file hashes (no traced run of this command was found), so it cannot be checked for staleness."
+    )
+    print(f"BASELINE: {seconds:.2f}s untraced (exit {code}).{note}")
+    return code
+
+
 def _quietly(action) -> None:
     try:
         action()
@@ -759,7 +796,7 @@ def _frame_index(roots: list[Node], limit: int = 5000) -> dict[str, Any]:
     }
 
 
-def _limit_text(text: str, max_lines: int, max_chars: int = 40_000) -> str:
+def _limit_text(text: str, max_lines: int, max_chars: int = 30_000) -> str:
     lines = text.splitlines()
     if len(lines) > max_lines:
         head = max(5, (max_lines * 2) // 3)
@@ -1067,6 +1104,10 @@ def main(argv=None) -> int:
     parser.add_argument("--diff", action="store_true", help="compare against this invocation's snapshot")
     parser.add_argument("--snapshot-name", help="explicit snapshot key")
     parser.add_argument("--learn-volatility", action="store_true", help="run twice and mask changing fields")
+    parser.add_argument(
+        "--baseline", action="store_true",
+        help="run the target once without recording and keep its time, to state the slowdown of later runs",
+    )
     parser.add_argument("--fail-on-change", action="store_true")
     parser.add_argument("--color", action="store_true")
     parser.add_argument("--no-prune", action="store_true", help="disable trace pruning of the printed report")
@@ -1205,6 +1246,10 @@ def main(argv=None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     golden_path = snapshot_path(ldr_dir, key)
+    if args.baseline:
+        if args.golden or args.diff or args.learn_volatility or requested_mode not in {"run", "pytest", "module"}:
+            parser.error("--baseline only runs the target once, without recording: use it alone with run, pytest or module")
+        return _record_baseline(args, ldr_dir, key)
     if requested_mode == "verify" and not args.golden and not args.diff:
         args.diff = os.path.exists(golden_path)
         args.golden = not args.diff
@@ -1382,6 +1427,24 @@ def main(argv=None) -> int:
             status["call_stream"]["first_calls"] = store.first_calls
             status["call_stream"]["last_calls"] = store.last_calls
             status["fingerprint"] = _fingerprint_status(stream_summaries)
+            status["invocation_key"] = key
+            executed = slowdown_report.file_hashes(recorder.executed_files())
+            status["files"] = executed
+            seconds = status["timing"]["execution_seconds"]
+            status["slowdown"] = slowdown_report.slowdown(
+                seconds, slowdown_report.read_baselines(ldr_dir).get(key), executed,
+                status["fingerprint"]["cost"],
+            )
+            calls: dict[str, int] = {}
+            for summary in stream_summaries:
+                for function, count in summary.get("calls", {}).items():
+                    calls[function] = calls.get(function, 0) + count
+            costs = {
+                function: nodes for summary in stream_summaries
+                for function, nodes in (summary.get("fingerprint") or {}).get("cost", {}).items()
+            }
+            status["hot_functions"] = slowdown_report.hot_functions(calls, costs, seconds)
+            status["hot_functions_of"] = status["call_stream"]["started"]
             references = [item["reference"] for item in stream_summaries if "reference" in item]
             if references:
                 status["reference"] = _reference_status(references)
@@ -1465,6 +1528,10 @@ def main(argv=None) -> int:
                     f"{'not counted' if missing is None else missing} missing. "
                     "Calls that differ keep full detail.\n"
                 )
+        if "slowdown" in status:
+            redaction_note += slowdown_report.render_slowdown(status["slowdown"])
+        if status.get("hot_functions"):
+            redaction_note += slowdown_report.render_hot(status["hot_functions"], status["hot_functions_of"])
         if repro := status.get("reproducibility"):
             if "error" not in repro:
                 redaction_note += _reproducibility_line(repro)

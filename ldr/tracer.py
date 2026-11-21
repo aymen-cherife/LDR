@@ -181,6 +181,13 @@ class Recorder:
         self._scope_cache[filename] = False
         return False
 
+    def executed_files(self) -> list[tuple[str, str]]:
+        """(shown path, path) of each project file that ran, for the baseline's file hashes."""
+        return sorted(
+            (self._display_path(name), name)
+            for name, inside in self._scope_cache.items() if inside and os.path.isfile(name)
+        )
+
     def _display_path(self, filename: str) -> str:
         cached = self._display_cache.get(filename)
         if cached is not None:
