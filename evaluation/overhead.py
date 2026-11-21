@@ -104,6 +104,10 @@ def unpack(work: Path, python: str, name: str, version: str, github: str | None 
         archive = next(download.glob(f"{name.lower()}-{version}.tar.gz"))
     with tarfile.open(archive) as source:
         source.extractall(work / "src", filter="data")
+    # Archives keep the authors' file times. Some temporary-directory cleanups remove files
+    # by age, which deleted every source file of an unpacked fixture once; touch them.
+    for path in root.rglob("*"):
+        os.utime(path)
     return root
 
 
@@ -174,13 +178,34 @@ def measure(name, fixture, rounds, env):
     }
 
 
+def _calls(database: Path) -> dict:
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
+        run = connection.execute("SELECT id FROM runs ORDER BY started_ns DESC LIMIT 1").fetchone()[0]
+        return {
+            frame_id: (function, bytes(signature))
+            for frame_id, function, signature in connection.execute(
+                "SELECT frame_id, function, signature FROM call_records WHERE run_id = ?", (run,)
+            )
+        }
+
+
 def noise(name, fixture, env):
-    """Run the same code twice under LDR and count the stored tables or answers that differ."""
+    """Run the same code twice under LDR and count what differs, and in which functions.
+
+    The code itself can be nondeterministic (an id-based __hash__, an unseeded random
+    generator); LDR then records that faithfully, so the differing calls are listed by
+    function for the reader to judge. A fixture with a deterministic program gives 0.
+    """
+    from collections import Counter
+
     root, _, traced = fixture
     # LDR picks a random hash seed when none is set (Phase 2 rule 6), which reorders sets
     # between two runs of the same code. The check pins it, as a user could.
     env = dict(env, PYTHONHASHSEED="0")
-    dumps = []
+    dumps, calls = [], []
     for _ in range(2):
         clean(root)
         timed(traced, root, env)
@@ -189,8 +214,20 @@ def noise(name, fixture, env):
             capture_output=True, text=True, check=True,
         )
         dumps.append(json.loads(result.stdout))
+        calls.append(_calls(root / ".ldr" / "traces.sqlite3"))
     different = [key for key in sorted(set(dumps[0]) | set(dumps[1])) if dumps[0].get(key) != dumps[1].get(key)]
-    return {"fixture": name, "differences": len(different), "which": different}
+    first, second = calls
+    changed = [key for key in first if key in second and first[key] != second[key]]
+    causes = Counter(first[key][0] for key in changed)
+    return {
+        "fixture": name,
+        "differences": len(different),
+        "which": different,
+        "calls": len(first),
+        "calls_only_in_one_run": len(first.keys() ^ second.keys()),
+        "calls_differing": len(changed),
+        "top_functions": causes.most_common(3),
+    }
 
 
 def main() -> int:
@@ -214,7 +251,12 @@ def main() -> int:
         item = results[-1]
         if not args.json:
             if args.noise:
-                print(f"{item['fixture']:8s} A/A differences: {item['differences']} {item['which']}", flush=True)
+                print(
+                    f"{item['fixture']:8s} A/A: {item['calls_differing']} of {item['calls']} calls differ, "
+                    f"{item['calls_only_in_one_run']} only in one run; tables {item['which']}; "
+                    f"top functions {item['top_functions']}",
+                    flush=True,
+                )
             else:
                 print(
                     f"{item['fixture']:8s} plain {item['plain_median_s']:6.2f}s  "
