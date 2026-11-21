@@ -64,7 +64,7 @@ RICH_TESTS = [
 
 
 def environment(ldr: Path, root: Path | None = None) -> dict[str, str]:
-    path = [str(ldr)]
+    path = [str(ldr), str(REPO / "evaluation")]  # evaluation: bench_plugin.py
     if root is not None and (root / "src").is_dir():
         path.append(str(root / "src"))
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(path))
@@ -118,7 +118,7 @@ def pytest_fixture(work, name, version, paths, passthrough, github=None, package
 def build(work: Path, name: str):
     if name == "attrs":
         paths = [f"tests/{test}" for test in ATTRS_TESTS]
-        return pytest_fixture(work, "attrs", "26.1.0", paths, ["--hypothesis-seed=0"])
+        return pytest_fixture(work, "attrs", "26.1.0", paths, ["--hypothesis-seed=0", "-p", "bench_plugin"])
     if name == "flask":
         skip = [arg for item in FLASK_SKIP for arg in ("--deselect", item)]
         return pytest_fixture(work, "Flask", "3.1.3", ["tests"], skip)
