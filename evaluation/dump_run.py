@@ -21,6 +21,7 @@ TIMING = {
     "elapsed_ms", "own_ms", "children_ms", "suspended_ms", "timing", "ms", "execution_seconds",
     "run_id", "started_ns", "postprocess_seconds", "total_seconds", "seconds", "cost_ms",
     "total_ms", "baseline_run", "reference_run",
+    "per_second", "factor", "traced_seconds", "untraced_seconds",  # rates and ratios
 }
 TABLES = {
     # table: (columns hashed, order by)
