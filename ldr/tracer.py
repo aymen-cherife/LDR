@@ -146,6 +146,9 @@ class Recorder:
         self._test_root = ""
         self._test_code = None
         self._registered_events: list[int] = []
+        # Code outside the project that boundary capture wants events from, by code
+        # object. Everything else outside the project is switched off for the run.
+        self._boundary_code: dict[object, bool] = {}
 
     # Only module frames are skipped. List, dict and set comprehensions are
     # inlined into their parent on Python 3.12+ and have no frame. Generator
@@ -526,7 +529,8 @@ class Recorder:
             return  # LDR's own sending thread is never recorded
         mon = sys.monitoring
         if not self._in_scope(code.co_filename):
-            if self.boundaries is None or self._skip(code):
+            if self._skip(code) or not self._boundary_wanted(code):
+                # Not recorded: switched off at its first event, for the whole run.
                 return mon.DISABLE
             self._start_boundary(code, sys._getframe(1))
             # This code can be called directly from the project on another invocation.
@@ -604,15 +608,27 @@ class Recorder:
         self._start_capture(code, frame, frame_id, at, entry if isinstance(entry, Node) else None)
         _stack.set(stack + (entry,))
 
+    def _boundary_wanted(self, code) -> bool:
+        """Whether boundary capture records calls into this code outside the project.
+
+        Decided once per code object from its module, never from who called it, so
+        a switched-off function cannot be one the project calls on another run.
+        """
+        if self.boundaries is None:
+            return False
+        wanted = self._boundary_code.get(code)
+        if wanted is None:
+            module = sys._getframe(2).f_globals.get("__name__")
+            wanted = type(module) is str and any(
+                module == selected or module.startswith(selected + ".")
+                for selected in self.boundary_modules
+            )
+            self._boundary_code[code] = wanted
+        return wanted
+
     def _start_boundary(self, code, frame):
         caller = frame.f_back
         if caller is None or not self._in_scope(caller.f_code.co_filename):
-            return
-        module = frame.f_globals.get("__name__")
-        if type(module) is not str or not any(
-            module == selected or module.startswith(selected + ".")
-            for selected in self.boundary_modules
-        ):
             return
         address = self.call_stream.frame_address(caller)
         source = self._display_path(caller.f_code.co_filename)
@@ -847,7 +863,7 @@ class Recorder:
 
     def _on_return(self, code, offset, retval):
         if not self._in_scope(code.co_filename):
-            if self.boundaries is None or self._skip(code):
+            if self._skip(code) or not self._boundary_wanted(code):
                 return sys.monitoring.DISABLE
             self.boundaries.close(id(sys._getframe(1)), retval)
             return
@@ -870,7 +886,7 @@ class Recorder:
 
     def _on_yield(self, code, offset, retval):
         if not self._in_scope(code.co_filename) or self._skip(code):
-            return sys.monitoring.DISABLE
+            return sys.monitoring.DISABLE  # boundary capture does not follow yields
         try:
             frame = sys._getframe(1)
         except Exception:
@@ -887,13 +903,17 @@ class Recorder:
         self.suspended[id(frame)] = entry
         _stack.set(parent_stack)
 
-    def _on_resume(self, code, offset, _exception=None):
+    def _on_resume(self, code, offset):
         if not self._in_scope(code.co_filename) or self._skip(code):
-            return
-        try:
-            frame = sys._getframe(1)
-        except Exception:
-            return
+            return sys.monitoring.DISABLE
+        self._resumed(code, sys._getframe(1))
+
+    def _on_throw(self, code, offset, _exception):
+        # PY_THROW cannot be switched off per code object.
+        if self._in_scope(code.co_filename) and not self._skip(code):
+            self._resumed(code, sys._getframe(1))
+
+    def _resumed(self, code, frame):
         fid = id(frame)
         if code in self._deep_codes:
             self.call_stream.resume_deep(frame)
@@ -906,7 +926,8 @@ class Recorder:
 
     def _on_unwind(self, code, offset, exc):
         if not self._in_scope(code.co_filename):
-            if self.boundaries is not None and not self._skip(code):
+            # PY_UNWIND cannot be switched off per code object.
+            if self.boundaries is not None and self._boundary_code.get(code):
                 self.boundaries.close(id(sys._getframe(1)), exc, raised=True)
             return
         if self._skip(code):
@@ -973,7 +994,7 @@ class Recorder:
             events.PY_RETURN: self._on_return,
             events.PY_YIELD: self._on_yield,
             events.PY_RESUME: self._on_resume,
-            events.PY_THROW: self._on_resume,
+            events.PY_THROW: self._on_throw,
             events.PY_UNWIND: self._on_unwind,
             events.RAISE: self._on_raise,
         }
