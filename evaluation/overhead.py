@@ -8,7 +8,7 @@ into this repository):
 
     attrs    attrs 26.1.0 (MIT), a subset of its own tests     small-call library
     flask    Flask 3.1.3 (BSD-3), its own tests                framework
-    rich     rich 15.0.0 (MIT, GitHub tag; the sdist has no tests)   object-heavy
+    rich     rich 15.0.0 (MIT, GitHub tag; the sdist has no tests), 9 test files   object-heavy
     toolz    toolz 1.0.0 (BSD-3), its own tests                extreme: many tiny calls
     orders   tests/fixtures/order_workflow with 20,000 orders  extreme: worst case
 
@@ -53,12 +53,13 @@ ATTRS_TESTS = [
 FLASK_SKIP = [
     "tests/test_cli.py::test_get_version", "tests/test_reqctx.py::test_bad_environ_raises_bad_request",
 ]
-RICH_SKIP = [
-    "tests/test_card.py::test_card_render", "tests/test_markdown.py::test_inline_code_in_table_cells",
-    "tests/test_syntax.py::test_python_render", "tests/test_syntax.py::test_python_render_simple",
-    "tests/test_syntax.py::test_python_render_simple_passing_lexer_instance",
-    "tests/test_syntax.py::test_python_render_indent_guides", "tests/test_syntax.py::test_option_no_wrap",
-    "tests/test_syntax.py::test_syntax_highlight_ranges",
+# The whole rich suite is not usable here: LDR had recorded 409,000 calls after 30 minutes
+# (plain: 13 s), because rich calls pass large Console and theme objects around and nothing
+# caps the fingerprint walk. This subset keeps the cheap files, the pathological test_table
+# and test_columns, and object-heavy test_console and test_pretty.
+RICH_TESTS = [
+    "test_text", "test_segment", "test_style", "test_markup", "test_table", "test_tree",
+    "test_columns", "test_console", "test_pretty",
 ]
 
 
@@ -122,8 +123,8 @@ def build(work: Path, name: str):
         skip = [arg for item in FLASK_SKIP for arg in ("--deselect", item)]
         return pytest_fixture(work, "Flask", "3.1.3", ["tests"], skip)
     if name == "rich":
-        skip = [arg for item in RICH_SKIP for arg in ("--deselect", item)]
-        return pytest_fixture(work, "rich", "15.0.0", ["tests"], skip, github=RICH_TAG)
+        paths = [f"tests/{test}.py" for test in RICH_TESTS]
+        return pytest_fixture(work, "rich", "15.0.0", paths, [], github=RICH_TAG)
     if name == "toolz":
         return pytest_fixture(work, "toolz", "1.0.0", ["toolz/tests"], [])
     root = work / "orders"
