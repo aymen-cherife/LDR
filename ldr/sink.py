@@ -141,6 +141,8 @@ class Sink:
                 store.finish_stream(worker, summary)
             elif kind == "environment":
                 store.save_environment(message[1])
+            elif kind == "section":
+                store.save_section(message[1], message[2])
             elif kind == "worker":
                 _, worker, rows, summary = message
                 store.save_worker_rows(worker, rows, summary)
@@ -285,6 +287,9 @@ class RemoteStore(TraceStore):
 
     def save_environment(self, record):
         self._send(("environment", record))
+
+    def save_section(self, name, text):
+        self._send(("section", name, text))
 
     def save_worker(self, worker, roots, summary):
         self._send(("worker", worker, list(_call_rows(roots)), summary))

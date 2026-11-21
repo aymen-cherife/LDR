@@ -50,6 +50,7 @@ from .store import (
 from .suggest import rank_inspections
 from .call_stream import CallStream
 from .sqlite_store import TraceStore, storage_settings
+from .summary import summarize
 from .tracer import Recorder, python_version_message
 from .value_capture import first_difference
 
@@ -397,7 +398,7 @@ def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
         parser.error(f"--frame-id requires a readable {result_path}: {exc}")
     frame = next(
         (
-            item for item in payload.get("frame_index", {}).get("frames", [])
+            item for item in (_whole_section(payload, "frame_index", ldr_dir) or {}).get("frames", [])
             if item.get("id") == args.frame_id
         ),
         None,
@@ -406,7 +407,7 @@ def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
         parser.error(f"frame id {args.frame_id} is not present in {result_path}")
     suggestion = next(
         (
-            item for item in payload.get("suggestions", [])
+            item for item in (_whole_section(payload, "suggestions", ldr_dir) or [])
             if item.get("id") == args.frame_id
         ),
         None,
@@ -695,13 +696,42 @@ def _redaction_note(count: int) -> str:
     return f"REDACTED: {count} value(s) redacted, not compared.\n"
 
 
-def _write_result(text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR) -> tuple[str, str]:
+def _write_result(
+    text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR, store: Any = None
+) -> tuple[str, str]:
+    """Write last.txt and the short last.json; what does not fit goes whole to SQLite."""
     os.makedirs(ldr_dir, exist_ok=True)
     text_path = os.path.join(ldr_dir, "last.txt")
     json_path = os.path.join(ldr_dir, "last.json")
+    short, sections = summarize(payload)
+    if sections:
+        stored = False
+        if store is not None:
+            try:
+                for name, section in sections.items():
+                    store.save_section(name, json.dumps(section, separators=(",", ":"), default=str))
+                stored = True
+            except (OSError, sqlite3.Error):
+                pass
+        short["summary"]["whole_in"]["stored"] = stored
+        if not stored:
+            short["summary"]["whole_in"]["note"] = "the whole parts could not be stored for this run"
     atomic_text(text_path, text)
-    atomic_json(json_path, payload)
+    atomic_json(json_path, short)
     return text_path, json_path
+
+
+def _whole_section(payload: dict[str, Any], name: str, ldr_dir: str):
+    """A part of the saved result in full: from SQLite when last.json holds only a cut of it."""
+    whole = (payload.get("summary") or {}).get("whole_in") or {}
+    if name in whole.get("names", ()) and whole.get("run_id"):
+        try:
+            section = TraceStore.read_section(ldr_dir, whole["run_id"], name)
+        except (OSError, sqlite3.Error):
+            section = None
+        if section is not None:
+            return section
+    return payload.get(name)
 
 
 def _print_result(text: str) -> None:
@@ -1374,7 +1404,7 @@ def main(argv=None) -> int:
             "findings": [],
             "failures": _failure_payload(recorder.roots),
         }
-        text_path, json_path = _write_result(text, payload, ldr_dir)
+        text_path, json_path = _write_result(text, payload, ldr_dir, store)
         _print_result(text)
         print(
             f"\n[ldr] agent result: {os.path.relpath(json_path, initial_cwd)}; "
@@ -1582,7 +1612,7 @@ def main(argv=None) -> int:
             "findings": [],
             "failures": _failure_payload(recorder.roots),
         }
-        _write_result(text, payload, ldr_dir)
+        _write_result(text, payload, ldr_dir, store)
         print(text, file=sys.stderr)
         return 2
 
@@ -1653,7 +1683,7 @@ def main(argv=None) -> int:
         "findings": findings or _finding_payload(changes),
         "failures": _failure_payload(recorder.roots),
     }
-    text_path, json_path = _write_result(text, payload, ldr_dir)
+    text_path, json_path = _write_result(text, payload, ldr_dir, store)
     _print_result(text)
     print(
         f"\n[ldr] agent result: {os.path.relpath(json_path, initial_cwd)}; "

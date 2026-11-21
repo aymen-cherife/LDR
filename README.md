@@ -36,7 +36,11 @@ ordered local-state transitions only for that invocation.
 
 LDR preserves the test runner's exit status and writes:
 
-- `.ldr/last.json` — structured output for agents and tooling
+- `.ldr/last.json` — a short summary for agents and tooling, always under 30,000
+  characters. When a part of the result is too long (many frames, findings or
+  suggestions) it keeps the first entries and a `summary` block says which parts
+  were cut and how many entries each had. The whole parts are in
+  `.ldr/traces.sqlite3`, table `run_sections`, under the run's `status.run_id`.
 - `.ldr/last.txt` — a compact human-readable trace
 - `.ldr/traces.sqlite3` — recorded call history keyed by `status.run_id` in the JSON result
 

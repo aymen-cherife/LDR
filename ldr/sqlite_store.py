@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS stream_boundaries (
 CREATE TABLE IF NOT EXISTS run_environment (
     run_id TEXT PRIMARY KEY REFERENCES runs(id), payload TEXT NOT NULL
 );
+-- Parts of a run's result that did not fit in the short .ldr/last.json, whole.
+CREATE TABLE IF NOT EXISTS run_sections (
+    run_id TEXT NOT NULL REFERENCES runs(id), name TEXT NOT NULL, payload TEXT NOT NULL,
+    PRIMARY KEY (run_id, name)
+) WITHOUT ROWID;
 """
 VALUE_FIELDS = ("in", "out", "in_fp", "out_fp", "input_changes")
 
@@ -501,6 +506,9 @@ class TraceStore:
         keeping the indexes current on every batch while the program runs.
         """
         with closing(self._connect()) as connection, connection:
+            # The two sorts and the index pages stay in memory instead of temporary files.
+            connection.execute("PRAGMA temp_store = MEMORY")
+            connection.execute("PRAGMA cache_size = -131072")
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "INSERT INTO call_records SELECT * FROM call_records_stage "
@@ -604,6 +612,26 @@ class TraceStore:
                 "INSERT OR REPLACE INTO run_environment VALUES (?, ?)",
                 (self.run_id, _json(record)),
             )
+
+    def save_section(self, name, text):
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO run_sections VALUES (?, ?, ?)", (self.run_id, name, text)
+            )
+
+    @staticmethod
+    def read_section(directory, run_id, name):
+        """One stored part of a run's result, or None. Read-only."""
+        path = Path(directory, "traces.sqlite3").resolve().as_uri()
+        with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as connection:
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_sections'"
+            ).fetchone() is None:
+                return None
+            row = connection.execute(
+                "SELECT payload FROM run_sections WHERE run_id = ? AND name = ?", (run_id, name)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
 
     def load_environment(self, run_id):
         """One run's environment record, or None when it was not saved."""

@@ -13,7 +13,9 @@ Run a bounded evidence pass:
 ldr pytest tests/test_feature.py::test_case
 ```
 
-Read `.ldr/last.json`. Prioritize `failures`, `recent_calls`, and
+Read `.ldr/last.json`. It is a short summary: if it has a `summary` block, some lists
+are cut to their first entries and `summary.cut` gives each part's shown and total
+counts (the whole parts are in `.ldr/traces.sqlite3`, table `run_sections`). Prioritize `failures`, `recent_calls`, and
 `suggestions`; treat a test assertion as the symptom unless application state
 proves otherwise. A suggestion is an inspection target, not a claimed defect.
 Check its `evidence` fields and form a runtime hypothesis before editing source.
