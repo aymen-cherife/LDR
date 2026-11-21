@@ -48,7 +48,7 @@ from .store import (
     snapshot_path,
 )
 from .suggest import rank_inspections
-from .call_stream import CallStream, changed_functions
+from .call_stream import CallStream
 from .sqlite_store import TraceStore, storage_settings
 from .tracer import Recorder, python_version_message
 from .value_capture import first_difference
@@ -1477,9 +1477,12 @@ def main(argv=None) -> int:
                             if not stream_status["unfinished"] and not stream_status["write_failed"]:
                                 stream_changes = reference["changed"]
                         else:
-                            baseline_stream = store.read_stream(baseline_status["run_id"])
-                            if len(baseline_stream) == baseline_status["call_stream"]["expected_workers"]:
-                                stream_changes = changed_functions(baseline_stream, stream_summaries)
+                            # Older snapshots kept one digest per function instead of one
+                            # record per call; there is nothing to compare call by call.
+                            scope_warnings.append(
+                                "The snapshot's call stream was recorded by an older LDR; "
+                                "re-run needed: record it again with --golden, then compare."
+                            )
                     except sqlite3.Error:
                         scope_warnings.append("Could not read baseline call stream fingerprints.")
                 snapshot_action = "compared"

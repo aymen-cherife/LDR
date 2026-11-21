@@ -46,7 +46,7 @@ class CallStream:
         self.active = {}
         self.next_ordinal = 0
         self.completed = 0
-        self.functions = {}
+        self.uncomparable = 0
         self.pending = []
         self.pending_fp = []
         self.pending_bytes = 0
@@ -237,15 +237,7 @@ class CallStream:
                 is_digest(token) and not token.endswith(PARTIAL_MARK)
                 for token in tokens
             )
-            digest, count, unknown = self.functions.get(function, (None, 0, 0))
-            if digest is None:
-                digest = blake2b(digest_size=32)
-            signature = _encode(
-                (inputs, exit_inputs, output, error.split(":", 1)[0] if error else None)
-            )
-            digest.update(len(signature).to_bytes(8, "big"))
-            digest.update(signature)
-            self.functions[function] = (digest, count + 1, unknown + (not comparable))
+            self.uncomparable += not comparable
 
             parts = [("in", name, token) for name, token in inputs.items()]
             parts.extend(
@@ -421,15 +413,9 @@ class CallStream:
                 "first_calls": self.store.first_calls,
                 "last_calls": self.store.last_calls,
                 "unfinished": len(self.active),
-                "uncomparable": sum(
-                    unknown for _, _, unknown in self.functions.values()
-                ),
+                "uncomparable": self.uncomparable,
                 "write_failed": self.write_failed,
                 "fingerprint": {"tmp_normalized": STATS.tmp_normalized, "cost": dict(self.cost)},
-                "functions": {
-                    key: [digest.hexdigest(), count, unknown]
-                    for key, (digest, count, unknown) in self.functions.items()
-                },
             }
             if self.store.max_deep_bytes:
                 summary["deep"] = {
@@ -459,26 +445,3 @@ class CallStream:
         except (OSError, sqlite3.Error):
             summary["write_failed"] = True
         return summary
-
-
-def changed_functions(old, new):
-    """Compare complete signatures by stable function identity, independent of worker."""
-
-    def groups(summaries):
-        result = {}
-        for summary in summaries:
-            if summary["write_failed"] or summary["unfinished"]:
-                return None
-            for key, (digest, count, unknown) in summary["functions"].items():
-                result.setdefault(key, []).append((digest, count, unknown))
-        return result
-
-    before, after = groups(old), groups(new)
-    if before is None or after is None:
-        return []
-    return [
-        key
-        for key in sorted(before.keys() | after.keys())
-        if not any(item[2] for item in before.get(key, []) + after.get(key, []))
-        and sorted(before.get(key, [])) != sorted(after.get(key, []))
-    ]
