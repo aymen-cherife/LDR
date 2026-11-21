@@ -21,7 +21,7 @@ from typing import Any
 
 from . import __version__
 from . import environment as run_environment
-from . import reproduce
+from . import rerun as rerun_detail, reproduce
 from .interpreter import CHILD_MARKER, RUNNING, SELECTED_BY, run_in_child
 from .sink import ENV as SINK_ENV, RemoteStore, sink_from_environment
 from .diff import (
@@ -486,6 +486,21 @@ def _fingerprint_status(summaries: list[dict]) -> dict[str, Any]:
     }
 
 
+def _environment_differences(store, source_run: str, current: dict | None) -> list[str]:
+    """What differs between the run being repeated and this one (rule 11)."""
+    try:
+        before = store.load_environment(source_run)
+    except (OSError, sqlite3.Error):
+        return []
+    if before is None or current is None:
+        return []
+    return [
+        run_environment.describe_change(change)
+        for change in run_environment.compare(before, current)
+        if change["kind"] in rerun_detail.BLOCKING
+    ]
+
+
 def _quietly(action) -> None:
     try:
         action()
@@ -745,12 +760,12 @@ def _redaction_note(count: int) -> str:
 
 
 def _write_result(
-    text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR, store: Any = None
+    text: str, payload: dict[str, Any], ldr_dir: str = LDR_DIR, store: Any = None, name: str = "last"
 ) -> tuple[str, str]:
     """Write last.txt and the short last.json; what does not fit goes whole to SQLite."""
     os.makedirs(ldr_dir, exist_ok=True)
-    text_path = os.path.join(ldr_dir, "last.txt")
-    json_path = os.path.join(ldr_dir, "last.json")
+    text_path = os.path.join(ldr_dir, f"{name}.txt")
+    json_path = os.path.join(ldr_dir, f"{name}.json")
     short, sections = summarize(payload)
     if sections:
         stored = False
@@ -787,6 +802,21 @@ def _print_result(text: str) -> None:
     if encoding:
         text = text.encode(encoding, errors="backslashreplace").decode(encoding)
     print(text)
+
+
+def _render_call(run_id: str, address: str, detail: dict) -> str:
+    lines = [f"Run {run_id}", f"{address}"]
+    if detail.get("kept"):
+        lines.append("kept because: " + ", ".join(detail["kept"]))
+    if detail.get("detail_at") == "return":
+        lines.append("(read at return; an argument changed by the call is marked)")
+    for name, value in (detail.get("input_preview") or {}).items():
+        lines.append(f"  in  {name} = {value}")
+    if detail.get("error"):
+        lines.append(f"  raised {detail['error']}")
+    elif detail.get("output_preview") is not None:
+        lines.append(f"  returned {detail['output_preview']}")
+    return "\n".join(lines)
 
 
 def _show_saved(argv, ldr_dir):
@@ -830,6 +860,22 @@ def _show_saved(argv, ldr_dir):
             file=sys.stderr,
         )
         return 2
+    if evidence is None and args.frame is not None and not (args.environment or args.boundaries):
+        # Not a deep capture: the call's own detail, if it kept any (rule 9).
+        state, detail = TraceStore.read_call(ldr_dir, run_id, args.frame)
+        if state == "kept":
+            if args.json:
+                print(json.dumps({"run_id": run_id, "call": detail}))
+            else:
+                print(_render_call(run_id, args.frame, detail))
+            return 0
+        if state == "not kept":
+            print(
+                f"Detail was not kept for {args.frame} in run {run_id}. "
+                f"To get it, rerun its test: ldr run --detail {args.frame}",
+                file=sys.stderr,
+            )
+            return 2
     if evidence is None:
         print(f"No saved deep capture for {args.frame} in run {run_id}.", file=sys.stderr)
         return 2
@@ -1022,6 +1068,10 @@ def main(argv=None) -> int:
         "--boundary", action="append", default=[], metavar="MODULE",
         help="save direct calls from the project into a Python module (repeatable)",
     )
+    parser.add_argument(
+        "--detail", metavar="ADDRESS",
+        help="run: rerun the test that contains this call address, to keep its detail",
+    )
     parser.add_argument("--timeout", type=float, default=300)
     args, unknown = parser.parse_known_args(argv)
     args.rest = list(args.rest) + unknown + passthrough
@@ -1057,6 +1107,12 @@ def main(argv=None) -> int:
         if args.target is not None or args.frame is not None or args.rest:
             parser.error("inspect --frame-id does not accept a target, --frame, or arguments")
         _restore_frame_shortcut(args, parser, ldr_dir)
+    elif args.detail:
+        if requested_mode != "run" or args.target is not None or args.rest:
+            parser.error("--detail is used as: ldr run --detail ADDRESS")
+        return rerun_detail.run_detail(
+            args.detail, ldr_dir, lambda child_argv, seed: run_in_child(child_argv, initial_cwd, seed)
+        )
     elif args.target is None:
         parser.error("target is required (or use inspect --frame-id N)")
 
@@ -1122,6 +1178,7 @@ def main(argv=None) -> int:
     if args.learn_volatility and not args.golden:
         parser.error("--learn-volatility is only valid while saving a snapshot")
 
+    rerun_plan = rerun_detail.load_plan(os.environ) if is_child else None
     store = None
     storage_warning = None
     try:
@@ -1137,6 +1194,12 @@ def main(argv=None) -> int:
         args.sink = sink
         if not args.golden and requested_mode != "inspect":
             store.reference_run = _baseline_run(golden_path)
+        if rerun_plan is not None:
+            # A rerun for detail: compare each call of the test with the run it repeats,
+            # and keep every call of the test.
+            store.reference_run = rerun_plan["source_run"]
+            store.reference_prefix = rerun_plan["prefix"]
+            store.full_tests = (rerun_plan["prefix"],)
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
         storage_warning = capture_error(exc)
         if args.deep or args.boundary:
@@ -1161,10 +1224,20 @@ def main(argv=None) -> int:
     except Exception as exc:
         scope_warnings.append(f"Environment record unavailable ({capture_error(exc)}).")
 
+    if rerun_plan is not None and store is not None:
+        differences = _environment_differences(store, rerun_plan["source_run"], environment)
+        if differences:
+            print(
+                f"could not reproduce: the environment differs from run {rerun_plan['source_run']}: "
+                + "; ".join(differences[:5]),
+                file=sys.stderr,
+            )
+            return rerun_detail.ENVIRONMENT_DIFFERS
     numpy_hook = None
     if store is not None:
         numpy_hook = reproduce.install_numpy_hook(
-            lambda state: _quietly(lambda: store.save_rng("numpy-at-import", state))
+            lambda state: _quietly(lambda: store.save_rng("numpy-at-import", state)),
+            rerun_plan.get("numpy") if rerun_plan else None,
         )
 
     def go(recorder):
@@ -1181,6 +1254,8 @@ def main(argv=None) -> int:
             from .pytest_capture import ControllerCapture
 
             pytest_capture = ControllerCapture(recorder, store, recorder_options)
+            if rerun_plan is not None:
+                pytest_capture.rerun_random = rerun_plan["random"]
             code = pytest.main(
                 [args.target, *args.rest, "-q", "-p", "no:cacheprovider", "-p", "ldr.pytest_worker"],
                 plugins=[pytest_capture],
@@ -1225,6 +1300,10 @@ def main(argv=None) -> int:
     status["commit"] = git_state(project_root)
     if environment is not None:
         status["environment"] = run_environment.summarize(environment)
+    if rerun_plan is not None:
+        status["rerun"] = {
+            "of": rerun_plan["source_run"], "test": rerun_plan["node"], "attempt": rerun_plan["attempt"],
+        }
     status["interpreter"] = {
         "path": _home_as_tilde(sys.executable),
         "version": platform.python_version(),
@@ -1748,8 +1827,12 @@ def main(argv=None) -> int:
         "findings": findings or _finding_payload(changes),
         "failures": _failure_payload(recorder.roots),
     }
-    text_path, json_path = _write_result(text, payload, ldr_dir, store)
-    _print_result(text)
+    # A rerun for detail must not replace the result of the run it repeats.
+    text_path, json_path = _write_result(
+        text, payload, ldr_dir, store, "last" if rerun_plan is None else "rerun"
+    )
+    if rerun_plan is None:  # a rerun reports through its own summary
+        _print_result(text)
     print(
         f"\n[ldr] agent result: {os.path.relpath(json_path, initial_cwd)}; "
         f"text: {os.path.relpath(text_path, initial_cwd)}",

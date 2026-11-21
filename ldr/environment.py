@@ -94,10 +94,27 @@ def _platform() -> dict[str, str]:
     return {"system": sys.platform, "release": release, "tag": sysconfig.get_platform()}
 
 
+# Values recorded for a rerun to check (rule 11). Every other variable stays name-only.
+# PYTHONHASHSEED is left out on purpose: each run chooses its own and records it in
+# status.reproducibility, so it would make every run's environment look different.
+RECORDED_VALUES = ("TZ", "LANG", "LC_ALL")
+
+
+def _home_as_tilde(path: str) -> str:
+    home = os.path.expanduser("~")
+    if home != "~" and os.path.normcase(path).startswith(os.path.normcase(home) + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
 def capture_environment(environ=None) -> dict:
-    """Read the record. Only variable names are taken from ``environ``."""
-    names = sorted({redact(name)[0] for name in (os.environ if environ is None else environ)})
+    """Read the record. Only variable names are taken from ``environ``, plus a fixed few values."""
+    source = os.environ if environ is None else environ
+    names = sorted({redact(name)[0] for name in source})
+    values = {name: source[name] for name in RECORDED_VALUES if name in source}
+    values["interpreter"] = _home_as_tilde(sys.executable)
     return {
+        "values": values,
         "python": {
             "version": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -147,6 +164,14 @@ def compare(before: dict, after: dict) -> list[dict]:
                     "after": new_packages.get(name),
                 }
             )
+    old_values, new_values = before.get("values"), after.get("values")
+    if old_values is not None and new_values is not None:  # older records have none
+        for name in sorted(old_values.keys() | new_values.keys()):
+            if old_values.get(name) != new_values.get(name):
+                changes.append(
+                    {"kind": "value", "name": name, "before": old_values.get(name),
+                     "after": new_values.get(name)}
+                )
     old_names, new_names = set(before.get("variables", ())), set(after.get("variables", ()))
     for name in sorted(old_names ^ new_names):
         changes.append(
@@ -196,6 +221,8 @@ def comparison(baseline: dict | None, current: dict, baseline_record: dict | Non
             "omitted": 0,
         }
     found = compare(baseline_record, record)
+    if not found:  # the digests differ only because an older record had no values
+        return {"state": "same", "reason": None, "changes": [], "omitted": 0}
     return {
         "state": "changed",
         "reason": None,

@@ -35,6 +35,7 @@ DETAIL_RANK = {
     "new shape": 2,
     "differs from reference": 3,
     "exception": 4,
+    "full": 4,  # a rerun of one test keeps every call of it
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -591,7 +592,10 @@ class TraceStore:
     def _find_run(connection, run_id):
         return (
             connection.execute(
-                "SELECT id FROM runs ORDER BY started_ns DESC, id DESC LIMIT 1"
+                # A rerun that did not match the run it repeats is never "the latest run".
+                "SELECT id FROM runs WHERE status IS NULL "
+                "OR COALESCE(json_extract(status, '$.rerun.verified'), 1) != 0 "
+                "ORDER BY started_ns DESC, id DESC LIMIT 1"
             ).fetchone()
             if run_id is None
             else connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -710,6 +714,21 @@ class TraceStore:
             return run_id, json.loads(saved[0]) if saved else None
 
     @staticmethod
+    def read_call(directory, run_id, address):
+        """One call of a run: ``("kept", detail)``, ``("not kept", None)`` or ``("unknown", None)``."""
+        path = Path(directory, "traces.sqlite3").resolve().as_uri()
+        with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as connection:
+            kept = connection.execute(
+                "SELECT payload FROM stream_calls WHERE run_id = ? AND frame_id = ?", (run_id, address)
+            ).fetchone()
+            if kept is not None:
+                return "kept", json.loads(kept[0])
+            known = connection.execute(
+                "SELECT 1 FROM call_records WHERE run_id = ? AND frame_id = ?", (run_id, address)
+            ).fetchone()
+        return ("not kept", None) if known else ("unknown", None)
+
+    @staticmethod
     def read_deep(directory, run_id, frame_id=None, *, offset=0, limit=20):
         path = Path(directory, "traces.sqlite3").resolve().as_uri()
         with closing(sqlite3.connect(path + "?mode=ro", uri=True)) as connection:
@@ -780,15 +799,20 @@ class TraceStore:
             ).fetchone()
         return used
 
-    def read_reference(self, run_id):
-        """Per-call signatures of a finished run: ``{address: (signature, function)}``."""
+    def read_reference(self, run_id, prefix=None):
+        """Per-call signatures of a finished run: ``{address: (signature, function)}``.
+
+        With a prefix, only the calls at or under that address (one test's calls).
+        """
+        query = "SELECT frame_id, function, signature FROM call_records WHERE run_id = ?"
+        parameters = [run_id]
+        if prefix:
+            query += " AND (frame_id = ? OR substr(frame_id, 1, ?) = ?)"
+            parameters += [prefix, len(prefix) + 1, prefix + "/"]
         with closing(self._connect()) as connection:
             return {
                 frame_id: (bytes(signature), function)
-                for frame_id, function, signature in connection.execute(
-                    "SELECT frame_id, function, signature FROM call_records WHERE run_id = ?",
-                    (run_id,),
-                )
+                for frame_id, function, signature in connection.execute(query, parameters)
             }
 
     def finish_stream(self, worker, summary):

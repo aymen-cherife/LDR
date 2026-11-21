@@ -81,9 +81,13 @@ class CallStream:
             flusher = threading.Thread(target=self._flush_periodically, name="ldr-flush", daemon=True)
             flusher.start()
             self.flusher_ident = flusher.ident
+        # Tests whose every call keeps detail (a rerun for detail), by address.
+        self.full_tests = tuple(getattr(store, "full_tests", ()))
         if store.reference_run:
             try:
-                self.reference = store.read_reference(store.reference_run)
+                self.reference = store.read_reference(
+                    store.reference_run, getattr(store, "reference_prefix", None)
+                )
             except (OSError, sqlite3.Error) as exc:
                 self.reference_error = type(exc).__name__
 
@@ -95,7 +99,7 @@ class CallStream:
         """Charge fingerprint work (nodes walked) to a function."""
         self.cost[function] = self.cost.get(function, 0) + nodes
 
-    def note_call(self, function, deep=False):
+    def note_call(self, function, deep=False, address=None):
         """Count a started call and say why it keeps detail from entry, if it does.
 
         The first call of a function, a selected (deep) function and the first N
@@ -111,6 +115,10 @@ class CallStream:
         if self.incomplete or self.write_failed:
             return None
         count = self.counts[function] = self.counts.get(function, 0) + 1
+        if self.full_tests and address is not None and any(
+            address == test or address.startswith(test + "/") for test in self.full_tests
+        ):
+            return "full"
         if count == 1:
             return "first call"
         if deep:

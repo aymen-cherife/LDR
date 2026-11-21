@@ -73,7 +73,7 @@ def importable(python: str, environ) -> bool:
     return probe.returncode == 0
 
 
-def run_in_child(argv: list[str], project_root: str) -> int:
+def run_in_child(argv: list[str], project_root: str, hash_seed: str | None = None) -> int:
     """Run ``ldr argv`` in the project's interpreter and return its exit status."""
     python, how = choose(project_root)
     environ = dict(os.environ)
@@ -92,7 +92,7 @@ def run_in_child(argv: list[str], project_root: str) -> int:
     environ[CHILD_MARKER] = "1"
     environ[SELECTED_BY] = how
     # Rule 6: the user's hash seed is respected; otherwise one is chosen, so it can be recorded.
-    environ["PYTHONHASHSEED"], environ[reproduce.SEED_SOURCE_ENV] = reproduce.choose_hash_seed(environ)
+    environ["PYTHONHASHSEED"], environ[reproduce.SEED_SOURCE_ENV] = reproduce.choose_hash_seed(environ, hash_seed)
     environ[SINK_ENV] = sink.token
     try:
         process = subprocess.Popen([python, "-m", "ldr.cli", *argv], env=environ)

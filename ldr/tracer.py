@@ -526,7 +526,7 @@ class Recorder:
             or identity in self.deep_functions
         )
         # Only the first N calls of a function keep detail; the rest keep fingerprints.
-        detail = self.call_stream.note_call(function, deep)
+        detail = self.call_stream.note_call(function, deep, frame_id)
         if self.call_stream.incomplete:
             self._halt()
             return
