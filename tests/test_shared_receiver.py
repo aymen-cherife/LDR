@@ -75,3 +75,47 @@ def test_a_different_receiver_is_still_read(tmp_path):
 def test_the_gap_is_stated_in_the_output(tmp_path):
     _, _, output = run(tmp_path)
     assert "1 call(s) share their receiver" in output and "one level up" in output
+
+
+FREED = """\
+import weakref
+
+
+class Thing:
+    def method(self):
+        return self.helper()
+
+    def helper(self):
+        return 1
+
+
+def plain(value):
+    return 1
+
+
+def make():
+    thing = Thing()
+    thing.method()
+    plain(thing)
+    return weakref.ref(thing)
+
+
+reference = make()
+assert reference() is None, "a recorded call kept its receiver alive"
+thing = Thing()
+thing.method()
+plain(thing)
+reference = weakref.ref(thing)
+del thing
+assert reference() is None, "a recorded call kept its argument alive"
+print("FREED")
+"""
+
+
+def test_recording_a_call_does_not_keep_its_objects_alive(tmp_path):
+    (tmp_path / "app.py").write_text(FREED, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-m", "ldr", "run", "app.py"], cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0 and "FREED" in result.stdout, result.stdout + result.stderr

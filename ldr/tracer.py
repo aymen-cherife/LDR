@@ -280,7 +280,8 @@ class Recorder:
             self._receivers[id(frame)] = (frame, held, skipped)
             if skipped:
                 self.call_stream.receivers_shared += 1
-        elif receiver is not None:
+        else:
+            # Every call is registered at entry, so every call is released here.
             known = self._receivers.pop(id(frame), None)
             skipped = known is not None and known[0] is frame and known[2]
         for name in self._argument_names(code):
