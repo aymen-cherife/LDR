@@ -34,7 +34,7 @@ TABLES = {
     "stream_summary": ("worker, summary", "worker"),
     "calls": ("worker, ordinal, parent, payload, values_fingerprint", "worker, ordinal"),
 }
-_CLOCK = re.compile(rb"\d+(\.\d+)?\s?(ms|s)\b")
+TIMING |= {key for key in os.environ.get("DUMP_DROP", "").split(",") if key}  # changed on purpose
 
 
 def clean(value):
