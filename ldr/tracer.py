@@ -521,7 +521,8 @@ class Recorder:
         identity = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
         function = f"{self.frame_prefix}{identity}"
         deep = bool(self.deep_functions) and (
-            code.co_name in self.deep_functions
+            "*" in self.deep_functions
+            or code.co_name in self.deep_functions
             or code.co_qualname in self.deep_functions
             or identity in self.deep_functions
         )
@@ -659,6 +660,7 @@ class Recorder:
         caller = frame.f_back
         if caller is None or not self._in_scope(caller.f_code.co_filename):
             return
+        module = frame.f_globals.get("__name__")  # already known to be a wanted module
         address = self.call_stream.frame_address(caller)
         source = self._display_path(caller.f_code.co_filename)
         site = {
