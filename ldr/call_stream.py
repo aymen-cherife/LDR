@@ -116,7 +116,7 @@ class CallStream:
             return None
         count = self.counts[function] = self.counts.get(function, 0) + 1
         if self.full_tests and address is not None and any(
-            address == test or address.startswith(test + "/") for test in self.full_tests
+            test == "*" or address == test or address.startswith(test + "/") for test in self.full_tests
         ):
             return "full"
         if count == 1:

@@ -108,6 +108,7 @@ class WorkerCapture(RuntimeCapture):
         super().__init__(Recorder(**settings["recorder"]))
         self.config = config
         self.store = store_from_settings(settings["store"])
+        self.store.full_tests = tuple(settings.get("full_tests") or ())
         self.name = config.workerinput["workerid"]
         self.worker = self.name
         self.rerun_random = settings.get("rerun_random") or {}
@@ -171,6 +172,7 @@ class ControllerCapture(RuntimeCapture):
             "store": self.store.settings(),
             "replicated": node.config.getoption("dist") == "each",
             "rerun_random": self.rerun_random,
+            "full_tests": list(getattr(self.store, "full_tests", ())),
         }
 
     @pytest.hookimpl(optionalhook=True)

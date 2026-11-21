@@ -93,12 +93,12 @@ To see how locals evolve inside a function, set an explicit
 snapshots within the trace budget. Choose both limits for your workload.
 
 ```sh
-ldr run app.py --deep calculate_total
+ldr run app.py --deep=calculate_total
 ldr show
 ldr show "app.py:calculate_total#1"
 ```
 
-Repeat `--deep` to select more functions. Use a qualified name such as
+Repeat `--deep=NAME` to select more functions; a bare `--deep` means every function. The value always takes `=`, so `--deep app.py` is a target, not a function. `--full=path::test` keeps full detail for every call of one pytest test (bare `--full` means everything); `--no-prune` is the old "disable pruning of the printed report". Each run stores its mode, and comparing across modes compares fingerprints only. Use a qualified name such as
 `Cart.total` or a project-relative selector such as `app.py:calculate_total`
 to narrow a match. Each snapshot records locals at the next line, return,
 yield, or exception unwind. Loop visits and generator continuations appear

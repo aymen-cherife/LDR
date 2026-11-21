@@ -69,7 +69,7 @@ def test_line_capture_requires_an_explicit_budget(tmp_path):
 
 def test_deep_capture_requires_budget_before_running_target(tmp_path):
     (tmp_path / "app.py").write_text("raise AssertionError('target ran')\n")
-    result = invoke(tmp_path, "run", "app.py", "--deep", "target")
+    result = invoke(tmp_path, "run", "app.py", "--deep=target")
     assert result.returncode == 2
     assert "requires explicit" in result.stderr
     assert "target ran" not in result.stderr
@@ -136,7 +136,7 @@ def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, m
     result = invoke(tmp_path, "run", "app.py", "--golden", "--", "--token", "qzx")
     assert result.returncode == 0, result.stdout + result.stderr
     result = invoke(
-        tmp_path, "run", "app.py", "--deep", "app.py:target", "--diff",
+        tmp_path, "run", "app.py", "--deep=app.py:target", "--diff",
         "--fail-on-change", "--", "--token", "qzx",
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -176,7 +176,7 @@ def test_deep_capture_marks_yield_continuation_and_unwind(tmp_path):
         "next(g)\n"
         "g.send(3)\n"
     )
-    result = invoke(tmp_path, "run", "app.py", "--deep", "gen")
+    result = invoke(tmp_path, "run", "app.py", "--deep=gen")
     assert result.returncode == 1, result.stdout + result.stderr
     shown = invoke(tmp_path, "show", "app.py:gen#1", "--json")
     steps = json.loads(shown.stdout)["frame"]["steps"]
@@ -200,7 +200,7 @@ def test_deep_budget_is_shared_across_workers(tmp_path):
         "def test_one():\n    assert target(1) == 1\n"
         "def test_two():\n    assert target(2) == 2\n"
     )
-    result = invoke(tmp_path, "pytest", "test_calc.py", "--deep", "target", "--", "-n", "2")
+    result = invoke(tmp_path, "pytest", "test_calc.py", "--deep=target", "--", "-n", "2")
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads((tmp_path / ".ldr" / "last.json").read_text())
     status = report["status"]["deep_capture"]

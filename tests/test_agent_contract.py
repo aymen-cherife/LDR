@@ -71,8 +71,9 @@ def test_late_exception_survives_node_budget(tmp_path):
     assert result.returncode == 1
     output = (tmp_path / ".ldr" / "last.txt").read_text()
     assert "fail() ! RuntimeError: late" in output
-    # Still compact. The bound grew from 30 when COMMIT and SCOPE header lines were added.
-    assert len(output.splitlines()) < 32
+    # Still compact. The bound grew from 30 when COMMIT and SCOPE header lines were added,
+    # and to 34 for the REPRODUCIBILITY and shared-receiver lines.
+    assert len(output.splitlines()) < 34
     assert "CAPTURE LIMITS" in output
 
 
@@ -395,7 +396,7 @@ def test_focused_state_history_obeys_its_own_budget(tmp_path):
         "    return total\n"
         "accumulate()\n"
     )
-    first = invoke(tmp_path, "run", "state_loop.py", "--full")
+    first = invoke(tmp_path, "run", "state_loop.py", "--no-prune")
     assert first.returncode == 0
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
     selected = next(

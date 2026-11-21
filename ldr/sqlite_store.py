@@ -903,7 +903,12 @@ class TraceStore:
 
     def settings(self):
         """Constructor arguments, so another process can open the same run."""
-        return {key: value for key, value in vars(self).items() if not key.startswith("_")}
+        # Attributes a run sets after opening the store are not constructor arguments.
+        later = ("full_tests", "reference_prefix")
+        return {
+            key: value for key, value in vars(self).items()
+            if not key.startswith("_") and key not in later
+        }
 
     def close(self):
         """Nothing to wait for: this store writes directly."""

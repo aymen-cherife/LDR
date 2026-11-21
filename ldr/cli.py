@@ -501,6 +501,27 @@ def _environment_differences(store, source_run: str, current: dict | None) -> li
     ]
 
 
+def _full_prefixes(values: list[str]) -> tuple[str, ...]:
+    """Address prefixes of the tests named in --full ('*' for everything)."""
+    if any(value == "*" for value in values):
+        return ("*",)
+    from .pytest_capture import encode_node_id
+
+    return tuple(encode_node_id(value) for value in values)
+
+
+def _mode_label(args) -> str:
+    """The capture mode, stored with each run (rule 15)."""
+    parts = []
+    if args.deep:
+        parts.append("deep=" + ",".join(sorted(args.deep)))
+    if args.full:
+        parts.append("full=" + ",".join(sorted(args.full)))
+    if args.boundary:
+        parts.append("boundary=" + ",".join(sorted(args.boundary)))
+    return "; ".join(parts) or "default"
+
+
 def _quietly(action) -> None:
     try:
         action()
@@ -1029,6 +1050,8 @@ def main(argv=None) -> int:
         index = argv.index("--")
         argv, passthrough = argv[:index], argv[index + 1 :]
 
+    # --deep and --full take their value with "=", so that they never swallow the target.
+    argv = ["--deep=*" if a == "--deep" else "--full=*" if a == "--full" else a for a in argv]
     parser = argparse.ArgumentParser(prog="ldr")
     parser.add_argument("--version", action="version", version=f"ldr {__version__}")
     parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect", "show"])
@@ -1046,7 +1069,11 @@ def main(argv=None) -> int:
     parser.add_argument("--learn-volatility", action="store_true", help="run twice and mask changing fields")
     parser.add_argument("--fail-on-change", action="store_true")
     parser.add_argument("--color", action="store_true")
-    parser.add_argument("--full", action="store_true", help="disable trace pruning")
+    parser.add_argument("--no-prune", action="store_true", help="disable trace pruning of the printed report")
+    parser.add_argument(
+        "--full", action="append", default=[], metavar="TEST",
+        help="full capture: every call keeps detail, for the named pytest test; bare --full means everything",
+    )
     parser.add_argument("--max-nodes", type=int, default=5000)
     parser.add_argument("--max-calls-per-function", type=int, default=8)
     parser.add_argument("--max-lines", type=int, default=200)
@@ -1062,7 +1089,7 @@ def main(argv=None) -> int:
     parser.add_argument("--max-state-steps", type=int, default=200)
     parser.add_argument(
         "--deep", action="append", default=[], metavar="FUNCTION",
-        help="save locals for a selected function (repeatable)",
+        help="save locals for a selected function, as --deep=FUNCTION (repeatable); bare --deep means every function",
     )
     parser.add_argument(
         "--boundary", action="append", default=[], metavar="MODULE",
@@ -1094,6 +1121,12 @@ def main(argv=None) -> int:
         or any(not name.strip() for name in args.deep)
     ):
         parser.error("--deep requires a function name and a recording command")
+    if args.full and (
+        requested_mode not in {"run", "pytest", "module", "verify"}
+        or any(not name.strip() for name in args.full)
+        or any(name != "*" and "::" not in name for name in args.full)
+    ):
+        parser.error("--full takes a pytest test as --full=path::test (or is bare for everything)")
     if args.boundary and (
         requested_mode not in {"run", "pytest", "module", "verify"}
         or any(not all(part.isidentifier() for part in name.split(".")) for name in args.boundary)
@@ -1194,12 +1227,13 @@ def main(argv=None) -> int:
         args.sink = sink
         if not args.golden and requested_mode != "inspect":
             store.reference_run = _baseline_run(golden_path)
+        store.full_tests = _full_prefixes(args.full)
         if rerun_plan is not None:
             # A rerun for detail: compare each call of the test with the run it repeats,
             # and keep every call of the test.
             store.reference_run = rerun_plan["source_run"]
             store.reference_prefix = rerun_plan["prefix"]
-            store.full_tests = (rerun_plan["prefix"],)
+            store.full_tests = (*store.full_tests, rerun_plan["prefix"])
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
         storage_warning = capture_error(exc)
         if args.deep or args.boundary:
@@ -1300,6 +1334,7 @@ def main(argv=None) -> int:
     status["commit"] = git_state(project_root)
     if environment is not None:
         status["environment"] = run_environment.summarize(environment)
+    status["mode"] = _mode_label(args)
     if rerun_plan is not None:
         status["rerun"] = {
             "of": rerun_plan["source_run"], "test": rerun_plan["node"], "attempt": rerun_plan["attempt"],
@@ -1592,7 +1627,7 @@ def main(argv=None) -> int:
                 recorder.roots,
                 args.color,
                 recorder.truncated,
-                args.full,
+                args.no_prune,
                 args.max_lines,
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,
@@ -1718,6 +1753,12 @@ def main(argv=None) -> int:
                 environment_note = run_environment.render_comparison(
                     environment_comparison, status["environment"]
                 )
+            if baseline_status and baseline_status.get("mode", "default") != status["mode"]:
+                environment_note += (
+                    f"MODE: the baseline was recorded in {baseline_status.get('mode', 'default')} mode, "
+                    f"this run in {status['mode']} mode. Fingerprints are compared; "
+                    "timings are compared only within the same mode.\n"
+                )
             if baseline_status:
                 text = (
                     f"BASELINE: outcome {describe_outcome(baseline_status)}, commit "
@@ -1735,7 +1776,7 @@ def main(argv=None) -> int:
                 recorder.roots,
                 args.color,
                 recorder.truncated,
-                args.full,
+                args.no_prune,
                 args.max_lines,
                 recorder.dropped_nodes,
                 recorder.sampled_nodes,

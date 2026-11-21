@@ -58,7 +58,7 @@ def test_cli_preserves_output_and_saves_readable_evidence(project):
     assert plain == {"orders": {"A": 400, "B": 375, "C": 50}, "total_cents": 825}
     traced = launch(
         project, "-m", "ldr", "run", "app.py", "--golden",
-        "--deep", "make_export", "--deep", "pricing_options",
+        "--deep=make_export", "--deep=pricing_options",
     )
     assert export(traced, project) == plain
     trace_dir = project / ".ldr"
@@ -121,7 +121,7 @@ def test_budget_limits_saved_evidence_and_preserves_output(project):
         encoding="utf-8",
     )
     plain = export(launch(project, "app.py"), project)
-    traced = launch(project, "-m", "ldr", "run", "app.py", "--deep", "make_export")
+    traced = launch(project, "-m", "ldr", "run", "app.py", "--deep=make_export")
     assert export(traced, project) == plain
 
     trace_dir = project / ".ldr"
