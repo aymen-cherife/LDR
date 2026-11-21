@@ -14,6 +14,7 @@ from __future__ import annotations
 import abc
 import datetime
 import decimal
+import functools
 import hashlib
 import types
 from dataclasses import dataclass
@@ -240,10 +241,29 @@ class _Walk:
         elif kind is types.FunctionType or kind is types.BuiltinFunctionType:
             name = f"{value.__module__}.{value.__qualname__}"
             self._text(b"Y", name.encode("utf-8", "surrogatepass"), out)
+            bound = value.__self__ if kind is types.BuiltinFunctionType else None
+            if bound is not None and type(bound) is not types.ModuleType:
+                # A method of a built-in object, such as [].append: which object matters.
+                out.update(b"@o")
+                self.encode(bound, out, depth + 1)
         elif kind is types.MethodType:
             out.update(b"Mt")
             self.encode(value.__func__, out, depth + 1)
             self.encode(value.__self__, out, depth + 1)
+        elif kind is functools.partial:
+            # The wrapped callable and every bound argument, read like any other value:
+            # secrets in them are redacted the same way. Keywords are an unordered set
+            # of names, so they are sorted.
+            out.update(b"Pa")
+            self.encode(value.func, out, depth + 1)
+            self.encode(value.args, out, depth + 1)
+            out.update(str(len(value.keywords)).encode() + b"{")
+            for key in sorted(value.keywords):
+                if is_secret_name(key):
+                    raise _Stop(REDACTED)
+                self._text(b"n", key.encode("utf-8", "surrogatepass"), out)
+                self.encode(value.keywords[key], out, depth + 1)
+            out.update(b"}")
         elif kind in (datetime.datetime, datetime.date, datetime.time):
             self._text(b"M", (type_label(kind) + value.isoformat()).encode(), out)
         elif kind is datetime.timedelta:
