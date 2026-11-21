@@ -177,6 +177,9 @@ def measure(name, fixture, rounds, env):
 def noise(name, fixture, env):
     """Run the same code twice under LDR and count the stored tables or answers that differ."""
     root, _, traced = fixture
+    # LDR picks a random hash seed when none is set (Phase 2 rule 6), which reorders sets
+    # between two runs of the same code. The check pins it, as a user could.
+    env = dict(env, PYTHONHASHSEED="0")
     dumps = []
     for _ in range(2):
         clean(root)

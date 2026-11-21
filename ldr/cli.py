@@ -21,6 +21,7 @@ from typing import Any
 
 from . import __version__
 from . import environment as run_environment
+from . import reproduce
 from .interpreter import CHILD_MARKER, RUNNING, SELECTED_BY, run_in_child
 from .sink import ENV as SINK_ENV, RemoteStore, sink_from_environment
 from .diff import (
@@ -485,6 +486,53 @@ def _fingerprint_status(summaries: list[dict]) -> dict[str, Any]:
     }
 
 
+def _quietly(action) -> None:
+    try:
+        action()
+    except (OSError, EOFError, sqlite3.Error):
+        pass
+
+
+def _reproducibility(store, mode: str, hash_seed: dict) -> dict[str, Any]:
+    """Rules 6 to 8 as the run records them, with the gaps stated."""
+    result: dict[str, Any] = {"hash_seed": hash_seed, "gaps": reproduce.GAPS}
+    try:
+        names = store.list_rng(store.run_id)
+        if mode == "pytest":
+            tests = store.load_tests(store.run_id)
+            result["tests"] = {"recorded": len(tests), "order": "recorded"}
+            seed = store.load_rng(store.run_id, "pytest-randomly")
+            result["random"] = (
+                {"owner": "pytest-randomly", "seed": seed} if seed is not None
+                else {"owner": "ldr", "state": "recorded per test"}
+            )
+        result["numpy"] = (
+            "state recorded at import" if any(n.startswith("numpy-at-import") for n in names)
+            else "not imported"
+        )
+    except (OSError, EOFError, sqlite3.Error):
+        result["error"] = "the records could not be read back"
+    return result
+
+
+def _reproducibility_line(info: dict[str, Any]) -> str:
+    seed = info["hash_seed"]
+    parts = [
+        f"hash seed {seed['value']} ({seed['source']})" if seed["value"] is not None
+        else f"hash seed {seed['source']}"
+    ]
+    if "tests" in info:
+        parts.append(f"order of {info['tests']['recorded']} test(s) recorded")
+        random = info["random"]
+        parts.append(
+            f"random seeded by pytest-randomly (seed {random['seed']})" if random["owner"] == "pytest-randomly"
+            else "random state recorded per test"
+        )
+    if "numpy" in info:
+        parts.append(f"numpy {info['numpy']}")
+    return f"REPRODUCIBILITY: {'; '.join(parts)}. Not controlled: {info['gaps']}.\n"
+
+
 def _home_as_tilde(path: str) -> str:
     """Show the home directory as ``~``, so a user name does not reach the output."""
     home = os.path.expanduser("~")
@@ -919,6 +967,7 @@ def main(argv=None) -> int:
     # Set by the parent that started this process. The target must not see either.
     is_child = os.environ.pop(CHILD_MARKER, None) == "1"
     selected_by = os.environ.pop(SELECTED_BY, None) or RUNNING
+    hash_seed_source = os.environ.pop(reproduce.SEED_SOURCE_ENV, None)
     sink = sink_from_environment()
     total_started = time.perf_counter()
     initial_cwd = os.path.realpath(os.getcwd())
@@ -1112,6 +1161,12 @@ def main(argv=None) -> int:
     except Exception as exc:
         scope_warnings.append(f"Environment record unavailable ({capture_error(exc)}).")
 
+    numpy_hook = None
+    if store is not None:
+        numpy_hook = reproduce.install_numpy_hook(
+            lambda state: _quietly(lambda: store.save_rng("numpy-at-import", state))
+        )
+
     def go(recorder):
         nonlocal pytest_capture
         if args.mode == "run":
@@ -1186,6 +1241,13 @@ def main(argv=None) -> int:
                     scope_warnings.append(
                         f"Environment record could not be saved ({capture_error(exc)})."
                     )
+            if numpy_hook is not None:
+                numpy_hook.remove()
+            if pytest_capture is not None:
+                pytest_capture.flush_tests()
+            status["reproducibility"] = _reproducibility(
+                store, args.mode, reproduce.hash_seed_status(os.environ, hash_seed_source)
+            )
             if not pytest_capture or not pytest_capture.workers:
                 recorder.call_stream.finish()
                 store.save_worker("main", recorder.roots, {})
@@ -1289,6 +1351,9 @@ def main(argv=None) -> int:
                     f"{'not counted' if missing is None else missing} missing. "
                     "Calls that differ keep full detail.\n"
                 )
+        if repro := status.get("reproducibility"):
+            if "error" not in repro:
+                redaction_note += _reproducibility_line(repro)
         if fingerprint_status := status.get("fingerprint"):
             if fingerprint_status["receivers_shared"]:
                 redaction_note += (

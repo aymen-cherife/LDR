@@ -143,6 +143,10 @@ class Sink:
                 store.save_environment(message[1])
             elif kind == "section":
                 store.save_section(message[1], message[2])
+            elif kind == "tests":
+                store.save_tests(message[1], message[2])
+            elif kind == "rng":
+                store.save_rng(message[1], message[2])
             elif kind == "worker":
                 _, worker, rows, summary = message
                 store.save_worker_rows(worker, rows, summary)
@@ -290,6 +294,24 @@ class RemoteStore(TraceStore):
 
     def save_section(self, name, text):
         self._send(("section", name, text))
+
+    def save_tests(self, worker, rows):
+        self._send(("tests", worker, list(rows)))
+
+    def save_rng(self, name, payload):
+        self._send(("rng", name, payload))
+
+    def load_tests(self, run_id):
+        self.sync()
+        return super().load_tests(run_id)
+
+    def load_rng(self, run_id, name):
+        self.sync()
+        return super().load_rng(run_id, name)
+
+    def list_rng(self, run_id):
+        self.sync()
+        return super().list_rng(run_id)
 
     def save_worker(self, worker, roots, summary):
         self._send(("worker", worker, list(_call_rows(roots)), summary))

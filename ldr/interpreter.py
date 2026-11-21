@@ -84,12 +84,15 @@ def run_in_child(argv: list[str], project_root: str) -> int:
             file=sys.stderr,
         )
         return 2
+    from . import reproduce
     from .sink import ENV as SINK_ENV, Sink
 
     # The child sends its records here and this process writes them.
     sink = Sink()
     environ[CHILD_MARKER] = "1"
     environ[SELECTED_BY] = how
+    # Rule 6: the user's hash seed is respected; otherwise one is chosen, so it can be recorded.
+    environ["PYTHONHASHSEED"], environ[reproduce.SEED_SOURCE_ENV] = reproduce.choose_hash_seed(environ)
     environ[SINK_ENV] = sink.token
     try:
         process = subprocess.Popen([python, "-m", "ldr.cli", *argv], env=environ)

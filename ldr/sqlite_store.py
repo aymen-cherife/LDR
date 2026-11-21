@@ -120,6 +120,18 @@ CREATE TABLE IF NOT EXISTS stream_boundaries (
 CREATE TABLE IF NOT EXISTS run_environment (
     run_id TEXT PRIMARY KEY REFERENCES runs(id), payload TEXT NOT NULL
 );
+-- Rule 8: the order tests started in, per worker, with the state of `random` at that
+-- point (rule 7) so that a rerun can restore it.
+CREATE TABLE IF NOT EXISTS run_tests (
+    run_id TEXT NOT NULL, worker TEXT NOT NULL, position INTEGER NOT NULL,
+    node_id TEXT NOT NULL, random_state TEXT,
+    PRIMARY KEY (run_id, worker, position)
+) WITHOUT ROWID;
+-- Rule 7: other generator records for the run (numpy at import, pytest-randomly's seed).
+CREATE TABLE IF NOT EXISTS run_rng (
+    run_id TEXT NOT NULL, name TEXT NOT NULL, payload TEXT NOT NULL,
+    PRIMARY KEY (run_id, name)
+) WITHOUT ROWID;
 -- Parts of a run's result that did not fit in the short .ldr/last.json, whole.
 CREATE TABLE IF NOT EXISTS run_sections (
     run_id TEXT NOT NULL REFERENCES runs(id), name TEXT NOT NULL, payload TEXT NOT NULL,
@@ -612,6 +624,44 @@ class TraceStore:
                 "INSERT OR REPLACE INTO run_environment VALUES (?, ?)",
                 (self.run_id, _json(record)),
             )
+
+    def save_tests(self, worker, rows):
+        """(position, node id, random state) for each test that started, in start order."""
+        with closing(self._connect()) as connection, connection:
+            connection.executemany(
+                "INSERT OR REPLACE INTO run_tests VALUES (?, ?, ?, ?, ?)",
+                [(self.run_id, worker, position, node, state) for position, node, state in rows],
+            )
+
+    def load_tests(self, run_id):
+        """[(worker, position, node id, random state)], by worker then position."""
+        with closing(self._connect()) as connection:
+            return connection.execute(
+                "SELECT worker, position, node_id, random_state FROM run_tests "
+                "WHERE run_id = ? ORDER BY worker, position",
+                (run_id,),
+            ).fetchall()
+
+    def save_rng(self, name, payload):
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO run_rng VALUES (?, ?, ?)", (self.run_id, name, payload)
+            )
+
+    def list_rng(self, run_id):
+        with closing(self._connect()) as connection:
+            return [
+                name for (name,) in connection.execute(
+                    "SELECT name FROM run_rng WHERE run_id = ? ORDER BY name", (run_id,)
+                )
+            ]
+
+    def load_rng(self, run_id, name):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT payload FROM run_rng WHERE run_id = ? AND name = ?", (run_id, name)
+            ).fetchone()
+        return row[0] if row else None
 
     def save_section(self, name, text):
         with closing(self._connect()) as connection, connection:
