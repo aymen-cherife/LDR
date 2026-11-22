@@ -72,8 +72,9 @@ def test_late_exception_survives_node_budget(tmp_path):
     output = (tmp_path / ".ldr" / "last.txt").read_text()
     assert "fail() ! RuntimeError: late" in output
     # Still compact. The bound grew from 30 when COMMIT and SCOPE header lines were added,
-    # and to 34 for the REPRODUCIBILITY and shared-receiver lines.
-    assert len(output.splitlines()) < 34
+    # to 34 for the REPRODUCIBILITY and shared-receiver lines, and to 37 for SLOWDOWN
+    # and HOT FUNCTIONS (rules 16 and 17: each one states a fact or a gap).
+    assert len(output.splitlines()) < 37
     assert "CAPTURE LIMITS" in output
 
 

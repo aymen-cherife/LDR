@@ -503,9 +503,11 @@ def _environment_differences(store, source_run: str, current: dict | None) -> li
 
 def _full_prefixes(values: list[str]) -> tuple[str, ...]:
     """Address prefixes of the tests named in --full ('*' for everything)."""
+    if not values:
+        return ()
     if any(value == "*" for value in values):
         return ("*",)
-    from .pytest_capture import encode_node_id
+    from .pytest_capture import encode_node_id  # imports pytest: only when a test is named
 
     return tuple(encode_node_id(value) for value in values)
 
