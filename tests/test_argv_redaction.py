@@ -62,7 +62,7 @@ def test_credentials_after_dashdash_are_hidden_but_the_program_still_gets_them(t
     (tmp_path / "app.py").write_text(APP)
 
     result = subprocess.run(
-        [sys.executable, "-m", "ldr.cli", "run", "app.py", "--golden", "--",
+        [sys.executable, "-m", "ldr.cli", "run", "app.py", "--",
          "--password=hunter22pass", "--token", "abc123def456", "keep-me"],
         cwd=tmp_path, env=ENV, capture_output=True, text=True,
     )
@@ -83,7 +83,7 @@ def test_credentials_are_hidden_even_when_argparse_separates_a_flag_from_its_val
     (tmp_path / "app.py").write_text(APP)
 
     result = subprocess.run(
-        [sys.executable, "-m", "ldr.cli", "run", "app.py", "--golden",
+        [sys.executable, "-m", "ldr.cli", "run", "app.py",
          "--password=hunter22pass", "--token", "abc123def456", "keep-me"],
         cwd=tmp_path, env=ENV, capture_output=True, text=True,
     )

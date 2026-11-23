@@ -5,14 +5,13 @@ so killing this process does not stop the run.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import threading
 import time
 from uuid import uuid4
 
-from .supervisor import RUNS, alive, read_state, run_directory, spawn_detached
+from .supervisor import alive, read_state, run_directory, spawn_detached
 
 PROGRESS_EVERY = 10.0  # seconds between progress lines when the output is not a terminal
 POLL = 0.05
@@ -28,20 +27,12 @@ def _ensure_ldr_dir(ldr_dir: str) -> None:
 
 
 def describe_progress(state: dict) -> str:
-    """One compact line: calls recorded, tests started, elapsed time, slowdown so far."""
+    """One compact line: calls recorded, tests started, elapsed time."""
     elapsed = state.get("elapsed") or 0
     parts = [f"{state.get('calls', 0):,} call(s) recorded"]
     if state.get("tests"):
         parts.append(f"{state['tests']} test(s) started")
     parts.append(f"elapsed {elapsed:.0f}s")
-    baseline = state.get("baseline_seconds")
-    if baseline:
-        parts.append(
-            f"at least {elapsed / baseline:.1f}x the untraced time ({baseline:.1f}s)"
-            if elapsed > baseline else f"still within the untraced time ({baseline:.1f}s)"
-        )
-    else:
-        parts.append("slowdown: no baseline")
     return f"[ldr] running {state.get('run', '')}: " + ", ".join(parts)
 
 

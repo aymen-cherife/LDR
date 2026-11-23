@@ -72,7 +72,7 @@ def slowdown(traced_seconds: float, baseline: dict | None, files: dict[str, str]
 
 def render_slowdown(info: dict) -> str:
     if info["state"] == "no baseline":
-        return "SLOWDOWN: no baseline (run this command with --baseline once to record the untraced time).\n"
+        return "SLOWDOWN: no baseline (run this command with --untraced-time once to record the untraced time).\n"
     text = (
         f"SLOWDOWN: {info['factor']:.1f}x (traced {info['traced_seconds']:.2f}s, "
         f"untraced {info['untraced_seconds']:.2f}s)"

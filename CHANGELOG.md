@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Every run is recorded and compared with the previous run of the same target, through SQLite. A pytest run is matched by test node id; other runs by exact command. The last 2 runs of each target are kept.
+- Removed: `verify`, `--golden`, `--diff`, `--snapshot-name`, `--learn-volatility` and the `.ldr/snapshots/` folder. A difference between two runs of identical files carries "also varied across 2 runs with no edit".
+- Added a size counter: every value the fingerprint walk reads leaves its type, role, call address and node count in the `value_sizes` table.
+
 ## 0.6.0
 
 **Breaking: snapshots recorded by 0.5.x cannot be compared.** Trace schema 7

@@ -108,7 +108,7 @@ def test_broad_output_is_compact_and_does_not_claim_uncaptured_semantics(tmp_pat
     assert len(text.splitlines()) < 35
 
 
-def test_capture_limits_only_appear_when_capture_is_incomplete(tmp_path):
+def test_a_complete_capture_prints_no_capture_limits(tmp_path):
     (tmp_path / "late.py").write_text(
         "def leaf(x):\n    return x\n"
         "def fail():\n"
@@ -116,22 +116,6 @@ def test_capture_limits_only_appear_when_capture_is_incomplete(tmp_path):
         "    raise RuntimeError('late')\n"
         "fail()\n"
     )
-    limited = invoke(
-        tmp_path,
-        "run",
-        "late.py",
-        "--only",
-        str(tmp_path),
-        "--max-nodes",
-        "10",
-        "--golden",  # a snapshot still uses the capped tree
-    )
-    assert limited.returncode == 1
-    text, payload = load_result(tmp_path)
-    assert "CAPTURE LIMITS:" in text
-    assert f"recorded={payload['status']['recorded_nodes']}" in text
-    assert "truncated=True" in text
-
     (tmp_path / "small.py").write_text("raise RuntimeError('small')\n")
     complete = invoke(tmp_path, "run", "small.py", "--only", str(tmp_path))
     assert complete.returncode == 1

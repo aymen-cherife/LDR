@@ -116,10 +116,10 @@ def test_the_old_pruning_switch_is_now_no_prune(tmp_path):
     assert status(tmp_path)["mode"] == "default"
 
 
-def test_a_diff_across_modes_compares_fingerprints_and_says_the_modes_differ(tmp_path):
+def test_a_run_in_another_mode_compares_fingerprints_and_says_the_modes_differ(tmp_path):
     deep_allowed(tmp_path)
     (tmp_path / "script.py").write_text(APP + "for index in range(20):\n    f(index)\n", encoding="utf-8")
-    ldr(tmp_path, "run", "script.py", "--golden", expected=0)
-    result = ldr(tmp_path, "run", "script.py", "--diff", "--deep=f", "--fail-on-change", expected=0)
-    assert "No behavioural change vs snapshot" in result.stdout
-    assert "MODE: the baseline was recorded in default mode, this run in deep=f mode" in result.stdout
+    ldr(tmp_path, "run", "script.py", expected=0)
+    result = ldr(tmp_path, "run", "script.py", "--deep=f", expected=0)
+    assert status(tmp_path)["reference"]["different"] == 0
+    assert "MODE: the previous run was recorded in default mode, this run in deep=f mode" in result.stdout

@@ -12,9 +12,7 @@ import runpy
 import shlex
 import signal
 import sqlite3
-import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 from typing import Any
@@ -23,30 +21,17 @@ from . import __version__
 from . import environment as run_environment
 from . import reproduce, slowdown as slowdown_report
 from .interpreter import CHILD_MARKER, RUNNING, SELECTED_BY, run_in_child
-from .sink import ENV as SINK_ENV, RemoteStore, sink_from_environment
-from .diff import (
-    EQUAL_READABLE,
-    align,
-    compare_fields,
-    diff_tree,
-    mark_unstable,
-    rank,
-    render_unstable,
-    unstable_fields,
-)
+from .sink import RemoteStore, sink_from_environment
 from .gitinfo import describe_commit, describe_outcome, git_state
-from .node import Node, capture, capture_error, count_redacted
+from .node import Node, capture_error, count_redacted
 from .redact import redact, redact_argv, register_argv_secrets
-from .render import render_call_chain, render_diff, render_inspection, render_run
+from .render import render_inspection, render_run
 from .store import (
     SCHEMA_VERSION,
     atomic_json,
     atomic_text,
     invocation_descriptor,
     invocation_key,
-    load_trace,
-    save_trace,
-    snapshot_path,
 )
 from .suggest import rank_inspections
 from .call_stream import CallStream
@@ -54,7 +39,6 @@ from .sqlite_store import TraceStore, storage_settings
 from . import fingerprint as fingerprint_module, previous, sqlreport
 from .summary import summarize
 from .tracer import Recorder, python_version_message
-from .value_capture import first_difference
 
 LDR_DIR = ".ldr"
 from .project import KNOWN_RUNNERS as _KNOWN_RUNNERS, infer_project_root as _infer_project_root, target_origin as _target_origin
@@ -394,18 +378,6 @@ def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
     args.project_root = rerun.get("project_root")
 
 
-def _baseline_run(snapshot: str) -> str | None:
-    """The run a saved snapshot was recorded from, when that run kept per-call fingerprints."""
-    try:
-        with open(snapshot, encoding="utf-8") as handle:
-            status = json.load(handle).get("status", {})
-    except (OSError, json.JSONDecodeError):
-        return None
-    if status.get("call_stream", {}).get("fingerprinted") is None:
-        return None
-    return status.get("run_id")
-
-
 def _find_previous(store) -> None:
     """Pick the run whose calls this run looks up while it records (see previous.py)."""
     from contextlib import closing
@@ -436,6 +408,42 @@ def _compare_with_previous(store, plan, files: dict) -> dict | None:
             return previous.compare(connection, store.run_id, other, prefix=prefix, files=(before, files))
     except (OSError, sqlite3.Error, ValueError) as exc:
         return {"run_id": None, "error": capture_error(exc)}
+
+
+def _previous_context(store, previous_id, status, environment, warnings):
+    """(environment comparison, a heading that sets this run beside the previous run)."""
+    from contextlib import closing
+
+    try:
+        with closing(store._connect()) as connection:
+            row = connection.execute("SELECT status FROM runs WHERE id = ?", (previous_id,)).fetchone()
+        before = json.loads(row[0]) if row and row[0] else {}
+    except (OSError, sqlite3.Error, ValueError):
+        return None, ""
+    note = ""
+    comparison = None
+    if environment is not None:
+        record = None
+        if before.get("run_id") and before.get("environment"):
+            try:
+                record = store.load_environment(before["run_id"])
+            except (OSError, sqlite3.Error, ValueError):
+                warnings.append("Could not read the previous run's environment record.")
+        comparison = run_environment.comparison(
+            before.get("environment"), status["environment"], record, environment
+        )
+        note = run_environment.render_comparison(comparison, status["environment"])
+    if before.get("mode", "default") != status["mode"]:
+        note += (
+            f"MODE: the previous run was recorded in {before.get('mode', 'default')} mode, "
+            f"this run in {status['mode']} mode. Fingerprints are compared; "
+            "timings are compared only within the same mode.\n"
+        )
+    heading = (
+        f"PREVIOUS RUN: outcome {describe_outcome(before)}, commit {describe_commit(before.get('commit'))}. "
+        f"THIS RUN: outcome {describe_outcome(status)}, commit {describe_commit(status['commit'])}.\n"
+    )
+    return comparison, heading + note
 
 
 def _previous_run_note(reference: dict) -> str:
@@ -542,7 +550,7 @@ def _render_too_large(info: dict[str, Any], args) -> str:
 
 def _describe_changed(functions: list[str], detail: dict[str, list[int]]) -> str:
     """Name each changed function, with the note when its calls also varied with no edit."""
-    from .diff import VARIED_NOTE, VARIED_RUNS
+    from .previous import VARIED_NOTE, VARIED_RUNS
 
     parts = []
     for function in functions:
@@ -615,8 +623,8 @@ def _mode_label(args) -> str:
     return "; ".join(parts) or "default"
 
 
-def _record_baseline(args, ldr_dir: str, key: str) -> int:
-    """Run the target once with no recording and keep the time (rule 16)."""
+def _record_untraced_time(args, ldr_dir: str, key: str) -> int:
+    """Run the target once with no recording and keep the time (an internal tool, rule 16)."""
     code = 0
     started = time.perf_counter()
     try:
@@ -648,7 +656,7 @@ def _record_baseline(args, ldr_dir: str, key: str) -> int:
     note = "" if files else (
         " It has no file hashes (no traced run of this command was found), so it cannot be checked for staleness."
     )
-    print(f"BASELINE: {seconds:.2f}s untraced (exit {code}).{note}")
+    print(f"untraced time: {seconds:.2f}s (exit {code}).{note}")
     return code
 
 
@@ -748,55 +756,6 @@ def _recent_context(node: Node) -> list[dict[str, Any]]:
             }
         )
     return recent
-
-
-def _value_differences(store, baseline_id, change):
-    if change.old is None or not change.old.frame_id or not change.node.frame_id:
-        return []
-    before = store.frame_values(baseline_id, change.old.frame_id)
-    after = store.frame_values(store.run_id, change.node.frame_id)
-    differences = []
-    for field, (state, _) in compare_fields(change.old, change.node).items():
-        if state != "different":
-            continue
-        if field == "out":
-            phase, name = "return", "result"
-        elif field.startswith("in."):
-            phase, name = "entry", field[3:]
-        else:
-            continue
-        left = before.get(phase, {}).get(name, {})
-        right = after.get(phase, {}).get(name, {})
-        if left.get("status") == right.get("status") == "complete":
-            detail = first_difference(left["value"], right["value"])
-            if detail is not None:
-                path, old, new = detail
-                differences.append({"field": field, "path": path, "before": capture(old), "after": capture(new)})
-    return differences
-
-
-def _finding_payload(changes, store=None, baseline_id=None) -> list[dict[str, Any]]:
-    findings = []
-    for position, change in enumerate(sorted(changes, key=rank)[:25], 1):
-        findings.append(
-            {
-                "rank": position,
-                "kind": change.kind,
-                "path": change.path,
-                "function": change.node.name,
-                "frame_id": change.node.frame_id,
-                "source_id": change.node.source_id,
-                "location": change.node.location,
-                "callsite": change.node.callsite,
-                "before": _node_state(change.old),
-                "after": _node_state(change.node),
-            }
-        )
-        if store is not None and store.max_value_bytes and baseline_id:
-            details = _value_differences(store, baseline_id, change)
-            if details:
-                findings[-1]["value_changes"] = details
-    return findings
 
 
 def _failure_payload(roots: list[Node]) -> list[dict[str, Any]]:
@@ -1091,72 +1050,6 @@ def _show_value(evidence):
     return f"<{evidence['status']}>"
 
 
-def _noise_run(
-    args,
-    scope: list[str],
-    invocation: dict[str, Any],
-    recorder: Recorder,
-    ldr_dir: str,
-) -> list[Node]:
-    os.makedirs(ldr_dir, exist_ok=True)
-    fd, noise_path = tempfile.mkstemp(prefix="noise-", suffix=".json", dir=ldr_dir)
-    os.close(fd)
-    os.unlink(noise_path)
-    # This process is already the child: the noise run must not start another.
-    environment = dict(os.environ, LDR_NOISE_RUN=noise_path, **{CHILD_MARKER: "1"})
-    if getattr(args, "sink", None):
-        environment[SINK_ENV] = args.sink
-    command = [
-        sys.executable,
-        "-m",
-        "ldr.cli",
-        args.mode,
-        args.target,
-        "--project-root",
-        args.project_root,
-        "--only",
-        *scope,
-        "--max-nodes",
-        str(args.max_nodes),
-        "--max-calls-per-function",
-        str(args.max_calls_per_function),
-        "--max-lines",
-        str(args.max_lines),
-        "--timeout",
-        str(args.timeout),
-        "--",
-        *args.rest,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            env=environment,
-            capture_output=True,
-            timeout=(args.timeout + 5) if args.timeout > 0 else None,
-            cwd=args.initial_cwd,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("noise run timed out; snapshot was not saved") from exc
-    try:
-        if not os.path.exists(noise_path):
-            detail = completed.stderr.decode(errors="replace")[-500:]
-            raise RuntimeError(f"noise run produced no trace: {detail}")
-        roots, envelope = load_trace(noise_path)
-        noise_status = envelope.get("status", {})
-        recorder.noise_run_id = noise_status.get("run_id")
-        if noise_status.get("exit_code") != recorder.exit_code:
-            raise RuntimeError(
-                "noise run changed runner status; snapshot was not saved "
-                f"({recorder.exit_code} then {noise_status.get('exit_code')})"
-            )
-        return roots
-    finally:
-        try:
-            os.unlink(noise_path)
-        except FileNotFoundError:
-            pass
-
-
 def main(argv=None) -> int:
     unsupported = python_version_message()
     if unsupported:
@@ -1189,7 +1082,7 @@ def main(argv=None) -> int:
     argv = ["--deep=*" if a == "--deep" else "--full=*" if a == "--full" else a for a in argv]
     parser = argparse.ArgumentParser(prog="ldr")
     parser.add_argument("--version", action="version", version=f"ldr {__version__}")
-    parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect", "show", "status"])
+    parser.add_argument("mode", choices=["run", "pytest", "module", "inspect", "show", "status"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("rest", nargs="*")
     parser.add_argument("--runner", choices=["auto", "run", "pytest", "module"], default="auto")
@@ -1198,14 +1091,8 @@ def main(argv=None) -> int:
         help="paths to trace (default: inferred project root)",
     )
     parser.add_argument("--project-root", help="stable source-identity root (normally inferred)")
-    parser.add_argument("--golden", action="store_true", help="replace this invocation's snapshot")
-    parser.add_argument("--diff", action="store_true", help="compare against this invocation's snapshot")
-    parser.add_argument("--snapshot-name", help="explicit snapshot key")
-    parser.add_argument("--learn-volatility", action="store_true", help="run twice and mask changing fields")
-    parser.add_argument(
-        "--baseline", action="store_true",
-        help="run the target once without recording and keep its time, to state the slowdown of later runs",
-    )
+    # An internal tool for LDR's developers: not in --help, the skill or the README.
+    parser.add_argument("--untraced-time", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--fail-on-change", action="store_true")
     parser.add_argument("--color", action="store_true")
     parser.add_argument("--no-prune", action="store_true", help="disable trace pruning of the printed report")
@@ -1246,8 +1133,6 @@ def main(argv=None) -> int:
     parser.add_argument("--timeout", type=float, default=300)
     args, unknown = parser.parse_known_args(argv)
     args.rest = list(args.rest) + unknown + passthrough
-    if args.golden and args.diff:
-        parser.error("--golden and --diff are mutually exclusive")
     if args.max_lines < 20:
         parser.error("--max-lines must be at least 20")
     if args.max_nodes < 1:
@@ -1261,18 +1146,18 @@ def main(argv=None) -> int:
 
     requested_mode = args.mode
     if args.deep and (
-        requested_mode not in {"run", "pytest", "module", "verify"}
+        requested_mode not in {"run", "pytest", "module"}
         or any(not name.strip() for name in args.deep)
     ):
         parser.error("--deep requires a function name and a recording command")
     if args.full and (
-        requested_mode not in {"run", "pytest", "module", "verify"}
+        requested_mode not in {"run", "pytest", "module"}
         or any(not name.strip() for name in args.full)
         or any(name != "*" and "::" not in name for name in args.full)
     ):
         parser.error("--full takes a pytest test as --full=path::test (or is bare for everything)")
     if args.boundary and (
-        requested_mode not in {"run", "pytest", "module", "verify"}
+        requested_mode not in {"run", "pytest", "module"}
         or any(not all(part.isidentifier() for part in name.split(".")) for name in args.boundary)
     ):
         parser.error("--boundary requires a dotted module name and a recording command")
@@ -1295,15 +1180,13 @@ def main(argv=None) -> int:
     elif args.target is None:
         parser.error("target is required (or use inspect --frame-id N)")
 
-    if requested_mode in ("verify", "inspect"):
+    if requested_mode == "inspect":
         args.mode = _infer_runner(args.target) if args.runner == "auto" else args.runner
     elif args.runner != "auto":
-        parser.error("--runner is only valid with verify or inspect")
+        parser.error("--runner is only valid with inspect")
     if requested_mode == "inspect":
         if not args.frame:
             parser.error("inspect requires --frame or --frame-id from a previous LDR result")
-        if args.golden or args.diff or args.learn_volatility:
-            parser.error("inspect cannot save or compare snapshots")
     elif args.frame or args.frame_id is not None:
         parser.error("--frame and --frame-id are only valid with inspect")
 
@@ -1350,20 +1233,11 @@ def main(argv=None) -> int:
         project_root=project_root,
         only=args.only,
     )
-    try:
-        key = invocation_key(invocation, args.snapshot_name)
-    except ValueError as exc:
-        parser.error(str(exc))
-    golden_path = snapshot_path(ldr_dir, key)
-    if args.baseline:
-        if args.golden or args.diff or args.learn_volatility or requested_mode not in {"run", "pytest", "module"}:
-            parser.error("--baseline only runs the target once, without recording: use it alone with run, pytest or module")
-        return _record_baseline(args, ldr_dir, key)
-    if requested_mode == "verify" and not args.golden and not args.diff:
-        args.diff = os.path.exists(golden_path)
-        args.golden = not args.diff
-    if args.learn_volatility and not args.golden:
-        parser.error("--learn-volatility is only valid while saving a snapshot")
+    key = invocation_key(invocation)
+    if args.untraced_time:
+        if requested_mode not in {"run", "pytest", "module"}:
+            parser.error("--untraced-time only runs the target once, without recording: use it with run, pytest or module")
+        return _record_untraced_time(args, ldr_dir, key)
 
     rerun_plan = None
     if is_child and os.environ.get("LDR_RERUN"):  # a rerun for detail (rerun.py), else not loaded
@@ -1383,7 +1257,7 @@ def main(argv=None) -> int:
             else TraceStore.start(ldr_dir, invocation, *settings)
         )
         args.sink = sink
-        if requested_mode in {"run", "pytest", "module"} and not os.environ.get("LDR_NOISE_RUN"):
+        if requested_mode in {"run", "pytest", "module"}:
             _find_previous(store)
         store.full_tests = _full_prefixes(args.full)
         if args.full or args.deep:
@@ -1417,8 +1291,6 @@ def main(argv=None) -> int:
     report_from_sql = (
         store is not None
         and requested_mode in {"run", "pytest", "module"}
-        and not (args.golden or args.diff or args.learn_volatility)
-        and not os.environ.get("LDR_NOISE_RUN")
     )
     recorder_options["build_tree"] = not report_from_sql
     pytest_capture = None
@@ -1598,12 +1470,11 @@ def main(argv=None) -> int:
             }
             status["hot_functions"] = slowdown_report.hot_functions(calls, costs, seconds)
             status["hot_functions_of"] = status["call_stream"]["started"]
-            if requested_mode in {"run", "pytest", "module"} and not os.environ.get("LDR_NOISE_RUN"):
+            if requested_mode in {"run", "pytest", "module"}:
                 if comparison := _compare_with_previous(store, rerun_plan, executed):
                     status["reference"] = comparison
             status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1
             status["call_stream"]["summaries"] = len(stream_summaries)
-            status["call_stream"]["volatile_baseline"] = bool(args.learn_volatility)
             status["call_stream"]["capture_lines"] = store.capture_lines
             if store.max_value_bytes:
                 status["call_stream"]["value_bytes"] = store.value_bytes_used()
@@ -1630,6 +1501,10 @@ def main(argv=None) -> int:
                     },
                 }
             store.finish(status)
+            # The slowdown and the hot functions are for LDR's developers: they stay in the
+            # stored run and are not part of what the agent is shown.
+            for internal in ("slowdown", "hot_functions", "hot_functions_of"):
+                status.pop(internal, None)
         except (OSError, sqlite3.Error) as exc:
             storage_warning = capture_error(exc)
     if storage_warning:
@@ -1675,10 +1550,6 @@ def main(argv=None) -> int:
             redaction_note += "PREVIOUS RUN: none (no earlier run of this target to compare with).\n"
         if status.get("too_large"):
             redaction_note += _render_too_large(status["too_large"], args)
-        if "slowdown" in status:
-            redaction_note += slowdown_report.render_slowdown(status["slowdown"])
-        if status.get("hot_functions"):
-            redaction_note += slowdown_report.render_hot(status["hot_functions"], status["hot_functions_of"])
         if repro := status.get("reproducibility"):
             if "error" not in repro:
                 redaction_note += _reproducibility_line(repro)
@@ -1733,13 +1604,6 @@ def main(argv=None) -> int:
             "The trace captured no frames from a detected production package. "
             f"Try: {command}"
         )
-    noise_path = os.environ.get("LDR_NOISE_RUN")
-    if noise_path:
-        if missing_workers:
-            raise SystemExit(recorder.exit_code or 2)
-        save_trace(noise_path, recorder.roots, invocation=invocation, status=status)
-        return recorder.exit_code
-
     if requested_mode == "inspect":
         inspected = [
             node
@@ -1814,16 +1678,9 @@ def main(argv=None) -> int:
             return recorder.exit_code
         return 0 if inspected else 2
 
-    changes = []
-    baseline_sampled = 0
-    unstable: list[dict[str, str]] = []
-    comparison_unknown = False
-    environment_comparison = None
     stream_changes = []
     if (compared := status.get("reference")) and not compared.get("error") and rerun_plan is None:
         stream_changes = list(compared["changed"])
-    findings = []
-    snapshot_action = "none"
     if sql_report is not None:
         if recorder.roots:
             # The failing path: the recorder kept the escaping chain; SQLite supplies the
@@ -1849,218 +1706,37 @@ def main(argv=None) -> int:
         total_calls = None
     display_scope = _display_scope(scope, initial_cwd)
     rerun = _rerun_payload(args, scope, initial_cwd, project_root)
+    environment_comparison = None
     try:
-        if (missing_workers or status.get("incomplete")) and (args.golden or args.diff):
-            comparison_unknown = True
-            snapshot_action = "unknown"
-            text = (
-                "COMPARISON UNKNOWN: at least one pytest worker trace is missing."
-                if missing_workers
-                else "COMPARISON UNKNOWN: the run is incomplete, so it was neither saved nor compared."
+        text = render_run(
+            trace_roots,
+            args.color,
+            recorder.truncated,
+            args.no_prune,
+            args.max_lines,
+            recorder.dropped_nodes,
+            recorder.sampled_nodes,
+            frame_index=frame_index_payload,
+            suggestions=suggestions if recorder.exit_code != 0 else None,
+            command_target=args.target,
+            scope=display_scope,
+            status=status,
+            max_nodes=args.max_nodes,
+            total_calls=total_calls,
+        )
+        if compared and not compared.get("error") and rerun_plan is None:
+            # How this run differs from the previous one in outcome, commit, mode and environment.
+            environment_comparison, previous_note = _previous_context(
+                store, compared["run_id"], status, environment, scope_warnings
             )
-        elif args.golden:
-            if args.learn_volatility:
-                second = _noise_run(args, scope, invocation, recorder, ldr_dir)
-                for left, right in align(recorder.roots, second):
-                    if left is not None and right is not None:
-                        mark_unstable(left, right)
-                noise_run = getattr(recorder, "noise_run_id", None)
-                if store is not None and noise_run:
-                    # Per call: which calls differed between the two identical runs.
-                    try:
-                        learned = sqlreport.varied_calls(store, noise_run)
-                        store.save_section("varied_calls", json.dumps(learned, separators=(",", ":")))
-                        status["varied_calls"] = {
-                            "runs": 2, "calls": len(learned["addresses"]),
-                            "functions": len(learned["functions"]), "truncated": learned["truncated"],
-                        }
-                    except (OSError, sqlite3.Error, EOFError):
-                        scope_warnings.append("The per-call variation between the two runs could not be stored.")
-            save_trace(golden_path, recorder.roots, invocation=invocation, status=status)
-            snapshot_action = "saved"
-            text = render_run(
-                recorder.roots,
-                args.color,
-                recorder.truncated,
-                args.no_prune,
-                args.max_lines,
-                recorder.dropped_nodes,
-                recorder.sampled_nodes,
-                frame_index=frame_index_payload,
-                suggestions=suggestions if recorder.exit_code != 0 else None,
-                command_target=args.target,
-                scope=display_scope,
-                status=status,
-                max_nodes=args.max_nodes,
-            )
-            volatility = sum(bool(node.volatile) for root in recorder.roots for node in root.walk())
-            text += f"\n\nSnapshot saved for this invocation: {os.path.relpath(golden_path, initial_cwd)}"
-            text += (
-                f"\nBaseline recorded from a run with outcome {describe_outcome(status)} "
-                f"at commit {describe_commit(status['commit'])}."
-            )
-            if args.learn_volatility:
-                text += f"\n{volatility} node(s) contain field-level volatility masks."
-                unstable = unstable_fields(recorder.roots)
-                if unstable:
-                    text += "\n\n" + render_unstable(unstable)
-        elif args.diff:
-            if not os.path.exists(golden_path):
-                raise FileNotFoundError(
-                    f"No snapshot for this invocation ({key}). Run verify or --golden first."
-                )
-            old, envelope = load_trace(golden_path)
-            if envelope.get("invocation") not in ({}, invocation):
-                raise ValueError("snapshot invocation metadata does not match this command")
-            snapshot_schema = envelope.get("schema_version", 1)
-            baseline_status = envelope.get("status", {})
-            if ("trace_workers" in status) != ("trace_workers" in baseline_status):
-                comparison_unknown = True
-                snapshot_action = "unknown"
-                text = (
-                    "COMPARISON UNKNOWN: the baseline and this run use different "
-                    "pytest capture modes. Re-record the baseline with --golden."
-                )
-            elif snapshot_schema < SCHEMA_VERSION:
-                comparison_unknown = True
-                snapshot_action = "unknown"
-                text = (
-                    "COMPARISON UNKNOWN: this snapshot was recorded by an older LDR "
-                    f"(schema {snapshot_schema}, current {SCHEMA_VERSION}). Its values are "
-                    "cut-off previews, so equal or different cannot be said. "
-                    "Re-record it with --golden, then compare again."
-                )
-            else:
-                for left, right in align(old, recorder.roots):
-                    changes.extend(diff_tree(left, right))
-                if (
-                    store is not None and stream_status
-                    and baseline_status.get("run_id") and baseline_status.get("call_stream")
-                    and stream_status["summaries"] == stream_status["expected_workers"]
-                ):
-                    reference = status.get("reference")
-                    try:
-                        if (
-                            reference
-                            and not reference["error"]
-                            and reference["run_id"] == baseline_status["run_id"]
-                        ):
-                            # Every call was compared with the baseline's while it was recorded.
-                            if not stream_status["unfinished"] and not stream_status["write_failed"]:
-                                stream_changes = reference["changed"]
-                        else:
-                            # Older snapshots kept one digest per function instead of one
-                            # record per call; there is nothing to compare call by call.
-                            scope_warnings.append(
-                                "The snapshot's call stream was recorded by an older LDR; "
-                                "re-run needed: record it again with --golden, then compare."
-                            )
-                    except sqlite3.Error:
-                        scope_warnings.append("Could not read baseline call stream fingerprints.")
-                snapshot_action = "compared"
-            if comparison_unknown:
-                pass
-            elif changes:
-                headline = (
-                    "BEST GUESS, RANKED"
-                    if any(change.kind != EQUAL_READABLE for change in changes)
-                    else "EQUAL IN READABLE PARTS ONLY (not proven equal)"
-                )
-                text = headline + "\n" + render_diff(changes, args.color)
-                try:
-                    findings = _finding_payload(changes, store, baseline_status.get("run_id"))
-                except sqlite3.Error:
-                    scope_warnings.append("Could not read structural values for comparison.")
-                details = [
-                    f"{finding['function']} {value['field']}{value['path']}: {value['before']} -> {value['after']}"
-                    for finding in findings for value in finding.get("value_changes", [])
-                ]
-                if details:
-                    text += "\n\nSTORED VALUE DIFFERENCES\n" + "\n".join(details)
-                if stream_changes:
-                    text += (
-                        "\n\nCALL STREAM: fingerprints changed for "
-                        + _describe_changed(
-                            stream_changes[:10], (status.get("reference") or {}).get("changed_detail", {})
-                        )
-                        + "."
-                    )
-                text += "\n\nCALL CHAIN\n" + render_call_chain(recorder.roots, changes, args.color)
-            elif stream_changes:
-                text = (
-                    "CALL STREAM: fingerprints changed for "
-                    + _describe_changed(stream_changes[:10], (status.get("reference") or {}).get("changed_detail", {}))
-                    + "."
-                )
-            else:
-                text = "No behavioural change vs snapshot."
-            unstable = unstable_fields(old)
-            if unstable:
-                text += "\n\n" + render_unstable(unstable)
-            baseline_sampled = baseline_status.get("sampled_repetitions", 0)
-            environment_note = ""
-            if environment is not None:
-                baseline_record = None
-                if (
-                    store is not None
-                    and baseline_status.get("run_id")
-                    and baseline_status.get("environment")
-                ):
-                    try:
-                        baseline_record = store.load_environment(baseline_status["run_id"])
-                    except (OSError, sqlite3.Error, ValueError):
-                        scope_warnings.append("Could not read the baseline environment record.")
-                environment_comparison = run_environment.comparison(
-                    baseline_status.get("environment"),
-                    status["environment"],
-                    baseline_record,
-                    environment,
-                )
-                environment_note = run_environment.render_comparison(
-                    environment_comparison, status["environment"]
-                )
-            if baseline_status and baseline_status.get("mode", "default") != status["mode"]:
-                environment_note += (
-                    f"MODE: the baseline was recorded in {baseline_status.get('mode', 'default')} mode, "
-                    f"this run in {status['mode']} mode. Fingerprints are compared; "
-                    "timings are compared only within the same mode.\n"
-                )
-            if baseline_status:
-                text = (
-                    f"BASELINE: outcome {describe_outcome(baseline_status)}, commit "
-                    f"{describe_commit(baseline_status.get('commit'))}. "
-                    f"THIS RUN: outcome {describe_outcome(status)}, commit "
-                    f"{describe_commit(status['commit'])}.\n"
-                    + environment_note
-                    + "\n"
-                    + text
-                )
-            elif environment_note:
-                text = environment_note + "\n" + text
-        else:
-            text = render_run(
-                trace_roots,
-                args.color,
-                recorder.truncated,
-                args.no_prune,
-                args.max_lines,
-                recorder.dropped_nodes,
-                recorder.sampled_nodes,
-                frame_index=frame_index_payload,
-                suggestions=suggestions if recorder.exit_code != 0 else None,
-                command_target=args.target,
-                scope=display_scope,
-                status=status,
-                max_nodes=args.max_nodes,
-                total_calls=total_calls,
-            )
+            if previous_note:
+                text = previous_note + "\n" + text
     except (OSError, ValueError, RuntimeError) as exc:
-        text = f"LDR snapshot error: {exc}"
+        text = f"LDR report error: {exc}"
         payload = {
             "schema_version": SCHEMA_VERSION,
             "invocation": invocation,
             "status": {**status, "ldr_error": str(exc)},
-            "snapshot": {"key": key, "path": golden_path, "action": "error"},
             "findings": [],
             "failures": _failure_payload(recorder.roots),
         }
@@ -2082,7 +1758,7 @@ def main(argv=None) -> int:
     else:
         note = "RUN STATUS: PASSED\n\n"
     note += redaction_note
-    if recorder.sampled_nodes or baseline_sampled:
+    if recorder.sampled_nodes:
         note += (
             f"DIAGNOSTIC SAMPLE: calls beyond the first {args.max_calls_per_function} "
             "per function are not compared individually unless sampled.\n"
@@ -2113,15 +1789,14 @@ def main(argv=None) -> int:
         "invocation": invocation,
         "rerun": rerun,
         "status": status,
-        "snapshot": {"key": key, "path": golden_path, "action": snapshot_action},
         "behavior": {
-            "changed": bool(stream_changes) or any(change.kind != EQUAL_READABLE for change in changes),
+            "changed": bool(stream_changes),
             "stream_changed_functions": stream_changes,
-            "finding_count": len(changes),
-            "equal_in_readable_parts_only": sum(
-                change.kind == EQUAL_READABLE for change in changes
+            # How many calls differ from, are new against, or are missing from the previous run.
+            "changed_calls": (
+                compared["different"] + compared["new"] + compared["missing"]
+                if compared and not compared.get("error") else 0
             ),
-            "unstable_fields": unstable[:50],
         },
         "environment_comparison": environment_comparison,
         "frame_index": frame_index_payload,
@@ -2132,7 +1807,7 @@ def main(argv=None) -> int:
             "project_calls": project_calls,
             "warnings": scope_warnings,
         },
-        "findings": findings or _finding_payload(changes),
+        "findings": [],
         "failures": _failure_payload(recorder.roots),
     }
     # A rerun for detail must not replace the result of the run it repeats.
@@ -2150,9 +1825,7 @@ def main(argv=None) -> int:
     if recorder.exit_code != 0:
         return recorder.exit_code
     # Equal-in-readable-parts is stated, not failed: it is not a proven change.
-    if args.fail_on_change and (
-        comparison_unknown or stream_changes or any(change.kind != EQUAL_READABLE for change in changes)
-    ):
+    if args.fail_on_change and stream_changes:
         return 3
     return 0
 

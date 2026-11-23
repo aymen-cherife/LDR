@@ -57,7 +57,7 @@ def test_cli_preserves_output_and_saves_readable_evidence(project):
     plain = export(launch(project, "app.py"), project)
     assert plain == {"orders": {"A": 400, "B": 375, "C": 50}, "total_cents": 825}
     traced = launch(
-        project, "-m", "ldr", "run", "app.py", "--golden",
+        project, "-m", "ldr", "run", "app.py",
         "--deep=make_export", "--deep=pricing_options",
     )
     assert export(traced, project) == plain
@@ -103,12 +103,12 @@ def test_cli_preserves_output_and_saves_readable_evidence(project):
     for path in (last_json, trace_dir / "last.txt", trace_dir / "traces.sqlite3"):
         assert EXPORT_KEY.encode() not in path.read_bytes()
 
-    unchanged = launch(project, "-m", "ldr", "run", "app.py", "--diff", "--fail-on-change")
+    unchanged = launch(project, "-m", "ldr", "run", "app.py", "--fail-on-change")
     assert export(unchanged, project) == plain
     assert json.loads(last_json.read_bytes())["behavior"]["changed"] is False
 
     changed = launch(
-        project, "-m", "ldr", "run", "app.py", "--diff", "--fail-on-change",
+        project, "-m", "ldr", "run", "app.py", "--fail-on-change",
         rate=120, expected_exit=3,
     )
     assert export(changed, project) == export(launch(project, "app.py", rate=120), project)
@@ -145,7 +145,7 @@ def test_boundary_capture_records_python_library_calls_without_their_internals(p
         handle.write("max_boundary_bytes = 10000\n")
     plain = export(launch(project, "app.py"), project)
     traced = launch(
-        project, "-m", "ldr", "run", "app.py", "--golden",
+        project, "-m", "ldr", "run", "app.py",
         "--boundary", "urllib.parse", "--boundary", "json",
     )
     assert export(traced, project) == plain
@@ -175,7 +175,7 @@ def test_boundary_capture_records_python_library_calls_without_their_internals(p
     for file in ("traces.sqlite3", "last.json", "last.txt"):
         assert EXPORT_KEY.encode() not in (project / ".ldr" / file).read_bytes()
 
-    launch(project, "-m", "ldr", "run", "app.py", "--diff", "--fail-on-change")
+    launch(project, "-m", "ldr", "run", "app.py", "--fail-on-change")
     assert json.loads(status_file.read_bytes())["behavior"]["changed"] is False
     assert json.loads(launch(project, "-m", "ldr", "show", "--boundaries", "--json"))[
         "boundaries"

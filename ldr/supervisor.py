@@ -215,7 +215,6 @@ def supervise(rundir: str) -> int:
 
 def _progress(state: State, sink, ldr_dir: str, started: float) -> None:
     """Keep progress current while the program runs: calls recorded, tests started, elapsed."""
-    baseline = None
     while state.fields.get("state") == "running":
         calls = tests = 0
         run = sink.runs.get(sink.main_run) if sink.main_run else None
@@ -223,18 +222,9 @@ def _progress(state: State, sink, ldr_dir: str, started: float) -> None:
             with run.lock:
                 calls = sum(worker["fingerprinted"] for worker in run.counts.values())
                 tests = run.tests
-            if baseline is None and run.invocation is not None:
-                try:
-                    from .slowdown import read_baselines
-                    from .store import invocation_key
-
-                    record = read_baselines(ldr_dir).get(invocation_key(run.invocation))
-                    baseline = record["seconds"] if record else 0
-                except Exception:
-                    baseline = 0
         try:
             state.update(calls=calls, tests=tests, elapsed=round(time.time() - started, 1),
-                         baseline_seconds=baseline or None, store_run_id=sink.main_run, state="running")
+                         store_run_id=sink.main_run, state="running")
         except OSError:
             pass
         time.sleep(1.0)

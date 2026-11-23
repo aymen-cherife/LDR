@@ -170,9 +170,9 @@ def configured(tmp_path):
 
 def test_the_gaps_line_names_the_value_the_sketch_state_and_the_exact_command(tmp_path):
     configured(tmp_path)
-    ldr(tmp_path, "--golden")
+    ldr(tmp_path)
     (tmp_path / "app.py").write_text(APP + "# edit\n", encoding="utf-8")
-    result = ldr(tmp_path, "--diff")
+    result = ldr(tmp_path)
     assert "too large: list at app.py:total#1 (rows), sketch unchanged" in result.stdout
     assert "An unchanged sketch does not prove the value is unchanged." in result.stdout
     assert "ldr run app.py --uncap=app.py:total" in result.stdout
@@ -181,21 +181,21 @@ def test_the_gaps_line_names_the_value_the_sketch_state_and_the_exact_command(tm
 
 def test_a_deep_change_is_invisible_to_the_sketch_and_uncapping_finds_it(tmp_path):
     configured(tmp_path)
-    ldr(tmp_path, "--golden")
+    ldr(tmp_path)
     deep = APP.replace("total(big)", "big[3000][4] = -1\ntotal(big)")
     (tmp_path / "app.py").write_text(deep, encoding="utf-8")
-    result = ldr(tmp_path, "--diff")
+    result = ldr(tmp_path)
     assert "sketch unchanged" in result.stdout  # the deep change is invisible to the sketch
-    again = ldr(tmp_path, "--diff", "--uncap=app.py:total")
+    again = ldr(tmp_path, "--uncap=app.py:total")
     assert "TOO LARGE" not in again.stdout  # normal mode, ceiling lifted for that function
     assert report(tmp_path)["reference"]["different"] == 1
 
 
 def test_a_change_of_size_changes_the_sketch(tmp_path):
     configured(tmp_path)
-    ldr(tmp_path, "--golden")
+    ldr(tmp_path)
     (tmp_path / "app.py").write_text(APP.replace("range(5000)", "range(5001)"), encoding="utf-8")
-    assert "sketch changed" in ldr(tmp_path, "--diff").stdout
+    assert "sketch changed" in ldr(tmp_path).stdout
 
 
 def test_full_has_no_ceiling(tmp_path):

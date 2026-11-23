@@ -42,12 +42,12 @@ PASSING = "def top(x):\n    return x + 1\ntop(1)\n"
 
 
 @needs_git
-def test_baseline_from_a_failing_run_states_outcome_and_commit(tmp_path):
+def test_a_failing_run_states_its_outcome_and_commit(tmp_path):
     head = make_repo(tmp_path, FAILING)
 
-    result = ldr(tmp_path, "run", "m.py", "--golden")
+    result = ldr(tmp_path, "run", "m.py")
 
-    assert "Baseline recorded from a run with outcome FAILED (exit 1) at commit " + head[:7] in result.stdout
+    assert "RUN STATUS: FAILED (exit 1)" in result.stdout and f"COMMIT: {head[:7]}" in result.stdout
     status = json.loads((tmp_path / ".ldr" / "last.json").read_text())["status"]
     assert status["commit"] == {"id": head, "dirty": False}
     assert status["exit_code"] == 1
@@ -65,17 +65,17 @@ def test_uncommitted_changes_are_stated_not_judged(tmp_path):
 
 
 @needs_git
-def test_diff_names_the_outcome_and_commit_of_both_runs(tmp_path):
+def test_the_comparison_names_the_outcome_and_commit_of_both_runs(tmp_path):
     first = make_repo(tmp_path, PASSING)
-    ldr(tmp_path, "run", "m.py", "--golden")
+    ldr(tmp_path, "run", "m.py")
     (tmp_path / "m.py").write_text(FAILING)
     git(tmp_path, "commit", "-q", "-am", "break it")
     second = git(tmp_path, "rev-parse", "HEAD")
 
-    result = ldr(tmp_path, "run", "m.py", "--diff")
+    result = ldr(tmp_path, "run", "m.py")
 
     assert (
-        f"BASELINE: outcome PASSED (exit 0), commit {first[:7]}. "
+        f"PREVIOUS RUN: outcome PASSED (exit 0), commit {first[:7]}. "
         f"THIS RUN: outcome FAILED (exit 1), commit {second[:7]}."
     ) in result.stdout
 
@@ -83,7 +83,7 @@ def test_diff_names_the_outcome_and_commit_of_both_runs(tmp_path):
 def test_without_git_the_commit_is_reported_as_none(tmp_path):
     (tmp_path / "m.py").write_text(PASSING)
 
-    result = ldr(tmp_path, "run", "m.py", "--golden")
+    result = ldr(tmp_path, "run", "m.py")
 
     assert "COMMIT: none (no git repository found)" in result.stdout
     assert json.loads((tmp_path / ".ldr" / "last.json").read_text())["status"]["commit"] is None
@@ -98,8 +98,8 @@ def test_ldr_never_writes_to_git(tmp_path):
         for p in (tmp_path / ".git").rglob("*") if p.is_file()
     }
 
-    ldr(tmp_path, "run", "m.py", "--golden")
-    ldr(tmp_path, "run", "m.py", "--diff")
+    ldr(tmp_path, "run", "m.py")
+    ldr(tmp_path, "run", "m.py")
 
     after = {
         str(p.relative_to(tmp_path)): (p.stat().st_mtime_ns, p.stat().st_size)

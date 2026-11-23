@@ -1,4 +1,6 @@
-"""Phase 2 rules 16 and 17: the untraced baseline, the slowdown, and the hot functions."""
+"""Phase 2 rules 16 and 17, as an internal tool for LDR's developers: the untraced time
+(`--untraced-time`), the slowdown and the hot functions. They are kept with the stored run and
+never shown to the agent (see test_removed_surface.py)."""
 
 import json
 import os
@@ -35,7 +37,15 @@ def ldr(project, *args, expected=0):
     return result
 
 
-def status(project):
+def stored(project):
+    """The status of the latest run, as stored with the run (the developers' copy)."""
+    with sqlite3.connect(project / ".ldr" / "traces.sqlite3") as connection:
+        return json.loads(
+            connection.execute("SELECT status FROM runs ORDER BY started_ns DESC LIMIT 1").fetchone()[0]
+        )
+
+
+def shown(project):
     return json.loads((project / ".ldr" / "last.json").read_text(encoding="utf-8"))["status"]
 
 
@@ -44,51 +54,47 @@ def runs(project):
         return connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
 
-def test_without_a_baseline_the_slowdown_says_so_and_nothing_is_run_twice(tmp_path):
+def test_without_an_untraced_time_the_stored_slowdown_says_so_and_nothing_is_run_twice(tmp_path):
     (tmp_path / "app.py").write_text(APP, encoding="utf-8")
     result = ldr(tmp_path, "run", "app.py")
-    assert "SLOWDOWN: no baseline" in result.stdout
-    assert status(tmp_path)["slowdown"] == {"state": "no baseline"}
+    assert "SLOWDOWN" not in result.stdout
+    assert stored(tmp_path)["slowdown"] == {"state": "no baseline"}
+    assert "slowdown" not in shown(tmp_path)
     assert runs(tmp_path) == 1
 
 
-def test_a_baseline_is_one_untraced_run_and_later_runs_state_the_factor(tmp_path):
+def test_the_untraced_time_is_one_untraced_run_and_later_runs_store_the_factor(tmp_path):
     (tmp_path / "app.py").write_text(APP, encoding="utf-8")
     ldr(tmp_path, "run", "app.py")  # a traced run first: it supplies the file hashes
-    result = ldr(tmp_path, "run", "app.py", "--baseline")
-    assert result.stdout.startswith("BASELINE:") and "untraced (exit 0)" in result.stdout
-    assert runs(tmp_path) == 1  # the baseline recorded nothing
+    result = ldr(tmp_path, "run", "app.py", "--untraced-time")
+    assert result.stdout.startswith("untraced time:") and "(exit 0)" in result.stdout
+    assert runs(tmp_path) == 1  # the untraced run recorded nothing
     recorded = json.loads((tmp_path / ".ldr" / "baselines.json").read_text(encoding="utf-8"))
     ((key, record),) = recorded.items()
     assert record["seconds"] > 0 and list(record["files"]) == ["app.py"]
-    traced = ldr(tmp_path, "run", "app.py")
-    info = status(tmp_path)["slowdown"]
+    ldr(tmp_path, "run", "app.py")
+    info = stored(tmp_path)["slowdown"]
     assert info["state"] == "measured" and info["factor"] > 0 and info["changed_files"] == []
-    assert f"SLOWDOWN: {info['factor']:.1f}x" in traced.stdout
-    assert status(tmp_path)["invocation_key"] == key
+    assert stored(tmp_path)["invocation_key"] == key
+    assert "slowdown" not in shown(tmp_path)
 
 
-def test_a_changed_file_makes_the_baseline_stale(tmp_path):
+def test_a_changed_file_makes_the_untraced_time_stale(tmp_path):
     (tmp_path / "app.py").write_text(APP, encoding="utf-8")
     ldr(tmp_path, "run", "app.py")
-    ldr(tmp_path, "run", "app.py", "--baseline")
+    ldr(tmp_path, "run", "app.py", "--untraced-time")
     (tmp_path / "app.py").write_text(APP + "# edited\n", encoding="utf-8")
-    result = ldr(tmp_path, "run", "app.py")
-    assert status(tmp_path)["slowdown"]["state"] == "stale"
-    assert "baseline stale (changed since it was recorded: app.py)" in result.stdout
+    ldr(tmp_path, "run", "app.py")
+    info = stored(tmp_path)["slowdown"]
+    assert info["state"] == "stale" and info["changed_files"] == ["app.py"]
 
 
-def test_a_baseline_without_file_hashes_says_staleness_cannot_be_checked(tmp_path):
+def test_an_untraced_time_without_file_hashes_says_staleness_cannot_be_checked(tmp_path):
     (tmp_path / "app.py").write_text(APP, encoding="utf-8")
-    result = ldr(tmp_path, "run", "app.py", "--baseline")
+    result = ldr(tmp_path, "run", "app.py", "--untraced-time")
     assert "no file hashes" in result.stdout
-    traced = ldr(tmp_path, "run", "app.py")
-    assert "baseline stale cannot be checked" in traced.stdout
-
-
-def test_baseline_cannot_be_combined_with_recording_options(tmp_path):
-    (tmp_path / "app.py").write_text(APP, encoding="utf-8")
-    assert ldr(tmp_path, "run", "app.py", "--baseline", "--golden", expected=2).returncode == 2
+    ldr(tmp_path, "run", "app.py")
+    assert stored(tmp_path)["slowdown"]["file_hashes_recorded"] is False
 
 
 def test_above_five_times_it_suggests_a_narrower_trace():
@@ -112,20 +118,19 @@ def test_the_slowdown_arithmetic():
     assert slowdown.slowdown(5.0, None, {}, []) == {"state": "no baseline"}
 
 
-def test_hot_functions_are_reported_not_skipped(tmp_path):
+def test_hot_functions_are_recorded_for_developers_and_not_shown(tmp_path):
     (tmp_path / "app.py").write_text(APP, encoding="utf-8")
     result = ldr(tmp_path, "run", "app.py")
-    hot = status(tmp_path)["hot_functions"]
+    hot = stored(tmp_path)["hot_functions"]
     assert hot[0]["function"] == "app.py:hot" and hot[0]["calls"] == 500
     assert hot[0]["share"] > 0.99 and hot[0]["fingerprint_nodes"] > 0
-    assert "HOT FUNCTIONS (of 501 calls): app.py:hot 500 calls" in result.stdout
-    assert "They are recorded, not skipped." in result.stdout
+    assert "HOT FUNCTIONS" not in result.stdout and "hot_functions" not in shown(tmp_path)
 
 
 def test_a_small_run_lists_no_hot_functions(tmp_path):
     (tmp_path / "app.py").write_text("def f():\n    return 1\nf()\n", encoding="utf-8")
-    result = ldr(tmp_path, "run", "app.py")
-    assert status(tmp_path)["hot_functions"] == [] and "HOT FUNCTIONS" not in result.stdout
+    ldr(tmp_path, "run", "app.py")
+    assert stored(tmp_path)["hot_functions"] == []
 
 
 def test_printed_output_is_limited_to_30000_characters():

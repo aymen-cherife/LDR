@@ -97,10 +97,3 @@ def test_without_a_tree_no_node_is_built_but_a_failure_still_gets_its_path(tmp_p
     assert recorder.n_nodes == 0
     assert [root.name for root in recorder.roots] == ["top"]  # the failing path only
     assert recorder.roots[0].error.startswith("RuntimeError")
-
-
-def test_snapshots_still_use_the_capped_tree(tmp_path):
-    (tmp_path / "app.py").write_text(MANY, encoding="utf-8")
-    ldr(tmp_path, "run", "app.py", "--golden")
-    data = report(tmp_path)
-    assert data["status"]["trace_truncated"] is True  # the tree is capped; the snapshot is a sample

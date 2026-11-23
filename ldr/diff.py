@@ -98,8 +98,7 @@ def compare_fields(old: Node, new: Node) -> dict[str, tuple[str, bool]]:
     return fields
 
 
-VARIED_NOTE = "also varied across {runs} runs with no edit"
-VARIED_RUNS = 2  # the snapshot run and the one noise run --learn-volatility adds
+from .previous import VARIED_NOTE, VARIED_RUNS  # noqa: E402,F401
 
 
 def varied_fields(old: Node, new: Node) -> list[str]:

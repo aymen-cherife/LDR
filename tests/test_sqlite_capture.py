@@ -131,11 +131,11 @@ def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, m
         "    return data\n"
         "target()\n"
     )
-    result = invoke(tmp_path, "run", "app.py", "--golden", "--", "--token", "qzx")
+    result = invoke(tmp_path, "run", "app.py", "--", "--token", "qzx-8841-argv")
     assert result.returncode == 0, result.stdout + result.stderr
     result = invoke(
-        tmp_path, "run", "app.py", "--deep=app.py:target", "--diff",
-        "--fail-on-change", "--", "--token", "qzx",
+        tmp_path, "run", "app.py", "--deep=app.py:target",
+        "--fail-on-change", "--", "--token", "qzx-8841-argv",
     )
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads((tmp_path / ".ldr" / "last.json").read_text())
@@ -159,7 +159,7 @@ def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, m
     database = (tmp_path / ".ldr" / "traces.sqlite3").read_bytes()
     assert secret.encode() not in database
     assert b"fixture-local-name-secret" not in database
-    assert b"qzx" not in database
+    assert b"qzx-8841-argv" not in database
 
 
 def test_deep_capture_marks_yield_continuation_and_unwind(tmp_path):
@@ -227,12 +227,11 @@ def test_structural_values_explain_a_change_outside_the_preview(tmp_path):
         "update([8] * 60, 'fixture-secret-kept-out')\n"
     )
     program.write_text(template.format(changed=8))
-    baseline = invoke(tmp_path, "run", "app.py", "--golden")
-    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    first = invoke(tmp_path, "run", "app.py")
+    assert first.returncode == 0, first.stdout + first.stderr
     program.write_text(template.format(changed=9))
-    compared = invoke(tmp_path, "run", "app.py", "--diff", "--fail-on-change")
+    compared = invoke(tmp_path, "run", "app.py", "--fail-on-change")
     assert compared.returncode == 3, compared.stdout + compared.stderr
-    assert "out[42]: 8 -> 9" in compared.stdout
 
     inspected = invoke(tmp_path, "inspect", "--frame-id", "1")
     assert inspected.returncode == 0, inspected.stdout + inspected.stderr
@@ -375,7 +374,7 @@ def test_pytest_xdist_records_both_workers_and_preserves_failure(tmp_path):
     assert len({frame_id for _, frame_id in totals.values()}) == 2
 
 
-def test_crashed_pytest_worker_prevents_saving_an_incomplete_baseline(tmp_path):
+def test_crashed_pytest_worker_is_reported_as_a_missing_trace(tmp_path):
     pytest.importorskip("xdist")
     (tmp_path / "test_crash.py").write_text(
         "import os\n\ndef test_crash():\n    os._exit(7)\n"
@@ -384,7 +383,6 @@ def test_crashed_pytest_worker_prevents_saving_an_incomplete_baseline(tmp_path):
         tmp_path,
         "pytest",
         "test_crash.py",
-        "--golden",
         "--",
         "-n",
         "1",
@@ -393,8 +391,6 @@ def test_crashed_pytest_worker_prevents_saving_an_incomplete_baseline(tmp_path):
     assert result.returncode == 1, result.stdout + result.stderr
     report = json.loads((tmp_path / ".ldr" / "last.json").read_text())
     assert report["status"]["missing_trace_workers"] == ["gw0"]
-    assert report["snapshot"]["action"] == "unknown"
-    assert not Path(report["snapshot"]["path"]).exists()
 
 
 @pytest.mark.parametrize("max_trace_bytes", [1000, 100_000])
@@ -407,10 +403,10 @@ def test_late_unsampled_change_is_detected_at_and_below_storage_budget(
     program = tmp_path / "app.py"
     template = "def leaf(n):\n    return n + ({delta} if n == 37 else 0)\nfor i in range(50):\n    leaf(i)\n"
     program.write_text(template.format(delta=0))
-    baseline = invoke(tmp_path, "run", "app.py", "--golden")
-    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    first = invoke(tmp_path, "run", "app.py")
+    assert first.returncode == 0, first.stdout + first.stderr
     program.write_text(template.format(delta=1))
-    result = invoke(tmp_path, "run", "app.py", "--diff", "--fail-on-change")
+    result = invoke(tmp_path, "run", "app.py", "--fail-on-change")
     assert result.returncode == 3, result.stdout + result.stderr
     report = json.loads((tmp_path / ".ldr" / "last.json").read_text())
     assert report["behavior"]["stream_changed_functions"] == ["app.py:leaf"]

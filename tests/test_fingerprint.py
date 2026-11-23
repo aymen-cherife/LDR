@@ -45,38 +45,6 @@ def test_change_beyond_the_preview_is_reported():
     assert "beyond the preview" in text
 
 
-def test_old_schema_snapshot_compares_as_unknown_with_a_rerecord_hint(tmp_path):
-    """Schema 6 snapshots hold previews only. They must never read as 'unchanged'."""
-    import json
-    import subprocess
-
-    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
-    (tmp_path / "m.py").write_text(
-        "def top(x):\n    return x + 1\n"
-        "if __name__ == '__main__':\n    print(top(5))\n"
-    )
-
-    def run(*extra):
-        return subprocess.run(
-            [sys.executable, "-m", "ldr.cli", "run", str(tmp_path / "m.py"),
-             "--only", str(tmp_path), *extra],
-            cwd=tmp_path, env=env, capture_output=True, text=True,
-        )
-
-    assert run("--golden").returncode == 0
-    snapshot = next((tmp_path / ".ldr" / "snapshots").glob("*.json"))
-    payload = json.loads(snapshot.read_text())
-    payload["schema_version"] = 6
-    snapshot.write_text(json.dumps(payload))
-
-    result = run("--diff", "--fail-on-change")
-
-    assert "No behavioural change" not in result.stdout
-    assert "unknown" in result.stdout.lower()
-    assert "re-record" in result.stdout.lower()
-    assert result.returncode == 3
-
-
 class Hooked:
     """Every hook LDR could trip over counts how often it ran."""
 
@@ -417,16 +385,16 @@ def test_cli_does_not_report_no_change_for_partially_readable_receivers(tmp_path
         )
 
     (tmp_path / "app.py").write_text(script % "")
-    assert run("--golden").returncode == 0
+    assert run().returncode == 0
     (tmp_path / "app.py").write_text(script % "client.guard.acquire()\n")
 
-    result = run("--diff", "--fail-on-change")
+    result = run("--fail-on-change")
 
-    assert "EQUAL IN READABLE PARTS ONLY" in result.stdout
-    assert "No behavioural change" not in result.stdout
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
     assert payload["behavior"]["changed"] is False
-    assert payload["behavior"]["equal_in_readable_parts_only"] >= 1
+    # Equal in the readable parts only: stated as not compared, never as the same.
+    assert payload["status"]["reference"]["not_compared"] >= 1
+    assert "not compared" in result.stdout
     assert result.returncode == 0  # not a proven change; stated, not failed
 
 

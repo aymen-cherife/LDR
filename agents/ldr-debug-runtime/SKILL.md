@@ -52,12 +52,12 @@ results, or ordered state transitions violate the expected invariant. Broad
 traces sample repetitive calls to protect useful late evidence; the JSON status
 reports both sampling and hard-budget overflow explicitly.
 
-For a behavioral regression, save the pre-edit behavior and compare after the patch:
+For a behavioral regression, run the same command before and after the patch. Every run is compared with the previous run of the same target, and the output names what changed:
 
 ```bash
-ldr verify tests/test_feature.py::test_case --only src tests
+ldr pytest tests/test_feature.py::test_case --only src tests
 # edit
-ldr verify tests/test_feature.py::test_case --only src tests
+ldr pytest tests/test_feature.py::test_case --only src tests
 ```
 
 Preserve LDR's exit code: a failing target still exits nonzero even when evidence was written successfully. Do not repeatedly trace the whole suite, enable `--full` by default, or inspect frames without a concrete hypothesis. Verify the final patch with the project's normal tests, not LDR alone.

@@ -8,7 +8,6 @@ import os
 import tempfile
 from typing import Any
 
-from .node import Node
 from .redact import redact_argv
 
 SCHEMA_VERSION = 7
@@ -66,22 +65,13 @@ def invocation_descriptor(
     }
 
 
-def invocation_key(descriptor: dict[str, Any], name: str | None = None) -> str:
-    if name:
-        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in name).strip("-")
-        if not safe:
-            raise ValueError("snapshot name must contain a letter or number")
-        return safe[:80]
+def invocation_key(descriptor: dict[str, Any]) -> str:
     # The command: runner, target, arguments and --only. The inferred scope is left out, so
     # adding a package to the project does not make the same command a different target.
     command = {key: descriptor.get(key) for key in ("runner", "target", "arguments")}
     command["only"] = descriptor.get("only") or []
     payload = json.dumps(command, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:20]
-
-
-def snapshot_path(ldr_dir: str, key: str) -> str:
-    return os.path.join(ldr_dir, "snapshots", f"{key}.json")
 
 
 def atomic_json(path: str, payload: Any) -> None:
@@ -118,31 +108,3 @@ def atomic_text(path: str, text: str) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
-
-
-def save_trace(
-    path: str,
-    roots: list[Node],
-    *,
-    invocation: dict[str, Any] | None = None,
-    status: dict[str, Any] | None = None,
-) -> None:
-    atomic_json(
-        path,
-        {
-            "schema_version": SCHEMA_VERSION,
-            "invocation": invocation or {},
-            "status": status or {},
-            "roots": [root.to_dict() for root in roots],
-        },
-    )
-
-
-def load_trace(path: str) -> tuple[list[Node], dict[str, Any]]:
-    with open(path, encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if isinstance(payload, list):
-        return [Node.from_dict(item) for item in payload], {"schema_version": 1}
-    if not isinstance(payload, dict) or not isinstance(payload.get("roots"), list):
-        raise ValueError(f"invalid LDR trace: {path}")
-    return [Node.from_dict(item) for item in payload["roots"]], payload

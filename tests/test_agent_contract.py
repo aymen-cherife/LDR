@@ -24,15 +24,6 @@ def invoke(tmp_path, *arguments):
     )
 
 
-def test_unrelated_targets_have_independent_snapshots(tmp_path):
-    (tmp_path / "test_a.py").write_text("def test_a():\n    assert True\n")
-    (tmp_path / "test_b.py").write_text("def test_b():\n    assert True\n")
-    assert invoke(tmp_path, "verify", "test_a.py").returncode == 0
-    assert invoke(tmp_path, "verify", "test_b.py").returncode == 0
-    snapshots = list((tmp_path / ".ldr" / "snapshots").glob("*.json"))
-    assert len(snapshots) == 2
-
-
 def test_expected_exception_is_not_a_failed_path(tmp_path):
     (tmp_path / "test_expected.py").write_text(
         "import pytest\n"
@@ -143,41 +134,6 @@ def test_project_relative_ids_keep_same_basenames_distinct(tmp_path):
     recorder = Recorder(scope=[str(tmp_path)], project_root=str(tmp_path))
     assert recorder._source_id(str(tmp_path / "src" / "common.py")) == "src/common.py"
     assert recorder._source_id(str(tmp_path / "tests" / "common.py")) == "tests/common.py"
-
-
-def test_named_snapshot_compares_across_checkout_directories(tmp_path):
-    for checkout, multiplier in (("a", 2), ("b", 3)):
-        root = tmp_path / checkout
-        root.mkdir()
-        (root / "pyproject.toml").write_text(
-            '[project]\nname = "cross-checkout"\nversion = "0"\n'
-        )
-        (root / "probe.py").write_text(
-            "def calculate(value):\n"
-            f"    return value * {multiplier}\n"
-            "print(calculate(4))\n"
-        )
-
-    baseline = invoke(
-        tmp_path,
-        "run", "a/probe.py", "--snapshot-name", "cross-checkout", "--golden",
-    )
-    assert baseline.returncode == 0, baseline.stderr
-    compared = invoke(
-        tmp_path,
-        "run", "b/probe.py", "--snapshot-name", "cross-checkout", "--diff",
-    )
-    assert compared.returncode == 0, compared.stderr
-    output = (tmp_path / ".ldr" / "last.txt").read_text()
-    assert "[CHANGED HERE] calculate" in output
-    assert "new call" not in output and "call gone" not in output
-    assert "@ b/probe.py:1" in output
-
-    snapshot = json.loads(
-        (tmp_path / ".ldr" / "snapshots" / "cross-checkout.json").read_text()
-    )
-    assert snapshot["invocation"]["target"] == "probe.py"
-    assert snapshot["roots"][0]["source_id"] == "probe.py"
 
 
 def test_capture_redacts_named_and_nested_secrets():

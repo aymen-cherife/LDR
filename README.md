@@ -65,9 +65,8 @@ releases with the WAL-reset fix and rollback journaling on earlier releases.
 LDR streams completed in-scope calls into SQLite. The byte budget covers the
 serialized call records and their frame IDs. SQLite pages, indexes, the
 diagnostic tree, and function summaries use additional space. When the detail
-budget is exhausted, function fingerprints still summarize the remaining calls.
-If the sampled diagnostic comparison finds no changes, local snapshots can
-use those fingerprints to detect changes outside the sample.
+budget is exhausted, every call still keeps its fingerprints, and each run is
+compared with the previous run of the same target through them.
 
 Set `capture_lines = true` in the same table and set `max_trace_bytes`
 explicitly for the workload. Each retained SQLite call then has an
@@ -84,8 +83,7 @@ LDR stores supported built-in scalars and containers at function entry and
 exit and on return. Larger or unsupported values keep available fingerprints,
 shape, and previews. Redacted values carry a redaction status. Run `ldr
 inspect --frame-id N` and open `captured_values` in `.ldr/last.json` to read
-the values. When both local runs retained a complete changed value, `--diff`
-can report the first differing item, such as `out[42]: 8 -> 9`.
+the values.
 
 To see how locals evolve inside a function, set an explicit
 `max_trace_bytes` and a positive `max_deep_bytes` in `[tool.ldr.storage]`.
@@ -169,14 +167,13 @@ ldr inspect tests/test_orders.py::test_refund \
 ## Compare behavior before and after a change
 
 ```bash
-# Capture the current behavior
-ldr verify tests/test_orders.py::test_refund --only src tests
+ldr pytest tests/test_orders.py::test_refund --only src tests
 
 # Edit the code, then run the same command again
-ldr verify tests/test_orders.py::test_refund --only src tests
+ldr pytest tests/test_orders.py::test_refund --only src tests
 ```
 
-The second run reports what changed in the execution tree. Snapshots are scoped by runner, target, arguments, and source scope so unrelated executions are not compared accidentally.
+Every run is recorded, and each run is compared with the previous run of the same target. The output names the functions whose calls changed. A pytest run is compared with the latest earlier pytest run that shares test node ids; tests present in only one of the two runs are listed as not compared. Any other run is compared with the latest earlier run of exactly the same command (target, arguments and `--only`). When two runs of identical files differ, the difference carries the note "also varied across 2 runs with no edit". The last 2 runs of each target are kept (`keep_runs` in `[tool.ldr.storage]`).
 
 ## Useful controls
 
@@ -189,9 +186,7 @@ The second run reports what changed in the execution tree. Snapshots are scoped 
 --frame-id N                Restore and inspect a ranked frame from the latest result
 --frame FRAME_ID            Inspect one invocation or a function selector ending #*
 --max-state-steps 200       Bound focused local-state history
---learn-volatility          Mask fields that vary across repeated runs
 --fail-on-change            Exit with code 3 when behavior changes
---golden                    Replace the current snapshot
 ```
 
 Values and output are bounded and result files are written atomically. On POSIX systems they are created with owner-only permissions (0600); on Windows LDR does not change file permissions.

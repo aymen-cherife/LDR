@@ -112,7 +112,7 @@ def test_status_shows_progress_then_the_result_the_exit_code_and_the_end_of_the_
     directory = wait_for(lambda: next(iter(runs(tmp_path)), None))
     wait_for(lambda: state_of(directory).get("state") == "running" and state_of(directory).get("calls"))
     running = ldr(tmp_path, "status", expected=0).stdout
-    assert "running" in running and "call(s) recorded" in running and "slowdown: no baseline" in running
+    assert "running" in running and "call(s) recorded" in running and "slowdown" not in running
     waiter.communicate(timeout=120)
     done = ldr(tmp_path, "status", directory.name, expected=0).stdout
     assert "finished" in done and "exit code 0" in done and "end of output:" in done and "finished" in done.split("end of output:")[1]
@@ -139,7 +139,7 @@ def test_progress_is_never_silent_when_the_output_is_not_a_terminal(tmp_path):
     result = ldr(tmp_path, "run", "app.py")
     assert result.returncode == 0
     lines = [line for line in result.stderr.splitlines() if line.startswith("[ldr] running")]
-    assert lines and "call(s) recorded" in lines[0] and "elapsed" in lines[0] and "slowdown" in lines[0]
+    assert lines and "call(s) recorded" in lines[0] and "elapsed" in lines[0] and "slowdown" not in lines[0]
 
 
 def test_status_without_runs_says_so(tmp_path):

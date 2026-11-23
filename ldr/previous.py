@@ -23,6 +23,8 @@ from pathlib import Path
 from .store import invocation_key
 
 KEEP_RUNS = 2  # runs kept per target; [tool.ldr.storage] keep_runs changes it
+VARIED_RUNS = 2  # the two consecutive runs of identical files that the note speaks of
+VARIED_NOTE = "also varied across {runs} runs with no edit"
 
 _ROOT = re.compile(r"(?:[^/:]+/)*[^/]*?::[^/]*")
 

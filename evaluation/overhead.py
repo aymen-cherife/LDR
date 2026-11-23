@@ -226,19 +226,12 @@ def noise(name, fixture, env):
     first, second = calls
     changed = [key for key in first if key in second and first[key] != second[key]]
     causes = Counter(first[key][0] for key in changed)
-    # The same code a third time, against a snapshot that learned what varies: every
-    # difference is reported, and the ones that also varied between the two learning runs
-    # carry the note.
-    flagged = list(traced)
-    split = flagged.index("--") if "--" in flagged else len(flagged)
-    learn = [*flagged[:split], "--golden", "--learn-volatility", *flagged[split:]]
-    diff = [*flagged[:split], "--diff", *flagged[split:]]
+    # The same code twice more, as two recorded runs: the second is compared with the first by
+    # the run itself (previous.compare). Every difference is reported; when both runs executed
+    # identical files, each carries the note "also varied across 2 runs with no edit".
     clean(root)
-    timed(learn, root, env)
-    try:
-        timed(diff, root, env)
-    except SystemExit:
-        pass  # a difference in a failing test run still leaves the report
+    timed(traced, root, env)
+    timed(traced, root, env)
     with open(root / ".ldr" / "last.json", encoding="utf-8") as handle:
         reference = json.load(handle).get("status", {}).get("reference") or {}
     detail = reference.get("changed_detail", {})
@@ -278,7 +271,7 @@ def main() -> int:
         if not args.json:
             if args.noise:
                 print(
-                    f"{item['fixture']:8s} A/A with --learn-volatility: {item['learned_differing_calls']} calls "
+                    f"{item['fixture']:8s} A/A against the previous run: {item['learned_differing_calls']} calls "
                     f"differ, {item['learned_calls_with_note']} carry the note; plain A/A: "
                     f"{item['calls_differing']} of {item['calls']} calls differ, "
                     f"{item['calls_only_in_one_run']} only in one run; tables {item['which']}; "

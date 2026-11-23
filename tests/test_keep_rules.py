@@ -129,7 +129,7 @@ def test_the_hard_cap_drops_lower_priority_detail_first(tmp_path):
 def test_passing_the_fingerprint_ceiling_stops_the_run_and_says_so(tmp_path):
     source = "def f(n):\n    return n\n\n\nfor n in range(200):\n    f(n)\n"
     connection, run_id, result = run(
-        tmp_path, source, "max_recorded_calls = 50\n", "--golden"
+        tmp_path, source, "max_recorded_calls = 50\n"
     )
     report = json.loads((tmp_path / ".ldr" / "last.json").read_bytes())
     incomplete = report["status"]["incomplete"]
@@ -138,5 +138,3 @@ def test_passing_the_fingerprint_ceiling_stops_the_run_and_says_so(tmp_path):
         "SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run_id,)
     ).fetchone()[0] <= 50
     assert "INCOMPLETE" in result.stdout
-    assert report["snapshot"]["action"] == "unknown"
-    assert not Path(report["snapshot"]["path"]).exists()

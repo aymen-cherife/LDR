@@ -385,32 +385,6 @@ def test_cli_run_writes_output_file(tmp_path):
     assert "compute" in (tmp_path / ".ldr" / "last.txt").read_text()
 
 
-def test_cli_golden_then_diff_finds_origin(tmp_path):
-    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
-    src = tmp_path / "m.py"
-    src.write_text(
-        "def inner(x):\n    return x * 2\n"
-        "def top(x):\n    return inner(x) + 1\n"
-        "if __name__ == '__main__':\n    print(top(5))\n"
-    )
-    run = lambda extra: subprocess.run(  # noqa: E731
-        [sys.executable, "-m", "ldr.cli", "run", str(src), "--only", str(tmp_path), *extra],
-        cwd=tmp_path, env=env, capture_output=True, text=True,
-    )
-    a = run(["--golden"])
-    assert a.returncode == 0, a.stderr
-
-    src.write_text(
-        "def inner(x):\n    return x * 3\n"
-        "def top(x):\n    return inner(x) + 1\n"
-        "if __name__ == '__main__':\n    print(top(5))\n"
-    )
-    b = run(["--diff"])
-    assert b.returncode == 0, b.stderr
-    assert "CHANGED HERE" in b.stdout
-    assert "inner" in b.stdout.split("CHANGED HERE")[1].split("\n")[0]
-
-
 def test_cli_pytest_mode_traces_the_code_under_test(tmp_path):
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
     (tmp_path / "lib.py").write_text("def add(a, b):\n    return a + b\n")
@@ -489,50 +463,6 @@ def test_addresses_are_normalised():
         pass
 
     assert "0x*" in capture(helper)  # a function's own repr still carries one
-
-
-def test_verify_snapshots_then_diffs(tmp_path):
-    """`ldr verify` with no flags: first call snapshots, second reports."""
-    # PYTHONDONTWRITEBYTECODE: the two source versions below are the same
-    # length. If both writes land in the same filesystem mtime tick, the
-    # default mtime+size pyc cache check can't tell the file changed and
-    # silently reuses the stale compiled version - a real, observed flake,
-    # not a fault in LDR. Force fresh compilation every time instead.
-    env = dict(
-        os.environ, PYTHONPATH=os.path.dirname(HERE), PYTHONDONTWRITEBYTECODE="1"
-    )
-    src = tmp_path / "m.py"
-    src.write_text(
-        "def inner(x):\n    return x * 2\n"
-        "def top(x):\n    return inner(x) + 1\n"
-        "if __name__ == '__main__':\n    print(top(5))\n"
-    )
-    (tmp_path / "t.py").write_text(
-        "import sys; sys.path.insert(0, r'%s')\n"
-        "from m import top\n\ndef test_top():\n    assert top(5) == 11\n" % tmp_path
-    )
-
-    def verify():
-        return subprocess.run(
-            [sys.executable, "-m", "ldr.cli", "verify", str(tmp_path / "t.py"),
-             "--runner", "pytest", "--only", str(tmp_path)],
-            cwd=tmp_path, env=env, capture_output=True, text=True,
-        )
-
-    a = verify()
-    assert a.returncode == 0, a.stderr
-    assert "Snapshot saved" in a.stdout
-
-    src.write_text(
-        "def inner(x):\n    return x * 3\n"
-        "def top(x):\n    return inner(x) + 1\n"
-        "if __name__ == '__main__':\n    print(top(5))\n"
-    )
-    b = verify()
-    assert b.returncode == 1, b.stderr
-    out = (tmp_path / ".ldr" / "last.txt").read_text()
-    assert "CHANGED HERE" in out or "RAISES HERE" in out
-    assert "inner" in out
 
 
 def test_module_mode_traces_unittest():
@@ -630,9 +560,8 @@ def test_entry_file_failure_is_never_hidden_by_only(tmp_path):
 
 
 def test_only_accepts_multiple_paths_without_dropping_any():
-    """--only used to accept a single path; the golden-run noise run
-    subprocess also only forwarded the first scope entry, silently
-    narrowing scope on the second half of every --golden call."""
+    """--only used to accept a single path; a second process also only forwarded the first
+    scope entry, silently narrowing the scope."""
     from ldr.cli import _entry_dirs
 
     assert isinstance(_entry_dirs("run", __file__), list)
@@ -657,3 +586,47 @@ def test_collection_failure_gets_an_honest_note_not_a_silent_pass(tmp_path):
     )
     assert "NOTE:" in r.stdout
     assert "trace cannot localize that failure" in r.stdout
+
+
+def test_a_changed_function_is_named_in_the_comparison_with_the_previous_run(tmp_path):
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE), PYTHONDONTWRITEBYTECODE="1")
+    src = tmp_path / "m.py"
+    src.write_text(
+        "def inner(x):\n    return x * 2\n"
+        "def top(x):\n    return inner(x) + 1\n"
+        "if __name__ == '__main__':\n    print(top(5))\n"
+    )
+    run = lambda: subprocess.run(  # noqa: E731
+        [sys.executable, "-m", "ldr.cli", "run", str(src), "--only", str(tmp_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True,
+    )
+    assert run().returncode == 0
+    src.write_text(
+        "def inner(x):\n    return x * 3\n"
+        "def top(x):\n    return inner(x) + 1\n"
+        "if __name__ == '__main__':\n    print(top(5))\n"
+    )
+    result = run()
+    assert result.returncode == 0, result.stderr
+    changed = next(line for line in result.stdout.splitlines() if line.startswith("CHANGED:"))
+    assert "m.py:inner" in changed and "m.py:top" in changed
+
+
+def test_a_failing_pytest_run_after_an_edit_names_the_changed_function(tmp_path):
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE), PYTHONDONTWRITEBYTECODE="1")
+    src = tmp_path / "m.py"
+    src.write_text("def inner(x):\n    return x * 2\ndef top(x):\n    return inner(x) + 1\n")
+    (tmp_path / "t.py").write_text(
+        "import sys; sys.path.insert(0, r'%s')\n"
+        "from m import top\n\ndef test_top():\n    assert top(5) == 11\n" % tmp_path
+    )
+    run = lambda: subprocess.run(  # noqa: E731
+        [sys.executable, "-m", "ldr.cli", "pytest", str(tmp_path / "t.py"), "--only", str(tmp_path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True,
+    )
+    assert run().returncode == 0
+    src.write_text("def inner(x):\n    return x * 3\ndef top(x):\n    return inner(x) + 1\n")
+    result = run()
+    assert result.returncode == 1, result.stderr
+    out = (tmp_path / ".ldr" / "last.txt").read_text()
+    assert "CHANGED:" in out and "m.py:inner" in out

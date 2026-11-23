@@ -1,4 +1,4 @@
-"""The per-run environment record: names only, saved with the run, compared on --diff."""
+"""The per-run environment record: names only, saved with the run, compared with the previous run."""
 
 import json
 import os
@@ -64,18 +64,18 @@ def test_compare_lists_each_difference_as_a_fact():
     assert environment.compare(record(), record()) == []
 
 
-def test_comparison_says_unknown_when_the_baseline_has_no_record():
+def test_comparison_says_unknown_when_the_previous_run_has_no_record():
     current = environment.summarize(record())
     result = environment.comparison(None, current, None, record())
     assert result["state"] == "unknown"
     assert "recorded no environment" in environment.render_comparison(result, current)
 
 
-def test_comparison_reports_same_changed_and_unreadable_baselines():
+def test_comparison_reports_same_changed_and_unreadable_records():
     current = environment.summarize(record())
     same = environment.comparison(current, current, record(), record())
     assert same["state"] == "same"
-    assert "same as the baseline" in environment.render_comparison(same, current)
+    assert "same as the previous run" in environment.render_comparison(same, current)
 
     newer = record(packages={"pytest": "9.0.0", "requests": "2.31.0"})
     summary = environment.summarize(newer)
@@ -142,38 +142,6 @@ def test_run_saves_names_only_and_show_reads_them_without_running(project):
     assert SENTINEL_VALUE not in text
 
 
-def test_diff_reports_an_environment_change_without_calling_it_a_behaviour_change(project):
-    launch(project, "run", "app.py", "--golden")
-    same = launch(project, "run", "app.py", "--diff", "--fail-on-change")
-    assert "ENVIRONMENT: same as the baseline" in same
-    last = project / ".ldr" / "last.json"
-    assert json.loads(last.read_bytes())["environment_comparison"]["state"] == "same"
-
-    changed = launch(
-        project, "run", "app.py", "--diff", "--fail-on-change",
-        extra_env={SENTINEL_NAME: SENTINEL_VALUE},
-    )
-    assert "ENVIRONMENT CHANGED since the baseline" in changed
-    assert f"variable name {SENTINEL_NAME} added" in changed
-    assert SENTINEL_VALUE not in changed
-    report = json.loads(last.read_bytes())
-    assert report["environment_comparison"]["state"] == "changed"
-    assert report["behavior"]["changed"] is False
-
-
-def test_diff_against_a_baseline_without_a_record_says_it_did_not_compare(project):
-    launch(project, "run", "app.py", "--golden")
-    snapshots = list((project / ".ldr" / "snapshots").glob("*.json"))
-    assert len(snapshots) == 1
-    saved = json.loads(snapshots[0].read_text(encoding="utf-8"))
-    del saved["status"]["environment"]
-    snapshots[0].write_text(json.dumps(saved), encoding="utf-8")
-    text = launch(project, "run", "app.py", "--diff")
-    assert "ENVIRONMENT: not compared; the baseline run recorded no environment" in text
-    report = json.loads((project / ".ldr" / "last.json").read_bytes())
-    assert report["environment_comparison"]["state"] == "unknown"
-
-
 def test_show_environment_names_a_run_that_has_no_record(project):
     launch(project, "run", "app.py")
     with sqlite3.connect(project / ".ldr" / "traces.sqlite3") as connection:
@@ -188,3 +156,34 @@ def test_show_environment_names_a_run_that_has_no_record(project):
     )
     assert result.returncode == 2
     assert "No environment was recorded for run" in result.stderr
+
+
+def test_the_comparison_reports_an_environment_change_without_calling_it_a_behaviour_change(project):
+    launch(project, "run", "app.py")
+    same = launch(project, "run", "app.py", "--fail-on-change")
+    assert "ENVIRONMENT: same as the previous run" in same
+    last = project / ".ldr" / "last.json"
+    assert json.loads(last.read_bytes())["environment_comparison"]["state"] == "same"
+
+    changed = launch(
+        project, "run", "app.py", "--fail-on-change",
+        extra_env={SENTINEL_NAME: SENTINEL_VALUE},
+    )
+    assert "ENVIRONMENT CHANGED since the previous run" in changed
+    assert f"variable name {SENTINEL_NAME} added" in changed
+    assert SENTINEL_VALUE not in changed
+    report = json.loads(last.read_bytes())
+    assert report["environment_comparison"]["state"] == "changed"
+    assert report["behavior"]["changed"] is False
+
+
+def test_a_previous_run_without_a_record_says_it_did_not_compare(project):
+    import sqlite3
+
+    launch(project, "run", "app.py")
+    with sqlite3.connect(project / ".ldr" / "traces.sqlite3") as connection:
+        connection.execute("UPDATE runs SET status = json_remove(status, '$.environment')")
+    text = launch(project, "run", "app.py")
+    assert "ENVIRONMENT: not compared; the previous run recorded no environment" in text
+    report = json.loads((project / ".ldr" / "last.json").read_bytes())
+    assert report["environment_comparison"]["state"] == "unknown"

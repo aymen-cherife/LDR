@@ -198,16 +198,16 @@ def describe_change(change: dict) -> str:
 
 
 def comparison(baseline: dict | None, current: dict, baseline_record: dict | None, record: dict):
-    """Compare this run's environment with the baseline's, saying what is unknown.
+    """Compare this run's environment with the previous run's, saying what is unknown.
 
-    ``baseline`` and ``current`` are the short summaries kept in each run's
-    status. ``baseline_record`` is the baseline's full record when it could
+    ``baseline`` (the previous run's) and ``current`` are the short summaries kept in each run's
+    status. ``baseline_record`` is the previous run's full record when it could
     be read back.
     """
     if not baseline:
         return {
             "state": "unknown",
-            "reason": "the baseline run recorded no environment",
+            "reason": "the previous run recorded no environment",
             "changes": [],
             "omitted": 0,
         }
@@ -216,7 +216,7 @@ def comparison(baseline: dict | None, current: dict, baseline_record: dict | Non
     if baseline_record is None:
         return {
             "state": "changed",
-            "reason": "the baseline's full record could not be read, so the differences are not listed",
+            "reason": "the previous run's full record could not be read, so the differences are not listed",
             "changes": [],
             "omitted": 0,
         }
@@ -235,7 +235,7 @@ def render_comparison(result: dict, current: dict, *, max_lines: int = 12) -> st
     state = result["state"]
     if state == "same":
         return (
-            f"ENVIRONMENT: same as the baseline (Python {current['python']}, "
+            f"ENVIRONMENT: same as the previous run (Python {current['python']}, "
             f"{current['packages']} packages, {current['variables']} variable names).\n"
         )
     if state == "unknown":
@@ -243,9 +243,9 @@ def render_comparison(result: dict, current: dict, *, max_lines: int = 12) -> st
     changes = result["changes"]
     total = len(changes) + result["omitted"]
     head = (
-        f"ENVIRONMENT CHANGED since the baseline ({total} difference(s))"
+        f"ENVIRONMENT CHANGED since the previous run ({total} difference(s))"
         if changes
-        else "ENVIRONMENT CHANGED since the baseline"
+        else "ENVIRONMENT CHANGED since the previous run"
     )
     if result["reason"]:
         return f"{head}; {result['reason']}.\n"
