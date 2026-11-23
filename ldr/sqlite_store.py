@@ -673,6 +673,14 @@ class TraceStore:
                 "INSERT OR REPLACE INTO run_sections VALUES (?, ?, ?)", (self.run_id, name, text)
             )
 
+    def load_section(self, run_id, name):
+        """One stored part of a run's result (see save_section), or None."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT payload FROM run_sections WHERE run_id = ? AND name = ?", (run_id, name)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
     @staticmethod
     def read_section(directory, run_id, name):
         """One stored part of a run's result, or None. Read-only."""

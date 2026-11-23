@@ -27,31 +27,34 @@ def ldr(cwd, *args):
     )
 
 
-def test_masked_fields_are_listed_when_comparing(tmp_path):
+def test_a_field_that_varied_is_still_compared_and_the_change_carries_a_note(tmp_path):
     (tmp_path / "app.py").write_text(SCRIPT)
     assert ldr(tmp_path, "--golden", "--learn-volatility").returncode == 0
 
     result = ldr(tmp_path, "--diff")
 
-    assert "No behavioural change" in result.stdout  # the unstable field is not a finding...
-    assert "UNSTABLE (shown, not compared)" in result.stdout  # ...but it is never hidden
-    assert "pick" in result.stdout.split("UNSTABLE")[1]
-    assert "out" in result.stdout.split("UNSTABLE")[1]
-    assert "stable(" not in result.stdout.split("UNSTABLE")[1]
+    # The random value changed between the snapshot and this run: it is a change, counted
+    # and shown, and the note says it also changed between two runs of identical code.
+    assert "No behavioural change" not in result.stdout
+    assert "pick" in result.stdout.split("BEST GUESS")[1]
+    assert "note: out also varied across 2 runs with no edit" in result.stdout
+    assert "stable(" not in result.stdout.split("BEST GUESS")[1].split("VARIED")[0]
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
+    assert payload["behavior"]["changed"] is True
+    assert payload["behavior"]["finding_count"] >= 1
     assert payload["behavior"]["unstable_fields"][0]["field"] == "out"
 
 
-def test_saving_a_baseline_lists_what_was_found_unstable(tmp_path):
+def test_saving_a_baseline_lists_what_varied_between_the_two_runs(tmp_path):
     (tmp_path / "app.py").write_text(SCRIPT)
 
     result = ldr(tmp_path, "--golden", "--learn-volatility")
 
-    assert "UNSTABLE (shown, not compared)" in result.stdout
-    assert "pick" in result.stdout.split("UNSTABLE")[1]
+    assert "VARIED BETWEEN IDENTICAL RUNS" in result.stdout
+    assert "pick" in result.stdout.split("VARIED BETWEEN")[1]
 
 
-def test_unstable_beyond_the_preview_is_found_too(tmp_path):
+def test_a_difference_beyond_the_preview_is_found_and_carries_the_note(tmp_path):
     """A random list differing only past the 6-item preview must still be learned."""
     (tmp_path / "app.py").write_text(
         "import random\n"
@@ -63,5 +66,5 @@ def test_unstable_beyond_the_preview_is_found_too(tmp_path):
 
     result = ldr(tmp_path, "--diff")
 
-    assert "No behavioural change" in result.stdout
-    assert "noisy" in result.stdout.split("UNSTABLE")[1]
+    assert "noisy" in result.stdout
+    assert "also varied across 2 runs with no edit" in result.stdout

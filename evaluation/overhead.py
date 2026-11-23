@@ -219,7 +219,26 @@ def noise(name, fixture, env):
     first, second = calls
     changed = [key for key in first if key in second and first[key] != second[key]]
     causes = Counter(first[key][0] for key in changed)
+    # The same code a third time, against a snapshot that learned what varies: every
+    # difference is reported, and the ones that also varied between the two learning runs
+    # carry the note.
+    flagged = list(traced)
+    split = flagged.index("--") if "--" in flagged else len(flagged)
+    learn = [*flagged[:split], "--golden", "--learn-volatility", *flagged[split:]]
+    diff = [*flagged[:split], "--diff", *flagged[split:]]
+    clean(root)
+    timed(learn, root, env)
+    try:
+        timed(diff, root, env)
+    except SystemExit:
+        pass  # a difference in a failing test run still leaves the report
+    with open(root / ".ldr" / "last.json", encoding="utf-8") as handle:
+        reference = json.load(handle).get("status", {}).get("reference") or {}
+    detail = reference.get("changed_detail", {})
     return {
+        "fixture": name,
+        "learned_differing_calls": sum(item[0] for item in detail.values()),
+        "learned_calls_with_note": sum(item[1] for item in detail.values()),
         "fixture": name,
         "differences": len(different),
         "which": different,
@@ -252,7 +271,9 @@ def main() -> int:
         if not args.json:
             if args.noise:
                 print(
-                    f"{item['fixture']:8s} A/A: {item['calls_differing']} of {item['calls']} calls differ, "
+                    f"{item['fixture']:8s} A/A with --learn-volatility: {item['learned_differing_calls']} calls "
+                    f"differ, {item['learned_calls_with_note']} carry the note; plain A/A: "
+                    f"{item['calls_differing']} of {item['calls']} calls differ, "
                     f"{item['calls_only_in_one_run']} only in one run; tables {item['which']}; "
                     f"top functions {item['top_functions']}",
                     flush=True,

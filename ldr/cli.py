@@ -465,7 +465,34 @@ def _reference_status(parts: list[dict]) -> dict[str, Any]:
         **total,
         "missing": sum(counted) if counted and len(counted) == len(parts) else None,
         "changed": sorted({function for part in parts for function in part["changed"]}),
+        "changed_detail": _merge_detail(parts),
     }
+
+
+def _merge_detail(parts: list[dict]) -> dict[str, list[int]]:
+    merged: dict[str, list[int]] = {}
+    for part in parts:
+        for function, (changed, varied) in part.get("changed_detail", {}).items():
+            total = merged.setdefault(function, [0, 0])
+            total[0] += changed
+            total[1] += varied
+    return merged
+
+
+def _describe_changed(functions: list[str], detail: dict[str, list[int]]) -> str:
+    """Name each changed function, with the note when its calls also varied with no edit."""
+    from .diff import VARIED_NOTE, VARIED_RUNS
+
+    parts = []
+    for function in functions:
+        changed, varied = detail.get(function, [0, 0])
+        notes = []
+        if varied:
+            notes.append(f"{varied} of {changed} call(s) " + VARIED_NOTE.format(runs=VARIED_RUNS))
+        if function.rsplit(".", 1)[-1] == "__hash__":
+            notes.append("a __hash__ result, which is often id-based")
+        parts.append(function + (f" ({'; '.join(notes)})" if notes else ""))
+    return ", ".join(parts)
 
 
 def _fingerprint_status(summaries: list[dict]) -> dict[str, Any]:
@@ -1053,6 +1080,7 @@ def _noise_run(
             raise RuntimeError(f"noise run produced no trace: {detail}")
         roots, envelope = load_trace(noise_path)
         noise_status = envelope.get("status", {})
+        recorder.noise_run_id = noise_status.get("run_id")
         if noise_status.get("exit_code") != recorder.exit_code:
             raise RuntimeError(
                 "noise run changed runner status; snapshot was not saved "
@@ -1749,6 +1777,18 @@ def main(argv=None) -> int:
                 for left, right in align(recorder.roots, second):
                     if left is not None and right is not None:
                         mark_unstable(left, right)
+                noise_run = getattr(recorder, "noise_run_id", None)
+                if store is not None and noise_run:
+                    # Per call: which calls differed between the two identical runs.
+                    try:
+                        learned = sqlreport.varied_calls(store, noise_run)
+                        store.save_section("varied_calls", json.dumps(learned, separators=(",", ":")))
+                        status["varied_calls"] = {
+                            "runs": 2, "calls": len(learned["addresses"]),
+                            "functions": len(learned["functions"]), "truncated": learned["truncated"],
+                        }
+                    except (OSError, sqlite3.Error, EOFError):
+                        scope_warnings.append("The per-call variation between the two runs could not be stored.")
             save_trace(golden_path, recorder.roots, invocation=invocation, status=status)
             snapshot_action = "saved"
             text = render_run(
@@ -1807,9 +1847,8 @@ def main(argv=None) -> int:
                 for left, right in align(old, recorder.roots):
                     changes.extend(diff_tree(left, right))
                 if (
-                    not changes and store is not None and stream_status
+                    store is not None and stream_status
                     and baseline_status.get("run_id") and baseline_status.get("call_stream")
-                    and not baseline_status.get("call_stream", {}).get("volatile_baseline")
                     and stream_status["summaries"] == stream_status["expected_workers"]
                 ):
                     reference = status.get("reference")
@@ -1851,9 +1890,21 @@ def main(argv=None) -> int:
                 ]
                 if details:
                     text += "\n\nSTORED VALUE DIFFERENCES\n" + "\n".join(details)
+                if stream_changes:
+                    text += (
+                        "\n\nCALL STREAM: fingerprints changed for "
+                        + _describe_changed(
+                            stream_changes[:10], (status.get("reference") or {}).get("changed_detail", {})
+                        )
+                        + "."
+                    )
                 text += "\n\nCALL CHAIN\n" + render_call_chain(recorder.roots, changes, args.color)
             elif stream_changes:
-                text = "CALL STREAM: fingerprints changed for " + ", ".join(stream_changes[:10]) + "."
+                text = (
+                    "CALL STREAM: fingerprints changed for "
+                    + _describe_changed(stream_changes[:10], (status.get("reference") or {}).get("changed_detail", {}))
+                    + "."
+                )
             else:
                 text = "No behavioural change vs snapshot."
             unstable = unstable_fields(old)

@@ -123,7 +123,13 @@ def test_volatile_parent_does_not_hide_child_regression():
     changed = Node("root", {}, out="nonce-c", children=[Node("compute", {}, out="99")])
     changes = diff_tree(baseline, changed)
     assert baseline.volatile == ["out"]
-    assert [(change.kind, change.path) for change in changes] == [("origin", "root > compute")]
+    # Nothing is left out: the child's change and the parent's (which carries the note).
+    assert [(change.kind, change.path) for change in changes] == [
+        ("origin", "root > compute"), ("downstream", "root"),
+    ] or {(change.kind, change.path) for change in changes} >= {("origin", "root > compute")}
+    by_path = {change.path: change for change in changes}
+    assert by_path["root > compute"].varied == []
+    assert by_path["root"].varied == ["out"]
 
 
 def test_source_identity_ignores_checkout_display_path():

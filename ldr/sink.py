@@ -313,6 +313,10 @@ class RemoteStore(TraceStore):
         self.sync()
         return super().list_rng(run_id)
 
+    def load_section(self, run_id, name):
+        self.sync()
+        return super().load_section(run_id, name)
+
     def save_worker(self, worker, roots, summary):
         self._send(("worker", worker, list(_call_rows(roots)), summary))
         self.sync()

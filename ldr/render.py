@@ -15,6 +15,8 @@ from .diff import (
     UNKNOWN,
     UNSTABLE,
     EQUAL_READABLE,
+    VARIED_NOTE,
+    VARIED_RUNS,
     Change,
     beyond_preview,
     partial_fields,
@@ -291,7 +293,7 @@ _LABEL = {
     DOWNSTREAM: "downstream",
     ADDED: "new call",
     REMOVED: "call gone",
-    UNSTABLE: "nondeterministic field ignored",
+    UNSTABLE: "varied between identical runs",
     UNKNOWN: "cannot compare",
     EQUAL_READABLE: "equal in readable parts only",
 }
@@ -321,10 +323,7 @@ def render_call_chain(roots: list[Node], changes: list[Change], color: bool = Fa
 
 
 def _visible_inputs(old: Node, new: Node) -> tuple[dict[str, str], dict[str, str]]:
-    masks = set(old.volatile) | set(new.volatile)
-    left = {key: value for key, value in old.in_.items() if f"in.{key}" not in masks}
-    right = {key: value for key, value in new.in_.items() if f"in.{key}" not in masks}
-    return left, right
+    return dict(old.in_), dict(new.in_)
 
 
 def _state(value: str | None) -> str:
@@ -353,13 +352,17 @@ def render_diff(changes: list[Change], color: bool = False, max_findings: int = 
         lines.append(f"[{_LABEL[change.kind]}] {change.path}{location}")
         if change.old is not None and change.kind != REMOVED:
             left_inputs, right_inputs = _visible_inputs(change.old, change.node)
-            masks = set(change.old.volatile) | set(change.node.volatile)
             if left_inputs != right_inputs:
                 lines.append(f"    in : {left_inputs} -> {right_inputs}")
-            if "out" not in masks and change.old.out != change.node.out:
+            if change.old.out != change.node.out:
                 lines.append(f"    out: {_state(change.old.out)} -> {_state(change.node.out)}")
-            if "error" not in masks and change.old.error != change.node.error:
+            if change.old.error != change.node.error:
                 lines.append(f"    err: {change.old.error} -> {change.node.error}")
+            if change.varied:
+                lines.append(
+                    f"    note: {', '.join(change.varied)} "
+                    + VARIED_NOTE.format(runs=VARIED_RUNS)
+                )
             for field in beyond_preview(change.old, change.node):
                 label = field[3:] if field.startswith("in.") else field
                 if label in ("self", "cls"):

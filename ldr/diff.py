@@ -70,13 +70,14 @@ def _compare_fingerprints(old_fp, new_fp) -> tuple[str, bool]:
     return _EQUAL, False  # absent or redacted on a side: not compared
 
 
-def compare_fields(old: Node, new: Node, masks: set[str] | None = None) -> dict[str, tuple[str, bool]]:
-    """Per-field outcome for a pair of calls: ``in.<name>``, ``out``, ``error``, ``handled``."""
-    masks = set(old.volatile) | set(new.volatile) | (masks or set())
+def compare_fields(old: Node, new: Node) -> dict[str, tuple[str, bool]]:
+    """Per-field outcome for a pair of calls: ``in.<name>``, ``out``, ``error``, ``handled``.
+
+    Every field is compared, including the ones that varied between two runs of identical
+    code: a change is never left out. Those get a note instead (see ``varied_fields``).
+    """
     fields: dict[str, tuple[str, bool]] = {}
     for key in sorted(set(old.in_) | set(new.in_) | set(old.in_fp) | set(new.in_fp)):
-        if f"in.{key}" in masks:
-            continue
         if key not in old.in_ and key not in new.in_:
             # Fingerprint only, such as a receiver (`self`): it has no preview.
             fields[f"in.{key}"] = _compare_fingerprints(old.in_fp.get(key), new.in_fp.get(key))
@@ -87,12 +88,9 @@ def compare_fields(old: Node, new: Node, masks: set[str] | None = None) -> dict[
         fields[f"in.{key}"] = _compare_value(
             old.in_[key], old.in_fp.get(key), new.in_[key], new.in_fp.get(key)
         )
-    if "out" not in masks:
-        fields["out"] = _compare_value(old.out, old.out_fp, new.out, new.out_fp)
-    if "error" not in masks:
-        fields["error"] = (_EQUAL if old.error == new.error else _DIFFERENT, False)
-    if "handled" not in masks:
-        fields["handled"] = (_EQUAL if old.handled == new.handled else _DIFFERENT, False)
+    fields["out"] = _compare_value(old.out, old.out_fp, new.out, new.out_fp)
+    fields["error"] = (_EQUAL if old.error == new.error else _DIFFERENT, False)
+    fields["handled"] = (_EQUAL if old.handled == new.handled else _DIFFERENT, False)
     fields["input_changes"] = (
         _EQUAL if old.input_changes == new.input_changes else _DIFFERENT,
         False,
@@ -100,8 +98,21 @@ def compare_fields(old: Node, new: Node, masks: set[str] | None = None) -> dict[
     return fields
 
 
-def _own_state(old: Node, new: Node, masks: set[str] | None = None) -> str:
-    states = {state for state, _ in compare_fields(old, new, masks).values()}
+VARIED_NOTE = "also varied across {runs} runs with no edit"
+VARIED_RUNS = 2  # the snapshot run and the one noise run --learn-volatility adds
+
+
+def varied_fields(old: Node, new: Node) -> list[str]:
+    """Fields that differ now and also differed between two runs of identical code."""
+    learned = set(old.volatile) | set(new.volatile)
+    return [
+        name for name, (state, _) in compare_fields(old, new).items()
+        if state == _DIFFERENT and name in learned
+    ]
+
+
+def _own_state(old: Node, new: Node) -> str:
+    states = {state for state, _ in compare_fields(old, new).values()}
     for state in (_DIFFERENT, _UNKNOWN, _PARTIAL):
         if state in states:
             return state
@@ -143,35 +154,30 @@ def _fp_or_text(node: Node, key: str) -> str:
     return fingerprint if is_digest(fingerprint) else "t:" + node.in_[key]
 
 
-def _masked_own(node: Node, masks: set[str] | None = None) -> dict:
-    masks = set(node.volatile) | (masks or set())
-    inputs = {
-        key: value
-        for key, value in node.in_.items()
-        if f"in.{key}" not in masks
-    }
+def _own(node: Node) -> dict:
+    """What a call's hash covers: everything, including fields that varied between runs."""
     payload = {
         "name": node.name,
-        "in": inputs,
-        "out": None if "out" in masks else node.out,
+        "in": dict(node.in_),
+        "out": node.out,
         "input_changes": node.input_changes,
-        "error": None if "error" in masks else node.error,
-        "handled": None if "handled" in masks else node.handled,
+        "error": node.error,
+        "handled": node.handled,
     }
     if node.in_fp or node.out_fp:
-        payload["in_fp"] = {k: v for k, v in node.in_fp.items() if f"in.{k}" not in masks}
-        payload["out_fp"] = None if "out" in masks else node.out_fp
+        payload["in_fp"] = dict(node.in_fp)
+        payload["out_fp"] = node.out_fp
     return payload
 
 
 def shallow_hash(node: Node) -> str:
-    payload = json.dumps(_masked_own(node), sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(_own(node), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def node_hash(node: Node) -> str:
     payload = {
-        "own": _masked_own(node),
+        "own": _own(node),
         "children": [node_hash(child) for child in node.children],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -179,6 +185,8 @@ def node_hash(node: Node) -> str:
 
 
 def _input_token(node: Node) -> str:
+    # Only for pairing calls: an input that varies between identical runs must not stop two
+    # calls of the same function from being paired. It is still compared once they are.
     masks = set(node.volatile)
     values = {k: _fp_or_text(node, k) for k in node.in_ if f"in.{k}" not in masks}
     return json.dumps(values, sort_keys=True, separators=(",", ":"))
@@ -232,6 +240,7 @@ def mark_unstable(old: Node, noise: Node) -> None:
 
 class Change:
     def __init__(self, kind, path, node, old, depth=0, leaf=True):
+        self.varied: list[str] = []  # fields of this change that also varied with no edit
         self.kind = kind
         self.path = path
         self.node = node
@@ -335,12 +344,13 @@ def diff_tree(
             for change in child_changes
         )
         self_change = [Change(kind, here, new, old, depth, leaf)]
+        self_change[0].varied = varied_fields(old, new)
     return self_change + unknown + child_changes
 
 
 def unstable_fields(roots: list[Node]) -> list[dict[str, str]]:
-    """Fields learned to vary between identical runs. They are not compared, so
-    they are listed instead: a masked field must never hide silently."""
+    """Fields learned to vary between identical runs. They are compared like any other;
+    a change in one carries a note."""
     found = []
     for root in roots:
         for node in root.walk():
@@ -354,7 +364,7 @@ def unstable_fields(roots: list[Node]) -> list[dict[str, str]]:
 def render_unstable(items: list[dict[str, str]], limit: int = 10) -> str:
     if not items:
         return ""
-    lines = ["UNSTABLE (shown, not compared)"]
+    lines = ["VARIED BETWEEN IDENTICAL RUNS (still compared; a change in one carries a note)"]
     lines += [f"  {item['call']}  {item['field']}" for item in items[:limit]]
     if len(items) > limit:
         lines.append(f"  (+{len(items) - limit} more in .ldr/last.json)")

@@ -78,6 +78,10 @@ class CallStream:
         self.reference_error = None
         self.reference_counts = {"compared": 0, "same": 0, "different": 0, "new": 0, "not_compared": 0}
         self.changed = {}
+        # Addresses whose calls also differed between two runs of identical code (learned by
+        # --learn-volatility on the reference run), and how many changed calls are such.
+        self.varied = set()
+        self.changed_varied = {}
         self.preview_of = None
         self.flusher_ident = None
         if getattr(store, "remote", False):
@@ -93,6 +97,11 @@ class CallStream:
                 )
             except (OSError, sqlite3.Error) as exc:
                 self.reference_error = type(exc).__name__
+            try:
+                learned = store.load_section(store.reference_run, "varied_calls")
+                self.varied = set(learned["addresses"]) if learned else set()
+            except (OSError, sqlite3.Error, KeyError, ValueError):
+                self.varied = set()
 
     @property
     def keeping_details(self):
@@ -390,6 +399,8 @@ class CallStream:
         counts[state] += 1
         if state in ("different", "new"):
             self.changed[function] = self.changed.get(function, 0) + 1
+            if frame_id in self.varied:
+                self.changed_varied[function] = self.changed_varied.get(function, 0) + 1
         return state
 
     def flush(self):
@@ -458,6 +469,10 @@ class CallStream:
                     **self.reference_counts,
                     "missing": len(missing) if missing is not None else None,
                     "changed": sorted(changed),
+                    "changed_detail": {
+                        function: [self.changed.get(function, 0), self.changed_varied.get(function, 0)]
+                        for function in sorted(changed)
+                    },
                 }
             if self.boundaries is not None:
                 summary["boundaries"] = self.boundaries.finish()

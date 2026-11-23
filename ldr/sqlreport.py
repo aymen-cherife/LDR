@@ -198,6 +198,57 @@ def trace_nodes(store, locations: dict, limit: int = TRACE_LIMIT) -> list[Node]:
     return roots
 
 
+VARIED_LIMIT = 100_000  # addresses kept per learned baseline
+
+
+def varied_calls(store, other_run: str) -> dict:
+    """Calls that differ between this run and ``other_run``, two runs of identical code.
+
+    ``{"addresses": [...], "functions": {function: count}, "truncated": bool}``. A call that
+    exists in only one of the runs counts as varying too. Waits for the other run to finish
+    writing: it was recorded by another process.
+    """
+    import time
+
+    deadline = time.monotonic() + 15
+    with _open(store) as connection:
+        while time.monotonic() < deadline:
+            row = connection.execute("SELECT status FROM runs WHERE id = ?", (other_run,)).fetchone()
+            if row and row[0]:
+                break
+            time.sleep(0.1)
+    if getattr(store, "remote", False):
+        store.sync()
+
+    def signatures(connection, run_id):
+        table = _table(connection, run_id)
+        return {
+            address: (function, bytes(signature))
+            for address, function, signature in connection.execute(
+                f"SELECT frame_id, function, signature FROM {table} WHERE run_id = ?", (run_id,)
+            )
+        }
+
+    with _open(store) as connection:
+        mine = signatures(connection, store.run_id)
+        theirs = signatures(connection, other_run)
+    differing = [
+        address for address in mine.keys() | theirs.keys()
+        if mine.get(address, (None, None))[1] != theirs.get(address, (None, None))[1]
+    ]
+    functions: dict[str, int] = {}
+    for address in differing:
+        function = identity((mine.get(address) or theirs[address])[0])
+        functions[function] = functions.get(function, 0) + 1
+    differing.sort()
+    return {
+        "runs": 2,
+        "addresses": differing[:VARIED_LIMIT],
+        "functions": functions,
+        "truncated": len(differing) > VARIED_LIMIT,
+    }
+
+
 FAILURE_LIMIT = 1500  # completed calls kept around a failure, the ones closest to it
 
 
