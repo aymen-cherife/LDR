@@ -38,11 +38,21 @@ class State:
 
     def update(self, **fields) -> None:
         with self.lock:
+            if self.fields.get("state") == "finished":
+                fields.pop("state", None)  # a late progress write must not reopen a finished run
             self.fields.update(fields)
             temporary = f"{self.path}.{os.getpid()}.tmp"
             with open(temporary, "w", encoding="utf-8") as handle:
                 json.dump(self.fields, handle)
-            os.replace(temporary, self.path)
+            # Windows refuses to replace a file that a reader has open at that instant.
+            for attempt in range(200):
+                try:
+                    os.replace(temporary, self.path)
+                    return
+                except PermissionError:
+                    if attempt == 199:
+                        raise
+                    time.sleep(0.01)
 
 
 def alive(pid: int) -> bool:
@@ -168,7 +178,10 @@ def supervise(rundir: str) -> int:
             thread = threading.Thread(target=_pump, args=(stream, os.path.join(rundir, name)), daemon=True)
             thread.start()
             pumps.append(thread)
-        state.update(state="running", program_pid=process.pid, control=f"{listener.address}|{key.hex()}")
+        try:
+            state.update(state="running", program_pid=process.pid, control=f"{listener.address}|{key.hex()}")
+        except OSError:
+            pass  # the progress thread writes the state again; the run itself must not fail over it
         threading.Thread(target=_progress, args=(state, sink, ldr_dir, started), daemon=True).start()
 
     code = 2
@@ -213,8 +226,11 @@ def _progress(state: State, sink, ldr_dir: str, started: float) -> None:
                     baseline = record["seconds"] if record else 0
                 except Exception:
                     baseline = 0
-        state.update(calls=calls, tests=tests, elapsed=round(time.time() - started, 1),
-                     baseline_seconds=baseline or None, store_run_id=sink.main_run)
+        try:
+            state.update(calls=calls, tests=tests, elapsed=round(time.time() - started, 1),
+                         baseline_seconds=baseline or None, store_run_id=sink.main_run, state="running")
+        except OSError:
+            pass
         time.sleep(1.0)
 
 
