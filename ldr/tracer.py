@@ -21,6 +21,7 @@ from contextlib import nullcontext
 from .fingerprint import REDACTED, STATS, fingerprint, fingerprint_details, lifted as fingerprint_lifted
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
 from .redact import redact, same_text_policy, text_policy
+from .structure import type_label
 from .timing import CallTiming
 
 
@@ -124,6 +125,8 @@ class Recorder:
         self._immutable_inputs = {}
         # Per live recorded call: (frame, receiver object or None, receiver not re-read).
         self._receivers: dict[int, tuple[object, object, bool]] = {}
+        # Per live call: the walks its fingerprints made, until the call closes (size counter).
+        self._size_rows: dict[int, list[tuple]] = {}
         # Entry state of caller-owned containers, for calls that keep detail when no tree is built.
         self._mutable_evidence: dict[int, dict[str, tuple[int, str]]] = {}
         self.deep_functions = frozenset(deep_functions or ())
@@ -316,17 +319,37 @@ class Recorder:
                 if is_secret_name(name):
                     result[name] = REDACTED
                     continue
+                mark = STATS.walks
                 token, immutable = fingerprint_details(value, partial_ok=name in _RECEIVERS)
+                if STATS.walks != mark:
+                    self._note_walk(frame, "entry", name)
                 if immutable:
                     # Keep the original object alive for the identity check at exit.
                     reusable[name] = (value, token)
                 result[name] = token
             else:
+                mark = STATS.walks
                 result[name] = fp_value(value, name)
+                if STATS.walks != mark:
+                    self._note_walk(frame, "entry" if entering else "exit", name)
         if reusable and same_text_policy(policy):
             self._immutable_inputs[id(frame)] = (policy, reusable)
         self._charge(code, walked)
         return result
+
+    def _note_walk(self, frame, phase: str, name: str | None) -> None:
+        """Log the walk that has just finished: where it was, what it walked, and how large it was."""
+        if self.call_stream is None:
+            return
+        role = "return" if name is None else "receiver" if name in _RECEIVERS else "argument"
+        self._size_rows.setdefault(id(frame), []).append(
+            (phase, role, name or "", type_label(STATS.walked_type), STATS.walked)
+        )
+
+    def _send_sizes(self, frame, frame_id: str) -> None:
+        rows = self._size_rows.pop(id(frame), None)
+        if rows and self.call_stream is not None:
+            self.call_stream.add_sizes(frame_id, rows)
 
     def _caller_receiver(self, frame):
         """The receiver of the nearest recorded call that is running this one, or None."""
@@ -883,6 +906,7 @@ class Recorder:
     def _close(self, code, frame, timing, *, error=None, return_value=None):
         matched = self._matching_stack(frame)
         if matched is None:
+            self._size_rows.pop(id(frame), None)
             self._immutable_inputs.pop(id(frame), None)
             self._receivers.pop(id(frame), None)
             self._mutable_evidence.pop(id(frame), None)
@@ -896,8 +920,11 @@ class Recorder:
                 out = capture(return_value)
             if node_retained or stream is not None:
                 walked = STATS.nodes
+                mark = STATS.walks
                 with self._no_ceiling(code):
                     out_fp = fp_value(return_value)
+                if STATS.walks != mark:
+                    self._note_walk(frame, "exit", None)
                 self._charge(code, walked)
         if isinstance(entry, Node) and self._focus_matches(
             entry.frame_id, self._entry_segment(entry)
@@ -915,6 +942,7 @@ class Recorder:
         if self.call_stream is not None:
             with self._no_ceiling(code):
                 exit_fps = self._argument_fingerprints(code, frame)
+            self._send_sizes(frame, entry.frame_id)
             self.call_stream.close(
                 frame,
                 exit_fps,
@@ -978,10 +1006,13 @@ class Recorder:
         if code in self._suppressed_codes:
             if self.call_stream is not None:
                 preview = capture(retval) if self.call_stream.detail_for(frame) else None
-                self.call_stream.close(
-                    frame, self._argument_fingerprints(code, frame),
-                    fp_value(retval), None, preview, timing, retval,
-                )
+                exit_fps = self._argument_fingerprints(code, frame)
+                mark = STATS.walks
+                out_fp = fp_value(retval)
+                if STATS.walks != mark:
+                    self._note_walk(frame, "exit", None)
+                self._send_sizes(frame, self.call_stream.frame_address(frame) or "")
+                self.call_stream.close(frame, exit_fps, out_fp, None, preview, timing, retval)
                 return
             return sys.monitoring.DISABLE
         self._close(code, frame, timing, return_value=retval)
@@ -1041,10 +1072,9 @@ class Recorder:
         if code in self._suppressed_codes:
             self._promote_suppressed(frame, exc)
             if self.call_stream is not None:
-                self.call_stream.close(
-                    frame, self._argument_fingerprints(code, frame),
-                    None, capture_error(exc), None, timing,
-                )
+                exit_fps = self._argument_fingerprints(code, frame)
+                self._send_sizes(frame, self.call_stream.frame_address(frame) or "")
+                self.call_stream.close(frame, exit_fps, None, capture_error(exc), None, timing)
             return
         self._close(code, frame, timing, error=capture_error(exc))
 

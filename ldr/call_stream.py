@@ -57,6 +57,9 @@ class CallStream:
         self.receivers_shared = 0
         self.pending = []
         self.pending_fp = []
+        # The size of every value walked, per call (see fingerprint.STATS): (address, phase,
+        # role, name, type, nodes), sent with the fingerprints.
+        self.sizes = []
         self.pending_bytes = 0
         self.counts = {}
         self.fingerprinted = 0
@@ -110,6 +113,11 @@ class CallStream:
     @property
     def keeping_details(self):
         return not self.write_failed
+
+    def add_sizes(self, frame_id, rows):
+        """The sizes of the values one call walked. The flusher thread sends and clears the list."""
+        with self.lock:
+            self.sizes.extend((frame_id, *row) for row in rows)
 
     def add_cost(self, function, nodes):
         """Charge fingerprint work (nodes walked) to a function."""
@@ -423,7 +431,7 @@ class CallStream:
                     self.committed_value_bytes,
                     self.committed_deep_bytes,
                     dropped,
-                ) = self.store.append_stream(self.worker, self.pending, self.pending_fp)
+                ) = self.store.append_stream(self.worker, self.pending, self.pending_fp, self.sizes)
                 self.stored += written
                 self.fingerprinted += len(self.pending_fp)
                 for reason, number in dropped.items():
@@ -437,6 +445,7 @@ class CallStream:
                     self._release_deep(timeline.steps)
             self.pending.clear()
             self.pending_fp.clear()
+            self.sizes.clear()
             self.pending_bytes = 0
 
     def finish(self):

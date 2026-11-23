@@ -163,12 +163,17 @@ def is_digest(token: str | None) -> bool:
 class _Stats:
     """Process-wide counters, read by the recorder to report cost and gaps."""
 
-    __slots__ = ("nodes", "tmp_normalized", "last_visited")
+    __slots__ = ("nodes", "tmp_normalized", "last_visited", "walks", "walked", "walked_type")
 
     def __init__(self) -> None:
         self.nodes = 0
         self.tmp_normalized = 0
         self.last_visited = 0
+        # The latest walk: how many there have been, its node count and the type of its value.
+        # The recorder reads them right after a fingerprint to log the size (batch 1).
+        self.walks = 0
+        self.walked = 0
+        self.walked_type = None
 
 
 STATS = _Stats()
@@ -567,3 +572,6 @@ def _fingerprint_details(
     finally:
         if walk is not None:
             STATS.nodes += walk.visited
+            STATS.walks += 1
+            STATS.walked = walk.visited
+            STATS.walked_type = type(value)

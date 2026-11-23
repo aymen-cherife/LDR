@@ -115,8 +115,8 @@ class Sink:
         store = run.store
         try:
             if kind == "append":
-                _, worker, rows, fingerprints = message
-                written, _, _, dropped = store.append_stream(worker, rows, fingerprints)
+                _, worker, rows, fingerprints, sizes = message
+                written, _, _, dropped = store.append_stream(worker, rows, fingerprints, sizes)
                 with run.lock:
                     counts = run.count(worker)
                     counts["stored"] += written
@@ -272,7 +272,7 @@ class RemoteStore(TraceStore):
 
     # --- writes: planned locally, sent to the parent
 
-    def append_stream(self, worker, rows, fingerprints=()):
+    def append_stream(self, worker, rows, fingerprints=(), sizes=()):
         kept, dropped, _, _, self._used, self._value_used, self._deep_used = self.plan_detail(
             rows, self._used, self._value_used, self._deep_used
         )
@@ -281,7 +281,7 @@ class RemoteStore(TraceStore):
              None if timeline is None else (timeline.observed, list(timeline.steps)), reason)
             for ordinal, frame_id, parent, payload, data, timeline, reason in rows
         ]
-        self._send(("append", worker, packed, list(fingerprints)))
+        self._send(("append", worker, packed, list(fingerprints), list(sizes)))
         return len(kept), self._value_used, self._deep_used, dropped
 
     def append_boundaries(self, worker, rows):

@@ -75,6 +75,13 @@ CREATE TABLE IF NOT EXISTS call_lookup (
 );
 CREATE INDEX IF NOT EXISTS call_lookup_fp ON call_lookup(run_id, fp);
 -- Records arrive here without indexes and move to the tables above once per run.
+-- The size of every value the fingerprint walk read: its type, its role in the call
+-- (receiver, argument or return), the call's address and the nodes walked.
+CREATE TABLE IF NOT EXISTS value_sizes (
+    run_id TEXT NOT NULL, worker TEXT NOT NULL, address TEXT NOT NULL,
+    phase TEXT NOT NULL, role TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
+    nodes INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS call_records_stage (
     run_id TEXT, worker TEXT, ordinal INTEGER, frame_id TEXT, parent INTEGER,
     function TEXT, error TEXT, reference TEXT, signature BLOB, parts BLOB
@@ -436,11 +443,16 @@ class TraceStore:
             used += added
         return kept, dropped, values, deep, used, value_used, deep_used
 
-    def append_stream(self, worker, rows, fingerprints=()):
+    def append_stream(self, worker, rows, fingerprints=(), sizes=()):
         """Write every fingerprint row, and the detail that fits (see ``plan_detail``)."""
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             self._append_fingerprints(connection, worker, fingerprints)
+            if sizes:
+                connection.executemany(
+                    "INSERT INTO value_sizes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(self.run_id, worker, *size) for size in sizes],
+                )
             used, value_used, deep_used = self._budgets(connection)
             kept, dropped, values, deep, used, value_used, deep_used = self.plan_detail(
                 rows, used, value_used, deep_used
