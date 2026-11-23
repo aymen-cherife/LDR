@@ -240,16 +240,15 @@ class _Walk:
             self._text(b"C", type_identity(value).encode(), out)
         elif kind is types.FunctionType or kind is types.BuiltinFunctionType:
             name = f"{value.__module__}.{value.__qualname__}"
+            # A name, never a read: for a built-in bound method (``[].append``) that is the
+            # name only, not the object it is bound to.
             self._text(b"Y", name.encode("utf-8", "surrogatepass"), out)
-            bound = value.__self__ if kind is types.BuiltinFunctionType else None
-            if bound is not None and type(bound) is not types.ModuleType:
-                # A method of a built-in object, such as [].append: which object matters.
-                out.update(b"@o")
-                self.encode(bound, out, depth + 1)
         elif kind is types.MethodType:
+            # The function's name and the receiver's type. The receiver itself is not read:
+            # a method is a way to call something, not a value to compare.
             out.update(b"Mt")
             self.encode(value.__func__, out, depth + 1)
-            self.encode(value.__self__, out, depth + 1)
+            self._text(b"T", type_identity(type(value.__self__)).encode("utf-8", "surrogatepass"), out)
         elif kind is functools.partial:
             # The wrapped callable and every bound argument, read like any other value:
             # secrets in them are redacted the same way. Keywords are an unordered set

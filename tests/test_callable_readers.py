@@ -63,14 +63,28 @@ def test_functions_and_bound_methods_are_named():
     assert read(add) == read(add) != read(other)
     counter = Counter(1)
     assert read(counter.bump) == read(counter.bump)
-    assert read(counter.bump) != read(Counter(2).bump)  # another object
-    assert read(counter.bump) != read(Counter.bump)
+    assert read(counter.bump) != read(Counter.bump)  # a bound method is not the plain function
     assert read(len) == read(len)
 
 
-def test_a_method_of_a_builtin_object_depends_on_that_object():
-    assert read([1].append) == read([1].append)
-    assert read([1].append) != read([2].append)
-    assert read({}.get) != read({"a": 1}.get)
-    assert read("abc".upper) != read("abd".upper)
-    assert fingerprint([SECRET].append) == "redacted"
+def test_a_bound_method_is_its_name_and_its_receivers_type_never_the_receiver():
+    first, second = Counter(1), Counter(2)
+    assert read(first.bump) == read(second.bump)  # same method of the same type: the object is not read
+    first.value = [object() for _ in range(10_000)]  # would be walked if the receiver were read
+    assert read(first.bump) == read(second.bump)
+
+    class Other(Counter):
+        pass
+
+    assert read(Other(1).bump) != read(first.bump)  # another receiver type
+
+
+def test_a_method_of_a_builtin_object_is_its_name_only():
+    assert read([1].append) == read([2].append) == read([].append)
+    assert read([1].append) != read({}.get)
+    assert read("abc".upper) == read("abd".upper)
+    assert fingerprint([SECRET].append) != "redacted"  # nothing inside the receiver is read
+
+
+def test_secrets_in_a_partial_inside_a_bound_container_are_still_redacted():
+    assert fingerprint({"callback": functools.partial(add, SECRET)}) == "redacted"
