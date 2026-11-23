@@ -73,15 +73,28 @@ def importable(python: str, environ) -> bool:
     return probe.returncode == 0
 
 
-def run_in_child(argv: list[str], project_root: str, hash_seed: str | None = None) -> int:
-    """Run ``ldr argv`` in the project's interpreter and return its exit status."""
+def run_in_child(
+    argv: list[str],
+    project_root: str,
+    hash_seed: str | None = None,
+    *,
+    popen_kwargs: dict | None = None,
+    started=None,
+    say=None,
+) -> int:
+    """Run ``ldr argv`` in the project's interpreter and return its exit status.
+
+    ``popen_kwargs`` (for example pipes for the program's streams) go to the child's
+    Popen; ``started(process, sink)`` is called as soon as it is running; ``say`` receives
+    the messages this would otherwise print to stderr.
+    """
+    say = say or (lambda text: print(text, file=sys.stderr))
     python, how = choose(project_root)
     environ = dict(os.environ)
     if not importable(python, environ):
-        print(
+        say(
             f"LDR is not installed in {python} ({how}). Install LDR in that environment, "
-            "or run ldr from it.",
-            file=sys.stderr,
+            "or run ldr from it."
         )
         return 2
     from . import reproduce
@@ -95,15 +108,17 @@ def run_in_child(argv: list[str], project_root: str, hash_seed: str | None = Non
     environ["PYTHONHASHSEED"], environ[reproduce.SEED_SOURCE_ENV] = reproduce.choose_hash_seed(environ, hash_seed)
     environ[SINK_ENV] = sink.token
     try:
-        process = subprocess.Popen([python, "-m", "ldr.cli", *argv], env=environ)
+        process = subprocess.Popen([python, "-m", "ldr.cli", *argv], env=environ, **(popen_kwargs or {}))
     except OSError as exc:
-        print(f"LDR could not start {python}: {exc}", file=sys.stderr)
+        say(f"LDR could not start {python}: {exc}")
         sink.close(2)
         return 2
+    if started is not None:
+        started(process, sink)
     code = _wait(process)
     message = sink.close(code)
     if message:
-        print(message, file=sys.stderr)
+        say(message)
     return code
 
 

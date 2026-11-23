@@ -46,6 +46,10 @@ def main(argv=None) -> int:
         from .cli import main as full  # prints the version message
 
         return full(argv)
+    if argv and argv[0] == "status":
+        from .status import main as status
+
+        return status(argv[1:])
     light = _light_run(argv)
     if light is None:
         from .cli import main as full
@@ -54,9 +58,9 @@ def main(argv=None) -> int:
     from .redact import register_argv_secrets
 
     register_argv_secrets(argv)
-    from .interpreter import run_in_child
+    from .waiter import run
 
-    return run_in_child(argv, light[1])
+    return run(argv, light[1])
 
 
 if __name__ == "__main__":

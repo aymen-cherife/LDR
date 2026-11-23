@@ -1134,6 +1134,10 @@ def main(argv=None) -> int:
     launch_argv = list(argv)
     if argv and argv[0] == "show":
         return _show_saved(argv[1:], ldr_dir)
+    if argv and argv[0] == "status":
+        from .status import main as status_main
+
+        return status_main(argv[1:], ldr_dir)
     register_argv_secrets(argv)
     timeout_requested = any(a == "--timeout" or a.startswith("--timeout=") for a in argv)
     passthrough: list[str] = []
@@ -1145,7 +1149,7 @@ def main(argv=None) -> int:
     argv = ["--deep=*" if a == "--deep" else "--full=*" if a == "--full" else a for a in argv]
     parser = argparse.ArgumentParser(prog="ldr")
     parser.add_argument("--version", action="version", version=f"ldr {__version__}")
-    parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect", "show"])
+    parser.add_argument("mode", choices=["run", "pytest", "module", "verify", "inspect", "show", "status"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("rest", nargs="*")
     parser.add_argument("--runner", choices=["auto", "run", "pytest", "module"], default="auto")
@@ -1273,8 +1277,11 @@ def main(argv=None) -> int:
     args.initial_cwd = initial_cwd
 
     if not is_child:
-        # The target always runs in a child process, in the project's interpreter.
-        return run_in_child(launch_argv, project_root)
+        # The program runs in a child process, in the project's interpreter, under a
+        # supervisor that survives this command (see supervisor.py).
+        from .waiter import run as wait_for_run
+
+        return wait_for_run(launch_argv, project_root)
 
     if args.mode == "pytest" and importlib.util.find_spec("pytest") is None:
         message = "LDR cannot run pytest because pytest is not installed in this Python environment."
@@ -1345,8 +1352,8 @@ def main(argv=None) -> int:
             # A rerun for detail: compare each call of the test with the run it repeats,
             # and keep every call of the test.
             store.reference_run = rerun_plan["source_run"]
-            store.reference_prefix = rerun_plan["prefix"]
-            store.full_tests = (*store.full_tests, rerun_plan["prefix"])
+            store.reference_prefix = rerun_plan["prefix"]  # None: a whole script
+            store.full_tests = (*store.full_tests, rerun_plan["prefix"] or "*")
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
         storage_warning = capture_error(exc)
         if args.deep or args.boundary:
@@ -1390,6 +1397,11 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
             return 4  # rerun.ENVIRONMENT_DIFFERS
+    if store is not None and args.mode in ("run", "module"):
+        # A script has no per-test start: the state of random when the program starts is what a rerun restores.
+        if rerun_plan is not None and rerun_plan.get("random_start"):
+            reproduce.restore_random(rerun_plan["random_start"])
+        _quietly(lambda: store.save_rng("random-at-start", reproduce.capture_random()))
     numpy_hook = None
     if store is not None:
         numpy_hook = reproduce.install_numpy_hook(

@@ -37,6 +37,8 @@ class _Run:
         self.directory = directory
         self.finished = False
         self.last_address = None
+        self.invocation = None  # what the program was started with, from its start message
+        self.tests = 0  # tests that have started (pytest runs)
         self.lock = threading.Lock()
         self.counts = {}  # worker -> stored, dropped, fingerprinted, boundaries, write_failed
 
@@ -96,6 +98,7 @@ class Sink:
                     store = TraceStore.start(directory, json.loads(invocation), *settings)
                     with self.lock:
                         run = self.runs[store.run_id] = _Run(store, directory)
+                        run.invocation = json.loads(invocation)
                         if self.main_run is None:
                             self.main_run = store.run_id
                     connection.send_bytes(marshal.dumps(("ok", store.settings())))
@@ -145,6 +148,8 @@ class Sink:
                 store.save_section(message[1], message[2])
             elif kind == "tests":
                 store.save_tests(message[1], message[2])
+                with run.lock:
+                    run.tests += len(message[2])
             elif kind == "rng":
                 store.save_rng(message[1], message[2])
             elif kind == "worker":
