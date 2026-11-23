@@ -124,6 +124,7 @@ def rank_inspections(
     roots: list[Node],
     frame_index: dict,
     limit: int = 3,
+    recorded_counts: dict[str, int] | None = None,
 ) -> list[dict]:
     """Rank captured frames worth a focused rerun.
 
@@ -141,6 +142,8 @@ def rank_inspections(
     if not failures:
         return []
     counts = Counter(frame.node.code_id for frame in observed)
+    if recorded_counts:  # the run's own totals, when the observed frames are only a part of it
+        counts = Counter(recorded_counts)
     short_ids = {
         frame.get("frame_id"): frame.get("id")
         for frame in frame_index.get("frames", [])

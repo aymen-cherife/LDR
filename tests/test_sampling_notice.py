@@ -1,4 +1,7 @@
-"""Until every call is recorded (Phase 2), output must say what sampling hides."""
+"""A default run records every call, so it has nothing to say about sampling.
+
+Snapshots (--golden, --diff) still use the capped tree and still say what it samples.
+"""
 
 import os
 import subprocess
@@ -23,10 +26,18 @@ def ldr(cwd, *args):
     )
 
 
-def test_sampled_run_says_later_calls_are_not_compared(tmp_path):
+def test_a_default_run_records_every_call_and_does_not_sample(tmp_path):
     (tmp_path / "app.py").write_text(LOOP)
 
     result = ldr(tmp_path)
+
+    assert NOTICE not in result.stdout and "sampled" not in result.stdout
+    assert "40 project call(s) recorded" in result.stdout
+
+def test_a_snapshot_run_says_what_the_tree_samples(tmp_path):
+    (tmp_path / "app.py").write_text(LOOP)
+
+    result = ldr(tmp_path, "--golden")
 
     assert NOTICE in result.stdout
 
@@ -43,7 +54,7 @@ def test_comparison_says_it_too(tmp_path):
 def test_the_notice_names_the_configured_limit(tmp_path):
     (tmp_path / "app.py").write_text(LOOP)
 
-    result = ldr(tmp_path, "--max-calls-per-function", "3")
+    result = ldr(tmp_path, "--golden", "--max-calls-per-function", "3")
 
     assert "calls beyond the first 3 per function are not compared" in result.stdout
 

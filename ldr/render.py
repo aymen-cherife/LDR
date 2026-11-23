@@ -234,6 +234,7 @@ def render_run(
     scope: list[str] | None = None,
     status: dict | None = None,
     max_nodes: int | None = None,
+    total_calls: int | None = None,
 ) -> str:
     blocks: list[str] = []
     failed = [root for root in roots if _failing(root)]
@@ -241,7 +242,7 @@ def render_run(
         blocks.append("FAILED PATH")
         for root in failed:
             blocks.extend(tree(root, color, prune=True, failure_only=True))
-        total = sum(root.count() for root in roots)
+        total = total_calls if total_calls is not None else sum(root.count() for root in roots)
         shown = sum(root.count() for root in failed)
         if total > shown:
             blocks.extend(("", f"[{total - shown} recorded calls succeeded]"))

@@ -51,6 +51,7 @@ from .store import (
 from .suggest import rank_inspections
 from .call_stream import CallStream
 from .sqlite_store import TraceStore, storage_settings
+from . import sqlreport
 from .summary import summarize
 from .tracer import Recorder, python_version_message
 from .value_capture import first_difference
@@ -1297,6 +1298,15 @@ def main(argv=None) -> int:
         "deep_functions": args.deep,
         "boundary_modules": args.boundary,
     }
+    # A default run builds no tree: its calls are in SQLite and the report reads them there.
+    # Snapshots, comparisons and inspect still use the capped tree (until Phase 3's store).
+    report_from_sql = (
+        store is not None
+        and requested_mode in {"run", "pytest", "module"}
+        and not (args.golden or args.diff or args.learn_volatility)
+        and not os.environ.get("LDR_NOISE_RUN")
+    )
+    recorder_options["build_tree"] = not report_from_sql
     pytest_capture = None
     # Read before the target runs, so the record is the environment it started in.
     environment = None
@@ -1378,6 +1388,7 @@ def main(argv=None) -> int:
         "execution_seconds": round(execution_finished - execution_started, 6),
     }
     status["redacted_values"] = count_redacted(recorder.roots)
+    sql_report = None  # set below when the report is read from SQLite
     status["commit"] = git_state(project_root)
     if environment is not None:
         status["environment"] = run_environment.summarize(environment)
@@ -1429,6 +1440,24 @@ def main(argv=None) -> int:
             status["call_stream"]["first_calls"] = store.first_calls
             status["call_stream"]["last_calls"] = store.last_calls
             status["fingerprint"] = _fingerprint_status(stream_summaries)
+            if report_from_sql:
+                try:
+                    locations = {
+                        sqlreport.identity(function): tuple(place) for summary in stream_summaries
+                        for function, place in summary.get("locations", {}).items()
+                    }
+                    per_function = sqlreport.counts(store)
+                    sql_report = {"locations": locations, "per_function": per_function}
+                    status["recorded_nodes"] = sum(calls for calls, _ in per_function.values())
+                    status["trace_truncated"] = False
+                    status["overflow_transitions"] = 0
+                    status["sampled_repetitions"] = 0
+                    status["redacted_values"] = sum(summary.get("redacted", 0) for summary in stream_summaries)
+                    # Nothing was dropped or sampled: every call is in SQLite.
+                    recorder.truncated = False
+                    recorder.dropped_nodes = recorder.sampled_nodes = 0
+                except (OSError, sqlite3.Error) as exc:
+                    scope_warnings.append(f"The report counts could not be read from SQLite ({capture_error(exc)}).")
             status["invocation_key"] = key
             executed = slowdown_report.file_hashes(recorder.executed_files())
             status["files"] = executed
@@ -1485,9 +1514,12 @@ def main(argv=None) -> int:
         status["storage_warning"] = storage_warning
         scope_warnings.append(f"SQLite trace storage: {storage_warning}")
     recorded_scope = _display_scope(scope, initial_cwd)
-    project_calls = sum(
-        1 for root in recorder.roots for node in root.walk() if not _is_test_node(node)
-    )
+    if sql_report is not None:
+        project_calls = sqlreport.project_calls(sql_report["per_function"])
+    else:
+        project_calls = sum(
+            1 for root in recorder.roots for node in root.walk() if not _is_test_node(node)
+        )
     if project_calls == 0:
         scope_warnings.append(
             "No calls from project code were recorded. If the code you expected lives "
@@ -1569,7 +1601,13 @@ def main(argv=None) -> int:
     if (
         recorder.exit_code != 0
         and detected_roots
-        and not _trace_has_production_frame(recorder.roots, detected_roots)
+        and not (
+            sqlreport.has_production_frame(
+                sql_report["per_function"], sql_report["locations"], detected_roots
+            )
+            if sql_report is not None
+            else _trace_has_production_frame(recorder.roots, detected_roots)
+        )
     ):
         suggested_scope = _display_scope(
             detected_roots + _entry_dirs(args.mode, args.target, args.rest),
@@ -1671,8 +1709,29 @@ def main(argv=None) -> int:
     stream_changes = []
     findings = []
     snapshot_action = "none"
-    frame_index_payload = _frame_index(recorder.roots)
-    suggestions = rank_inspections(recorder.roots, frame_index_payload)
+    if sql_report is not None:
+        if recorder.roots:
+            # The failing path: the recorder kept the escaping chain; SQLite supplies the
+            # completed calls around it, which the ranking and the readable path need.
+            recorder.roots = [
+                sqlreport.failure_tree(store, root.frame_id, sql_report["locations"]) or root
+                for root in recorder.roots
+            ]
+        frame_index_payload = sqlreport.frame_index(
+            store, sql_report["per_function"], sql_report["locations"]
+        )
+        suggestions = rank_inspections(
+            recorder.roots, frame_index_payload,
+            recorded_counts={function: calls for function, (calls, _) in sql_report["per_function"].items()},
+        )
+        # A run that passed has no failing path; its readable trace is the first calls.
+        trace_roots = recorder.roots or sqlreport.trace_nodes(store, sql_report["locations"])
+        total_calls = status["recorded_nodes"]
+    else:
+        frame_index_payload = _frame_index(recorder.roots)
+        suggestions = rank_inspections(recorder.roots, frame_index_payload)
+        trace_roots = recorder.roots
+        total_calls = None
     display_scope = _display_scope(scope, initial_cwd)
     rerun = _rerun_payload(args, scope, initial_cwd, project_root)
     try:
@@ -1842,7 +1901,7 @@ def main(argv=None) -> int:
                 text = environment_note + "\n" + text
         else:
             text = render_run(
-                recorder.roots,
+                trace_roots,
                 args.color,
                 recorder.truncated,
                 args.no_prune,
@@ -1855,6 +1914,7 @@ def main(argv=None) -> int:
                 scope=display_scope,
                 status=status,
                 max_nodes=args.max_nodes,
+                total_calls=total_calls,
             )
     except (OSError, ValueError, RuntimeError) as exc:
         text = f"LDR snapshot error: {exc}"

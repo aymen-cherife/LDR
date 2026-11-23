@@ -47,6 +47,9 @@ class CallStream:
         self.next_ordinal = 0
         self.completed = 0
         self.uncomparable = 0
+        self.redacted = 0
+        # Where each recorded function is defined: {function: (file, line)}.
+        self.locations = {}
         self.receivers_shared = 0
         self.pending = []
         self.pending_fp = []
@@ -230,6 +233,7 @@ class CallStream:
         timing,
         return_value=None,
         shape=None,
+        input_changes=None,
     ):
         with self.lock:
             entry = self.active.pop(id(frame), None)
@@ -247,6 +251,7 @@ class CallStream:
                 for token in tokens
             )
             self.uncomparable += not comparable
+            self.redacted += sum(token == "redacted" for token in inputs.values()) + (output == "redacted")
 
             parts = [("in", name, token) for name, token in inputs.items()]
             parts.extend(
@@ -320,6 +325,8 @@ class CallStream:
                 fields["detail_at"] = "return"
             if mutated:
                 fields["mutated_in_call"] = mutated
+            if input_changes:
+                fields["input_changes"] = input_changes
             if lines is not None:
                 fields["executed_lines"] = list(lines)
                 fields["completion_order"] = self.completed
@@ -423,6 +430,8 @@ class CallStream:
                 "last_calls": self.store.last_calls,
                 "unfinished": len(self.active),
                 "uncomparable": self.uncomparable,
+                "redacted": self.redacted,
+                "locations": {function: list(place) for function, place in self.locations.items()},
                 "write_failed": self.write_failed,
                 "calls": dict(sorted(self.counts.items(), key=lambda item: (-item[1], item[0]))[:50]),
                 "fingerprint": {

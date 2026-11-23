@@ -93,6 +93,7 @@ class Recorder:
         max_calls_per_function: int = 8,
         deep_functions: list[str] | None = None,
         boundary_modules: list[str] | None = None,
+        build_tree: bool = True,
     ):
         if max_nodes < 1:
             raise ValueError("max_nodes must be at least 1")
@@ -106,6 +107,9 @@ class Recorder:
         self.project_root = os.path.realpath(project_root or os.getcwd())
         self.display_root = os.path.realpath(display_root or os.getcwd())
         self.max_nodes = max_nodes
+        # False: no node is built per call. The calls are in SQLite, and the report reads
+        # them from there. Light entries keep addresses and failures working.
+        self.build_tree = build_tree
         self.max_depth = max_depth
         self.lines_for = lines_for or set()
         self.focus_frame = focus_frame
@@ -114,6 +118,8 @@ class Recorder:
         self._immutable_inputs = {}
         # Per live recorded call: (frame, receiver object or None, receiver not re-read).
         self._receivers: dict[int, tuple[object, object, bool]] = {}
+        # Entry state of caller-owned containers, for calls that keep detail when no tree is built.
+        self._mutable_evidence: dict[int, dict[str, tuple[int, str]]] = {}
         self.deep_functions = frozenset(deep_functions or ())
         self.boundary_modules = tuple(boundary_modules or ())
         self.boundaries = None
@@ -379,11 +385,10 @@ class Recorder:
         return evidence
 
     @staticmethod
-    def _finish_mutable_argument_evidence(entry: Node, frame) -> None:
-        """Record only in-place changes visible through the original object."""
-        for name, (object_id, before) in entry.__dict__.get(
-            "_mutable_argument_evidence", {}
-        ).items():
+    def _changed_arguments(evidence, frame) -> dict[str, dict[str, str]]:
+        """In-place changes visible through the original object, with entry and exit state."""
+        changes = {}
+        for name, (object_id, before) in evidence.items():
             if name not in frame.f_locals:
                 continue
             value = frame.f_locals[name]
@@ -391,7 +396,15 @@ class Recorder:
                 continue
             after = capture_state(value, name)
             if before != after:
-                entry.input_changes[name] = {"before": before, "after": after}
+                changes[name] = {"before": before, "after": after}
+        return changes
+
+    @classmethod
+    def _finish_mutable_argument_evidence(cls, entry: Node, frame) -> None:
+        """Record only in-place changes visible through the original object."""
+        entry.input_changes.update(
+            cls._changed_arguments(entry.__dict__.get("_mutable_argument_evidence", {}), frame)
+        )
 
     def begin_test(self, root: str, code=None, partition: str = "") -> None:
         """Make ``root`` (a pytest node id) the root of the addresses that follow.
@@ -528,6 +541,10 @@ class Recorder:
         )
         identity = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
         function = f"{self.frame_prefix}{identity}"
+        if function not in self.call_stream.locations:
+            self.call_stream.locations[function] = (
+                self._display_path(code.co_filename), code.co_firstlineno
+            )
         deep = bool(self.deep_functions) and (
             "*" in self.deep_functions
             or code.co_name in self.deep_functions
@@ -536,6 +553,10 @@ class Recorder:
         )
         # Only the first N calls of a function keep detail; the rest keep fingerprints.
         detail = self.call_stream.note_call(function, deep, frame_id)
+        if detail and not self.build_tree and node is None:
+            evidence = self._mutable_argument_evidence(code, frame)
+            if evidence:
+                self._mutable_evidence[id(frame)] = evidence
         if self.call_stream.incomplete:
             self._halt()
             return
@@ -583,6 +604,12 @@ class Recorder:
         stack = _stack.get()
         parent = stack[-1] if stack else None
         frame_id, segment, ordinal = self._next_frame_id(code, parent)
+        if not self.build_tree:
+            entry = self._new_shadow(code, frame, frame_id)
+            entry.segment = segment
+            self._start_capture(code, frame, frame_id, at)
+            _stack.set(stack + (entry,))
+            return
         if code in self._suppressed_codes:
             self._start_capture(code, frame, frame_id, at)
             return
@@ -833,6 +860,7 @@ class Recorder:
         if matched is None:
             self._immutable_inputs.pop(id(frame), None)
             self._receivers.pop(id(frame), None)
+            self._mutable_evidence.pop(id(frame), None)
             return
         parent_stack, entry = matched
         node_retained = isinstance(entry, Node)
@@ -853,6 +881,11 @@ class Recorder:
             self._finish_mutable_argument_evidence(entry, frame)
         self.suspended.pop(self._entry_fid(entry), None)
         _stack.set(parent_stack)
+        changes = None
+        if self._mutable_evidence and not isinstance(entry, Node):
+            saved = self._mutable_evidence.pop(id(frame), None)
+            if saved:
+                changes = self._changed_arguments(saved, frame)
         if self.call_stream is not None:
             self.call_stream.close(
                 frame,
@@ -863,6 +896,7 @@ class Recorder:
                 timing,
                 return_value,
                 shape_of(return_value) if error is None else None,
+                changes,
             )
 
         if isinstance(entry, _Shadow):

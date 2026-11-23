@@ -38,14 +38,12 @@ def test_concurrent_runs_keep_separate_sqlite_traces(tmp_path):
         assert left.wait() == right.wait() == 0
 
     with sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3") as connection:
+        # A default run builds no tree, so its calls are the per-call records.
         rows = connection.execute(
-            "SELECT run_id, worker, count(*) FROM calls GROUP BY run_id, worker"
+            "SELECT run_id, worker, count(*) FROM call_records GROUP BY run_id, worker"
         ).fetchall()
         assert len(rows) == 2
         assert all(row[1:] == ("main", 1) for row in rows)
-        assert connection.execute(
-            "SELECT count(*) FROM captured_values"
-        ).fetchone() == (1,)
 
 
 def test_console_encoding_preserves_run_result_and_utf8_report(tmp_path, monkeypatch):
@@ -356,7 +354,7 @@ def test_pytest_xdist_records_both_workers_and_preserves_failure(tmp_path):
     assert payload["scope"]["project_calls"] == 2
     with sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3") as connection:
         rows = connection.execute(
-            "SELECT worker, parent, payload FROM calls WHERE run_id = ?",
+            "SELECT worker, parent, frame_id FROM call_records WHERE run_id = ? AND function LIKE '%:total'",
             (payload["status"]["run_id"],),
         ).fetchall()
         streamed_workers = connection.execute(
@@ -371,11 +369,7 @@ def test_pytest_xdist_records_both_workers_and_preserves_failure(tmp_path):
     assert 0 < payload["status"]["call_stream"]["value_bytes"] <= 7
     assert all(json.loads(row[0])["timing"]["complete"] for row in stream_payloads)
     assert all(json.loads(row[0])["executed_lines"] for row in stream_payloads)
-    totals = {
-        worker: (parent, json.loads(call)["frame_id"])
-        for worker, parent, call in rows
-        if json.loads(call)["name"] == "total"
-    }
+    totals = {worker: (parent, frame_id) for worker, parent, frame_id in rows}
     assert set(totals) == {"gw0", "gw1"}
     assert all(parent is not None for parent, _ in totals.values())
     assert len({frame_id for _, frame_id in totals.values()}) == 2

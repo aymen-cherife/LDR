@@ -63,7 +63,7 @@ def test_copyable_command_handles_spaces_and_resolves_from_original_cwd(tmp_path
     assert focused_payload["inspection"]["matched"] is True
 
 
-def test_sampling_stays_bounded_when_late_inputs_are_all_distinct(tmp_path):
+def test_late_distinct_inputs_are_all_recorded_not_sampled(tmp_path):
     (tmp_path / "many.py").write_text(
         "def convert(x):\n    return x\n"
         "def test_many():\n"
@@ -86,8 +86,9 @@ def test_sampling_stays_bounded_when_late_inputs_are_all_distinct(tmp_path):
         for frame in payload["frame_index"]["frames"]
         if frame["function"] == "convert"
     ]
-    assert len(convert_frames) < 30
-    assert payload["status"]["sampled_repetitions"] > 0
+    convert = next(f for f in payload["frame_index"]["functions"] if f["function"] == "convert")
+    assert convert["recorded_calls"] == 128  # last.json lists only some frames; the totals are exact
+    assert payload["status"]["sampled_repetitions"] == 0
 
 
 def test_broad_output_is_compact_and_does_not_claim_uncaptured_semantics(tmp_path):
@@ -123,6 +124,7 @@ def test_capture_limits_only_appear_when_capture_is_incomplete(tmp_path):
         str(tmp_path),
         "--max-nodes",
         "10",
+        "--golden",  # a snapshot still uses the capped tree
     )
     assert limited.returncode == 1
     text, payload = load_result(tmp_path)

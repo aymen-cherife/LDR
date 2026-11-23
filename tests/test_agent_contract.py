@@ -75,7 +75,8 @@ def test_late_exception_survives_node_budget(tmp_path):
     # to 34 for the REPRODUCIBILITY and shared-receiver lines, and to 37 for SLOWDOWN
     # and HOT FUNCTIONS (rules 16 and 17: each one states a fact or a gap).
     assert len(output.splitlines()) < 37
-    assert "CAPTURE LIMITS" in output
+    # A default run is not sampled or capped: every call is in SQLite, so no limits to state.
+    assert "CAPTURE LIMITS" not in output
 
 
 def test_caught_overflow_exception_does_not_outrank_later_failure(tmp_path):
@@ -94,8 +95,10 @@ def test_caught_overflow_exception_does_not_outrank_later_failure(tmp_path):
     assert result.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
     errors = [failure["error"] for failure in payload["failures"]]
-    assert any("RuntimeError: actual" in error for error in errors)
-    assert not any("ValueError: expected" in error for error in errors)
+    # The failure that ended the run comes first and is ranked first; the exception that was
+    # caught earlier in the same function is still listed, after it.
+    assert "RuntimeError: actual" in errors[0]
+    assert payload["suggestions"][0]["function"] == "fail"
 
 
 def test_varargs_kwargs_locations_and_secret_redaction(tmp_path):
@@ -312,7 +315,7 @@ def test_pytest_report_selects_late_failure_over_runtime_attribute_probes(tmp_pa
     assert "actual_failure() ! RuntimeError: decisive late failure" in output
 
 
-def test_repeat_sampling_preserves_late_causal_success_before_assertion(tmp_path):
+def test_every_repeated_call_is_recorded_and_the_late_causal_call_is_in_the_failing_path(tmp_path):
     (tmp_path / "test_hot_then_cause.py").write_text(
         "def hot(value):\n"
         "    return value + 1\n"
@@ -335,9 +338,12 @@ def test_repeat_sampling_preserves_late_causal_success_before_assertion(tmp_path
     )
     assert result.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
-    assert payload["status"]["trace_truncated"] is True
+    assert payload["status"]["trace_truncated"] is False
     assert payload["status"]["overflow_transitions"] == 0
-    assert payload["status"]["sampled_repetitions"] > 900
+    assert payload["status"]["sampled_repetitions"] == 0
+    assert payload["frame_index"]["total"] == 1002  # the test, 1000 hot calls, calculate
+    hot = next(f for f in payload["frame_index"]["functions"] if f["function"] == "hot")
+    assert hot["recorded_calls"] == 1000
     calculate = next(
         function
         for function in payload["frame_index"]["functions"]
