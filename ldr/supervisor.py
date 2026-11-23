@@ -199,6 +199,12 @@ def supervise(rundir: str) -> int:
     run_id = None
     if sink is not None and sink.main_run:
         run_id = sink.main_run
+    try:  # only the last runs of each target are kept (before the run is announced as finished)
+        from .previous import keep_runs, prune as prune_runs
+
+        prune_runs(ldr_dir, keep_runs(spec["project_root"]))
+    except Exception as exc:
+        said.append(f"LDR could not delete old runs: {type(exc).__name__}: {exc}")
     state.update(
         state="finished", exit_code=code, message="\n".join(said) or None, ended_at=time.time(),
         store_run_id=run_id,

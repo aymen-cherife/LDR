@@ -44,6 +44,7 @@ def invocation_descriptor(
     scope: list[str],
     cwd: str | None = None,
     project_root: str | None = None,
+    only: list[str] | None = None,
 ) -> dict[str, Any]:
     cwd = os.path.realpath(cwd or os.getcwd())
     project_root = os.path.realpath(project_root or cwd)
@@ -60,6 +61,8 @@ def invocation_descriptor(
             _portable_argument(argument, project_root) for argument in redact_argv(arguments)
         ],
         "scope": sorted({_portable_path(path, project_root) for path in scope}),
+        # What the user asked to trace with --only. The scope LDR infers is not part of the command.
+        "only": sorted({_portable_path(path, project_root) for path in only or ()}),
     }
 
 
@@ -69,7 +72,11 @@ def invocation_key(descriptor: dict[str, Any], name: str | None = None) -> str:
         if not safe:
             raise ValueError("snapshot name must contain a letter or number")
         return safe[:80]
-    payload = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+    # The command: runner, target, arguments and --only. The inferred scope is left out, so
+    # adding a package to the project does not make the same command a different target.
+    command = {key: descriptor.get(key) for key in ("runner", "target", "arguments")}
+    command["only"] = descriptor.get("only") or []
+    payload = json.dumps(command, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:20]
 
 

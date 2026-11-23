@@ -51,7 +51,7 @@ from .store import (
 from .suggest import rank_inspections
 from .call_stream import CallStream
 from .sqlite_store import TraceStore, storage_settings
-from . import fingerprint as fingerprint_module, sqlreport
+from . import fingerprint as fingerprint_module, previous, sqlreport
 from .summary import summarize
 from .tracer import Recorder, python_version_message
 from .value_capture import first_difference
@@ -406,18 +406,68 @@ def _baseline_run(snapshot: str) -> str | None:
     return status.get("run_id")
 
 
-def _reference_status(parts: list[dict]) -> dict[str, Any]:
-    """Add up each worker's comparison with the reference run."""
-    total = {key: sum(part[key] for part in parts) for key in ("compared", "same", "different", "new", "not_compared")}
-    counted = [part["missing"] for part in parts if part["missing"] is not None]
-    return {
-        "run_id": parts[0]["run_id"],
-        "error": next((part["error"] for part in parts if part["error"]), None),
-        **total,
-        "missing": sum(counted) if counted and len(counted) == len(parts) else None,
-        "changed": sorted({function for part in parts for function in part["changed"]}),
-        "changed_detail": _merge_detail(parts),
-    }
+def _find_previous(store) -> None:
+    """Pick the run whose calls this run looks up while it records (see previous.py)."""
+    from contextlib import closing
+
+    try:
+        with closing(store._connect()) as connection:
+            store.reference_run, store.reference_roots = previous.provisional_run(connection, store.run_id)
+    except (OSError, sqlite3.Error):
+        store.reference_run = store.reference_roots = None
+
+
+def _compare_with_previous(store, plan, files: dict) -> dict | None:
+    """The comparison with the previous run (or, for a rerun, with the run it repeats), from SQLite."""
+    from contextlib import closing
+
+    try:
+        if hasattr(store, "sync"):
+            store.sync()  # the parent has written everything that was sent
+        with closing(store._connect()) as connection:
+            if plan is not None:
+                other, prefix = plan["source_run"], plan["prefix"]
+            else:
+                other, prefix = previous.previous_run(connection, store.run_id), None
+            if other is None:
+                return None
+            row = connection.execute("SELECT status FROM runs WHERE id = ?", (other,)).fetchone()
+            before = (json.loads(row[0]).get("files") or {}) if row and row[0] else {}
+            return previous.compare(connection, store.run_id, other, prefix=prefix, files=(before, files))
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return {"run_id": None, "error": capture_error(exc)}
+
+
+def _previous_run_note(reference: dict) -> str:
+    """What changed against the previous run: counts, the changed functions, the tests not compared."""
+    if reference.get("error"):
+        return (
+            f"PREVIOUS RUN: the comparison could not be made ({reference['error']}); "
+            "calls were not compared.\n"
+        )
+    text = (
+        f"PREVIOUS RUN {reference['run_id'][:8]}: {reference['compared']} call(s) compared, "
+        f"{reference['same']} same, {reference['different']} differ, {reference['new']} new, "
+        f"{reference['missing']} missing"
+    )
+    if reference.get("not_compared"):
+        text += f", {reference['not_compared']} not compared (a value was too large or incomplete)"
+    text += ". Calls that differ keep full detail.\n"
+    tests = reference.get("tests")
+    if tests:
+        for key, label in (("only_in_this_run", "only in this run"), ("only_in_previous", "only in the previous run")):
+            names = tests[key]
+            if names:
+                shown = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+                text += f"NOT COMPARED: {len(names)} test(s) {label}: {shown}.\n"
+    changed = reference["changed"]
+    if changed:
+        more = (
+            f"; and {len(changed) - 10} more (all of them: status.reference.changed in .ldr/last.json)"
+            if len(changed) > 10 else ""
+        )
+        text += "CHANGED: " + _describe_changed(changed[:10], reference["changed_detail"]) + more + ".\n"
+    return text
 
 
 def _too_large(store, summaries: list[dict]) -> dict[str, Any] | None:
@@ -488,16 +538,6 @@ def _render_too_large(info: dict[str, Any], args) -> str:
         )
         lines.append(f"  To walk those values in full, run again in normal mode with: {command}\n")
     return "".join(lines)
-
-
-def _merge_detail(parts: list[dict]) -> dict[str, list[int]]:
-    merged: dict[str, list[int]] = {}
-    for part in parts:
-        for function, (changed, varied) in part.get("changed_detail", {}).items():
-            total = merged.setdefault(function, [0, 0])
-            total[0] += changed
-            total[1] += varied
-    return merged
 
 
 def _describe_changed(functions: list[str], detail: dict[str, list[int]]) -> str:
@@ -1308,6 +1348,7 @@ def main(argv=None) -> int:
         scope,
         cwd=initial_cwd,
         project_root=project_root,
+        only=args.only,
     )
     try:
         key = invocation_key(invocation, args.snapshot_name)
@@ -1342,8 +1383,8 @@ def main(argv=None) -> int:
             else TraceStore.start(ldr_dir, invocation, *settings)
         )
         args.sink = sink
-        if not args.golden and requested_mode != "inspect":
-            store.reference_run = _baseline_run(golden_path)
+        if requested_mode in {"run", "pytest", "module"} and not os.environ.get("LDR_NOISE_RUN"):
+            _find_previous(store)
         store.full_tests = _full_prefixes(args.full)
         if args.full or args.deep:
             store.walk_ceiling = None  # --full= and --deep= have no ceiling
@@ -1557,9 +1598,9 @@ def main(argv=None) -> int:
             }
             status["hot_functions"] = slowdown_report.hot_functions(calls, costs, seconds)
             status["hot_functions_of"] = status["call_stream"]["started"]
-            references = [item["reference"] for item in stream_summaries if "reference" in item]
-            if references:
-                status["reference"] = _reference_status(references)
+            if requested_mode in {"run", "pytest", "module"} and not os.environ.get("LDR_NOISE_RUN"):
+                if comparison := _compare_with_previous(store, rerun_plan, executed):
+                    status["reference"] = comparison
             status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1
             status["call_stream"]["summaries"] = len(stream_summaries)
             status["call_stream"]["volatile_baseline"] = bool(args.learn_volatility)
@@ -1629,20 +1670,9 @@ def main(argv=None) -> int:
         if status.get("incomplete"):
             redaction_note += f"INCOMPLETE: {status['incomplete']}.\n"
         if reference_status := status.get("reference"):
-            if reference_status["error"]:
-                redaction_note += (
-                    "REFERENCE: the baseline run's fingerprints could not be read "
-                    f"({reference_status['error']}), so calls were not compared while recording.\n"
-                )
-            else:
-                missing = reference_status["missing"]
-                redaction_note += (
-                    f"REFERENCE: run {reference_status['run_id'][:8]}: "
-                    f"{reference_status['compared']} call(s) compared, {reference_status['same']} same, "
-                    f"{reference_status['different']} differ, {reference_status['new']} new, "
-                    f"{'not counted' if missing is None else missing} missing. "
-                    "Calls that differ keep full detail.\n"
-                )
+            redaction_note += _previous_run_note(reference_status)
+        elif rerun_plan is None and requested_mode in {"run", "pytest", "module"}:
+            redaction_note += "PREVIOUS RUN: none (no earlier run of this target to compare with).\n"
         if status.get("too_large"):
             redaction_note += _render_too_large(status["too_large"], args)
         if "slowdown" in status:
@@ -1790,6 +1820,8 @@ def main(argv=None) -> int:
     comparison_unknown = False
     environment_comparison = None
     stream_changes = []
+    if (compared := status.get("reference")) and not compared.get("error") and rerun_plan is None:
+        stream_changes = list(compared["changed"])
     findings = []
     snapshot_action = "none"
     if sql_report is not None:

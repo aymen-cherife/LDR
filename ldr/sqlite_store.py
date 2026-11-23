@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS call_lookup (
     role TEXT NOT NULL, name TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS call_lookup_fp ON call_lookup(run_id, fp);
+-- The comparison with the previous run looks calls up by address.
+CREATE INDEX IF NOT EXISTS call_records_frame ON call_records(run_id, frame_id);
 -- Records arrive here without indexes and move to the tables above once per run.
 -- The size of every value the fingerprint walk read: its type, its role in the call
 -- (receiver, argument or return), the call's address and the nodes walked.
@@ -282,6 +284,7 @@ class TraceStore:
         max_recorded_calls=DEFAULT_MAX_RECORDED_CALLS,
         reference_run=None,
         walk_ceiling=DEFAULT_WALK_CEILING,
+        reference_roots=None,
     ):
         self.path = path
         self.run_id = run_id
@@ -300,6 +303,8 @@ class TraceStore:
         self.max_recorded_calls = max_recorded_calls
         # The run whose per-call fingerprints each live call is compared with.
         self.reference_run = reference_run
+        # The tests of that run that this run is compared with (pytest), or None for all calls.
+        self.reference_roots = reference_roots
         # Nodes a value may need before it is sketched instead of walked (None: no ceiling).
         self.walk_ceiling = walk_ceiling
 
@@ -826,22 +831,6 @@ class TraceStore:
                 (self.run_id,),
             ).fetchone()
         return used
-
-    def read_reference(self, run_id, prefix=None):
-        """Per-call signatures of a finished run: ``{address: (signature, function)}``.
-
-        With a prefix, only the calls at or under that address (one test's calls).
-        """
-        query = "SELECT frame_id, function, signature FROM call_records WHERE run_id = ?"
-        parameters = [run_id]
-        if prefix:
-            query += " AND (frame_id = ? OR substr(frame_id, 1, ?) = ?)"
-            parameters += [prefix, len(prefix) + 1, prefix + "/"]
-        with closing(self._connect()) as connection:
-            return {
-                frame_id: (bytes(signature), function)
-                for frame_id, function, signature in connection.execute(query, parameters)
-            }
 
     def finish_stream(self, worker, summary):
         with closing(self._connect()) as connection, connection:

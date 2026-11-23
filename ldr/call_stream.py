@@ -10,6 +10,7 @@ from threading import RLock
 from .boundary import BoundaryStream
 from .deep import Timeline
 from .fingerprint import PARTIAL_MARK, REDACTED, SKETCH_MARK, SKETCH_TYPES, STATS, is_digest
+from .previous import Lookup
 from .sqlite_store import DETAIL_RANK
 from .node import capture
 from .value_capture import capture_value
@@ -80,15 +81,9 @@ class CallStream:
         self.deep_bytes_in_flight = 0
         self.committed_deep_bytes = 0
         self.boundaries = BoundaryStream(store, worker) if store.max_boundary_bytes else None
-        # The reference run's per-call signatures, loaded once, by address.
-        self.reference = None
-        self.reference_error = None
-        self.reference_counts = {"compared": 0, "same": 0, "different": 0, "new": 0, "not_compared": 0}
-        self.changed = {}
-        # Addresses whose calls also differed between two runs of identical code (learned by
-        # --learn-volatility on the reference run), and how many changed calls are such.
-        self.varied = set()
-        self.changed_varied = {}
+        # The previous run is asked about each finished call in SQLite; none of it is held here.
+        self.lookup = None
+        self.lookup_error = None
         self.preview_of = None
         self.flusher_ident = None
         if getattr(store, "remote", False):
@@ -98,17 +93,12 @@ class CallStream:
         # Tests whose every call keeps detail (a rerun for detail), by address.
         self.full_tests = tuple(getattr(store, "full_tests", ()))
         if store.reference_run:
+            prefix = getattr(store, "reference_prefix", None)
+            roots = [prefix] if prefix else getattr(store, "reference_roots", None)
             try:
-                self.reference = store.read_reference(
-                    store.reference_run, getattr(store, "reference_prefix", None)
-                )
+                self.lookup = Lookup(store.path, store.reference_run, roots, store.busy_timeout)
             except (OSError, sqlite3.Error) as exc:
-                self.reference_error = type(exc).__name__
-            try:
-                learned = store.load_section(store.reference_run, "varied_calls")
-                self.varied = set(learned["addresses"]) if learned else set()
-            except (OSError, sqlite3.Error, KeyError, ValueError):
-                self.varied = set()
+                self.lookup_error = type(exc).__name__
 
     @property
     def keeping_details(self):
@@ -292,9 +282,10 @@ class CallStream:
                 parts.append(("ret", "", output))
             error_type = error.split(":", 1)[0] if error else None
             signature = call_signature(parts, error_type)
-            state = self._compare(frame_id, function, signature, comparable)
+            state = self._compare(frame_id, signature, comparable)
             self.pending_fp.append(
-                (ordinal, frame_id, parent, function, error_type, parts, state, signature)
+                (ordinal, frame_id, parent, function, error_type, parts,
+                 None if comparable else "uncomparable", signature)
             )
             mutated = [name for name, token in inputs.items() if exit_inputs.get(name) != token]
             reasons = []
@@ -402,26 +393,25 @@ class CallStream:
                 with self.boundaries.lock:
                     self.boundaries._flush()
 
-    def _compare(self, frame_id, function, signature, comparable):
-        """Compare one finished call with the reference run's call at the same address."""
-        if self.reference is None:
+    def _compare(self, frame_id, signature, comparable):
+        """Compare one finished call with the previous run's call at the same address.
+
+        The answer only decides which calls keep detail; the comparison that is reported is
+        made from the stored rows after the run (previous.compare).
+        """
+        if self.lookup is None or not self.lookup.covers(frame_id):
             return None
-        known = self.reference.pop(frame_id, None)
-        counts = self.reference_counts
+        try:
+            known = self.lookup.signature(frame_id)
+        except sqlite3.Error as exc:
+            self.lookup_error = type(exc).__name__
+            self.lookup = None
+            return None
         if known is None:
-            state = "new"
-        else:
-            counts["compared"] += 1
-            if known[0] != signature:
-                state = "different"
-            else:
-                state = "same" if comparable else "not_compared"
-        counts[state] += 1
-        if state in ("different", "new"):
-            self.changed[function] = self.changed.get(function, 0) + 1
-            if frame_id in self.varied:
-                self.changed_varied[function] = self.changed_varied.get(function, 0) + 1
-        return state
+            return "new"
+        if known != signature:
+            return "different"
+        return "same" if comparable else "not_compared"
 
     def flush(self):
         if self.pending or self.pending_fp:
@@ -484,22 +474,10 @@ class CallStream:
                     "observed": self.deep_observed
                     + sum(timeline.observed for timeline in self.deep.values()),
                 }
-            if self.reference is not None or self.reference_error:
-                missing = self.reference if self.reference is not None and self.worker == "main" else None
-                changed = set(self.changed)
-                if missing:
-                    changed.update(function for _, function in missing.values())
-                summary["reference"] = {
-                    "run_id": self.store.reference_run,
-                    "error": self.reference_error,
-                    **self.reference_counts,
-                    "missing": len(missing) if missing is not None else None,
-                    "changed": sorted(changed),
-                    "changed_detail": {
-                        function: [self.changed.get(function, 0), self.changed_varied.get(function, 0)]
-                        for function in sorted(changed)
-                    },
-                }
+            if self.lookup is not None:
+                self.lookup.close()
+            if self.lookup_error:
+                summary["lookup_error"] = self.lookup_error
             if self.boundaries is not None:
                 summary["boundaries"] = self.boundaries.finish()
             self.active.clear()

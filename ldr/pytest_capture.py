@@ -7,19 +7,9 @@ import pytest
 
 from . import fingerprint, reproduce
 from .call_stream import CallStream
+from .previous import encode_node_id
 from .sink import store_from_settings
 from .tracer import Recorder
-
-
-def encode_node_id(node_id: str) -> str:
-    """Keep the file path, and percent-encode ``%``, ``/`` and ``#`` after it.
-
-    Those characters separate the segments of an address, so they must not
-    appear inside the test's own segment.
-    """
-    path, separator, rest = node_id.partition("::")
-    rest = rest.replace("%", "%25").replace("/", "%2F").replace("#", "%23")
-    return path + separator + rest
 
 
 def _test_key(root) -> str:

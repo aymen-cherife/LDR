@@ -1,4 +1,8 @@
-"""Phase 2 rule 4: calls are compared with the reference run while they are recorded."""
+"""Phase 2 rule 4: calls are compared with the previous run of the same target.
+
+A finished call asks SQLite for the signature of the call at the same address in the previous
+run; a call that differs keeps full detail, with no rerun. After the run the whole comparison
+is a join over the two runs' rows (see previous.py and test_previous_run.py)."""
 
 import json
 import os
@@ -48,9 +52,9 @@ def database(project):
 
 def test_a_differing_call_beyond_the_first_eight_keeps_detail_without_a_rerun(tmp_path):
     write(tmp_path)
-    ldr(tmp_path, "run", "app.py", "--golden")
+    ldr(tmp_path, "run", "app.py")
     write(tmp_path, delta=1)
-    ldr(tmp_path, "run", "app.py", "--diff", "--fail-on-change", expected=3)
+    ldr(tmp_path, "run", "app.py")
     result = report(tmp_path)
     reference = result["status"]["reference"]
     assert (reference["compared"], reference["same"], reference["different"]) == (30, 29, 1)
@@ -65,11 +69,7 @@ def test_a_differing_call_beyond_the_first_eight_keeps_detail_without_a_rerun(tm
                 (run_id,),
             )
         }
-        flagged = connection.execute(
-            "SELECT frame_id FROM call_records WHERE run_id = ? AND reference = 'different'", (run_id,)
-        ).fetchall()
     assert kept == {f"app.py:f#{n}" for n in range(1, 9)} | {"app.py:f#12"}
-    assert flagged == [("app.py:f#12",)]
     payload = json.loads(
         database(tmp_path).execute(
             "SELECT payload FROM stream_calls WHERE run_id = ? AND frame_id = 'app.py:f#12'", (run_id,)
@@ -77,40 +77,35 @@ def test_a_differing_call_beyond_the_first_eight_keeps_detail_without_a_rerun(tm
     )
     assert payload["detail_at"] == "return"
     assert payload["input_preview"] == {"n": "12"}
+    assert "differs from reference" in payload["kept"]
 
 
 def test_moving_the_function_does_not_make_its_calls_differ(tmp_path):
     write(tmp_path)
-    ldr(tmp_path, "run", "app.py", "--golden")
+    ldr(tmp_path, "run", "app.py")
     write(tmp_path, padding="# moved down\n# by two lines\n")
-    ldr(tmp_path, "run", "app.py", "--diff", "--fail-on-change")
+    ldr(tmp_path, "run", "app.py")
     reference = report(tmp_path)["status"]["reference"]
     assert (reference["compared"], reference["different"], reference["new"]) == (30, 0, 0)
 
 
 def test_new_and_missing_calls_are_reported(tmp_path):
     write(tmp_path, count=30)
-    ldr(tmp_path, "run", "app.py", "--golden")
+    ldr(tmp_path, "run", "app.py")
     write(tmp_path, count=28)
-    ldr(tmp_path, "run", "app.py", "--diff", "--fail-on-change", expected=3)
+    ldr(tmp_path, "run", "app.py")
     reference = report(tmp_path)["status"]["reference"]
     assert (reference["compared"], reference["same"], reference["missing"]) == (28, 28, 2)
     assert report(tmp_path)["behavior"]["stream_changed_functions"] == ["app.py:f"]
     write(tmp_path, count=31)
-    ldr(tmp_path, "run", "app.py", "--diff", "--fail-on-change", expected=3)
+    ldr(tmp_path, "run", "app.py")
     reference = report(tmp_path)["status"]["reference"]
-    assert (reference["new"], reference["missing"]) == (1, 0)
+    assert (reference["new"], reference["missing"]) == (3, 0)  # against the run of 28, not of 30
 
 
-def test_without_a_baseline_there_is_no_reference(tmp_path):
+def test_the_previous_run_is_stated_in_the_output(tmp_path):
     write(tmp_path)
     ldr(tmp_path, "run", "app.py")
-    assert "reference" not in report(tmp_path)["status"]
-
-
-def test_the_reference_is_stated_in_the_output(tmp_path):
-    write(tmp_path)
-    ldr(tmp_path, "run", "app.py", "--golden")
     write(tmp_path, delta=1)
-    result = ldr(tmp_path, "run", "app.py", "--diff", "--fail-on-change", expected=3)
-    assert "REFERENCE:" in result.stdout and "1 differ" in result.stdout
+    result = ldr(tmp_path, "run", "app.py")
+    assert "PREVIOUS RUN" in result.stdout and "1 differ" in result.stdout
