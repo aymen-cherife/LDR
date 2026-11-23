@@ -9,7 +9,7 @@ from threading import RLock
 
 from .boundary import BoundaryStream
 from .deep import Timeline
-from .fingerprint import PARTIAL_MARK, REDACTED, STATS, is_digest
+from .fingerprint import PARTIAL_MARK, REDACTED, SKETCH_MARK, SKETCH_TYPES, STATS, is_digest
 from .sqlite_store import DETAIL_RANK
 from .node import capture
 from .value_capture import capture_value
@@ -47,6 +47,10 @@ class CallStream:
         self.next_ordinal = 0
         self.completed = 0
         self.uncomparable = 0
+        # Values too large to walk in full: sketched instead (see fingerprint.configure).
+        self.sketched_total = 0
+        self.sketched_functions = {}
+        self.sketched_examples = []
         self.redacted = 0
         # Where each recorded function is defined: {function: (file, line)}.
         self.locations = {}
@@ -256,10 +260,18 @@ class CallStream:
             if error is None:
                 tokens.append(output)
             comparable = all(
-                is_digest(token) and not token.endswith(PARTIAL_MARK)
+                is_digest(token) and not token.endswith((PARTIAL_MARK, SKETCH_MARK))
                 for token in tokens
             )
             self.uncomparable += not comparable
+            for name, token in (*inputs.items(), *([("return", output)] if error is None else [])):
+                if token and token.endswith(SKETCH_MARK):
+                    self.sketched_total += 1
+                    self.sketched_functions[function] = self.sketched_functions.get(function, 0) + 1
+                    if len(self.sketched_examples) < 20:
+                        self.sketched_examples.append(
+                            [entry[2], name, SKETCH_TYPES.get(token, "?"), token]
+                        )
             self.redacted += sum(token == "redacted" for token in inputs.values()) + (output == "redacted")
 
             parts = [("in", name, token) for name, token in inputs.items()]
@@ -442,6 +454,11 @@ class CallStream:
                 "unfinished": len(self.active),
                 "uncomparable": self.uncomparable,
                 "redacted": self.redacted,
+                "sketched": {
+                    "total": self.sketched_total,
+                    "functions": dict(sorted(self.sketched_functions.items(), key=lambda i: (-i[1], i[0]))[:20]),
+                    "examples": self.sketched_examples,
+                },
                 "locations": {function: list(place) for function, place in self.locations.items()},
                 "write_failed": self.write_failed,
                 "calls": dict(sorted(self.counts.items(), key=lambda item: (-item[1], item[0]))[:50]),

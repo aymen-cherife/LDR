@@ -51,7 +51,7 @@ from .store import (
 from .suggest import rank_inspections
 from .call_stream import CallStream
 from .sqlite_store import TraceStore, storage_settings
-from . import sqlreport
+from . import fingerprint as fingerprint_module, sqlreport
 from .summary import summarize
 from .tracer import Recorder, python_version_message
 from .value_capture import first_difference
@@ -467,6 +467,76 @@ def _reference_status(parts: list[dict]) -> dict[str, Any]:
         "changed": sorted({function for part in parts for function in part["changed"]}),
         "changed_detail": _merge_detail(parts),
     }
+
+
+def _too_large(store, summaries: list[dict]) -> dict[str, Any] | None:
+    """Values that went over the node ceiling and were sketched, and whether each sketch changed."""
+    import marshal
+
+    total = sum(summary.get("sketched", {}).get("total", 0) for summary in summaries)
+    if not total:
+        return None
+    functions: dict[str, int] = {}
+    examples: list[list[str]] = []
+    for summary in summaries:
+        sketched = summary.get("sketched", {})
+        for function, count in sketched.get("functions", {}).items():
+            key = sqlreport.identity(function)
+            functions[key] = functions.get(key, 0) + count
+        examples.extend(sketched.get("examples", []))
+    examples = examples[:10]
+    state = {}
+    reference = getattr(store, "reference_run", None)
+    if reference:
+        try:
+            addresses = [example[0] for example in examples]
+            with sqlreport._open(store) as connection:
+                rows = connection.execute(
+                    "SELECT frame_id, parts FROM call_records WHERE run_id = ? AND frame_id IN (%s)"
+                    % ",".join("?" * len(addresses)), (reference, *addresses),
+                ).fetchall() if addresses else []
+            before = {
+                (address, "return" if role == "ret" else name): token
+                for address, parts in rows for role, name, token in marshal.loads(parts)
+                if role in ("in", "ret")
+            }
+            for address, name, kind, token in examples:
+                old = before.get((address, name))
+                state[(address, name)] = "no reference call" if old is None else (
+                    "sketch unchanged" if old == token else "sketch changed"
+                )
+        except (OSError, sqlite3.Error, ValueError):
+            pass
+    return {
+        "values": total,
+        "ceiling": store.walk_ceiling,
+        "functions": dict(sorted(functions.items(), key=lambda item: (-item[1], item[0]))[:10]),
+        "examples": [
+            {"address": address, "argument": name, "type": kind,
+             "sketch": state.get((address, name), "no reference run")}
+            for address, name, kind, token in examples
+        ],
+    }
+
+
+def _render_too_large(info: dict[str, Any], args) -> str:
+    lines = [
+        f"TOO LARGE: {info['values']} value(s) went over the node ceiling ({info['ceiling']:,} nodes) and "
+        "were fingerprinted as a sketch (type, size, top-level parts), not walked in full. "
+        "An unchanged sketch does not prove the value is unchanged.\n"
+    ]
+    for example in info["examples"][:5]:
+        lines.append(
+            f"  too large: {example['type']} at {example['address']} ({example['argument']}), "
+            f"{example['sketch']}\n"
+        )
+    if info["functions"]:
+        command = shlex.join(
+            ["ldr", args.mode, args.target, *redact_argv(list(args.rest)),
+             *[f"--uncap={function}" for function in list(info["functions"])[:3]]]
+        )
+        lines.append(f"  To walk those values in full, run again in normal mode with: {command}\n")
+    return "".join(lines)
 
 
 def _merge_detail(parts: list[dict]) -> dict[str, list[int]]:
@@ -1168,6 +1238,11 @@ def main(argv=None) -> int:
         help="save direct calls from the project into a Python module (repeatable)",
     )
     parser.add_argument(
+        "--uncap", action="append", default=[], metavar="FUNCTION",
+        help="walk the values of this function in full, without the node ceiling (repeatable); "
+             "everything else stays in normal mode",
+    )
+    parser.add_argument(
         "--detail", metavar="ADDRESS",
         help="run: rerun the test that contains this call address, to keep its detail",
     )
@@ -1304,6 +1379,9 @@ def main(argv=None) -> int:
         if not args.golden and requested_mode != "inspect":
             store.reference_run = _baseline_run(golden_path)
         store.full_tests = _full_prefixes(args.full)
+        if args.full or args.deep:
+            store.walk_ceiling = None  # --full= and --deep= have no ceiling
+        fingerprint_module.configure(store.walk_ceiling)
         if rerun_plan is not None:
             # A rerun for detail: compare each call of the test with the run it repeats,
             # and keep every call of the test.
@@ -1325,6 +1403,7 @@ def main(argv=None) -> int:
         "max_calls_per_function": args.max_calls_per_function,
         "deep_functions": args.deep,
         "boundary_modules": args.boundary,
+        "uncapped": args.uncap,
     }
     # A default run builds no tree: its calls are in SQLite and the report reads them there.
     # Snapshots, comparisons and inspect still use the capped tree (until Phase 3's store).
@@ -1468,6 +1547,9 @@ def main(argv=None) -> int:
             status["call_stream"]["first_calls"] = store.first_calls
             status["call_stream"]["last_calls"] = store.last_calls
             status["fingerprint"] = _fingerprint_status(stream_summaries)
+            too_large = _too_large(store, stream_summaries)
+            if too_large:
+                status["too_large"] = too_large
             if report_from_sql:
                 try:
                     locations = {
@@ -1590,6 +1672,8 @@ def main(argv=None) -> int:
                     f"{'not counted' if missing is None else missing} missing. "
                     "Calls that differ keep full detail.\n"
                 )
+        if status.get("too_large"):
+            redaction_note += _render_too_large(status["too_large"], args)
         if "slowdown" in status:
             redaction_note += slowdown_report.render_slowdown(status["slowdown"])
         if status.get("hot_functions"):

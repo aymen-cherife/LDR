@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from . import reproduce
+from . import fingerprint, reproduce
 from .call_stream import CallStream
 from .sink import store_from_settings
 from .tracer import Recorder
@@ -109,6 +109,7 @@ class WorkerCapture(RuntimeCapture):
         self.config = config
         self.store = store_from_settings(settings["store"])
         self.store.full_tests = tuple(settings.get("full_tests") or ())
+        fingerprint.configure(self.store.walk_ceiling)
         self.name = config.workerinput["workerid"]
         self.worker = self.name
         self.rerun_random = settings.get("rerun_random") or {}

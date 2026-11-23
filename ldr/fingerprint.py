@@ -54,6 +54,36 @@ class Budget:
 
 DEFAULT_BUDGET = Budget()
 
+# The node ceiling of default mode (close-list item 4). A value that needs more nodes than
+# this is not walked in full: it gets a cheap sketch instead (type, size, top-level parts),
+# marked with SKETCH_MARK. None means no ceiling (--full= and --deep=), and a function
+# named by --uncap runs with the ceiling lifted. TO MEASURE: the default is a placeholder.
+DEFAULT_WALK_CEILING = 20_000
+_ceiling: Budget | None = None
+_lifted = 0
+
+
+def configure(ceiling: int | None) -> None:
+    """Set the node ceiling for this process; None or 0 removes it."""
+    global _ceiling
+    _ceiling = Budget(max_nodes=ceiling) if ceiling else None
+
+
+class lifted:
+    """``with lifted():`` computes fingerprints without the node ceiling."""
+
+    def __enter__(self):
+        global _lifted
+        _lifted += 1
+
+    def __exit__(self, *exc):
+        global _lifted
+        _lifted -= 1
+
+
+def _effective() -> Budget:
+    return _ceiling if _ceiling is not None and not _lifted else DEFAULT_BUDGET
+
 
 class _Stop(Exception):
     def __init__(self, status: str):
@@ -77,6 +107,7 @@ def _current_caches():
     if _cache_policy is None or not same_text_policy(_cache_policy):
         _secret_cache.clear()
         _value_cache.clear()
+        _identity_cache.clear()
         _cache_policy = text_policy()
 
 
@@ -132,11 +163,12 @@ def is_digest(token: str | None) -> bool:
 class _Stats:
     """Process-wide counters, read by the recorder to report cost and gaps."""
 
-    __slots__ = ("nodes", "tmp_normalized")
+    __slots__ = ("nodes", "tmp_normalized", "last_visited")
 
     def __init__(self) -> None:
         self.nodes = 0
         self.tmp_normalized = 0
+        self.last_visited = 0
 
 
 STATS = _Stats()
@@ -380,9 +412,72 @@ class _Walk:
 
 
 PARTIAL_MARK = "+"
+SKETCH_MARK = "~"  # the digest is of a sketch: equal does not prove the value unchanged
+SKETCH_TYPES: dict[str, str] = {}  # sketch token -> type label, for the gaps line (bounded)
+SKETCH_TYPES_LIMIT = 2000
 
 
-def fingerprint(value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool = False) -> str:
+def is_sketch(token: str | None) -> bool:
+    return bool(token) and token.endswith(SKETCH_MARK)
+
+
+def _shallow(item: Any) -> str:
+    """One part of a sketch: its type and size, and the value itself when it is a small scalar."""
+    kind = type(item)
+    label = type_identity(kind)
+    if kind in (int, float, bool) or item is None:
+        return f"{label}={item!r}"
+    if kind in (str, bytes, bytearray, list, tuple, dict, set, frozenset):
+        return f"{label}[{len(item)}]"
+    return label
+
+
+def _sketch(value: Any) -> str:
+    """A digest of a value's type, size and top-level parts. Never calls user code."""
+    kind = type(value)
+    parts: list[str] = [type_identity(kind)]
+    if kind in (list, tuple):
+        parts.append(f"len={len(value)}")
+        parts += [_shallow(item) for item in value[:32]]
+        parts.append("...")
+        parts += [_shallow(item) for item in value[-32:]]
+    elif kind is dict:
+        parts.append(f"len={len(value)}")
+        for key, item in list(value.items())[:64]:
+            if type(key) is str and len(key) <= 32 and not _looks_secret(key) and not is_secret_name(key):
+                parts.append(f"{key}:{_shallow(item)}")
+            else:
+                parts.append(f"{_shallow(key)}:{_shallow(item)}")
+    elif kind in (set, frozenset):
+        parts.append(f"len={len(value)}")
+        parts += sorted(_shallow(item) for item in list(value)[:64])
+    else:
+        reading = read(value)
+        if reading is not None:
+            parts.append(f"fields={len(reading.fields)}")
+            for name, item in reading.fields[:64]:
+                if name is not None and is_secret_name(name):
+                    raise _Stop(REDACTED)
+                parts.append(f"{name}:{_shallow(item)}")
+        elif hasattr(kind, "__len__"):
+            parts.append("sized")
+    digest = hashlib.blake2b("\x1f".join(parts).encode("utf-8", "surrogatepass"), digest_size=DIGEST_BYTES)
+    token = digest.hexdigest() + SKETCH_MARK
+    if len(SKETCH_TYPES) >= SKETCH_TYPES_LIMIT:
+        SKETCH_TYPES.clear()
+    SKETCH_TYPES[token] = type_label(kind)
+    return token
+
+
+# Deeply immutable values (nothing mutable at any depth) keep their fingerprint between
+# calls. Each entry holds a reference to the value, so the value's id cannot be reused by
+# another object while it is cached; the cache is small and first-in first-out.
+IDENTITY_LIMIT = 512
+IDENTITY_MIN_NODES = 16
+_identity_cache: dict[tuple[int, bool], tuple[Any, tuple[str, bool]]] = {}
+
+
+def fingerprint(value: Any, budget: Budget | None = None, *, partial_ok: bool = False) -> str:
     """Return a hex digest of the full value, or a status word. Never raises.
 
     With ``partial_ok`` a value holding unreadable parts still gets a digest of
@@ -394,10 +489,18 @@ def fingerprint(value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool
 
 
 def fingerprint_details(
-    value: Any, budget: Budget = DEFAULT_BUDGET, *, partial_ok: bool = False
+    value: Any, budget: Budget | None = None, *, partial_ok: bool = False
 ) -> tuple[str, bool]:
-    """Return the existing fingerprint and whether it can be reused for this object."""
-    if CACHE and budget is DEFAULT_BUDGET:
+    """Return the existing fingerprint and whether it can be reused for this object.
+
+    Without an explicit budget the process's node ceiling applies (see ``configure``): a
+    value over it is sketched, and the token ends with ``SKETCH_MARK``.
+    """
+    implicit = budget is None
+    if implicit:
+        budget = _effective()
+    sketch = implicit and budget is not DEFAULT_BUDGET
+    if CACHE and implicit:
         key = _cache_key(value)
         if key is not None:
             _current_caches()
@@ -406,7 +509,7 @@ def fingerprint_details(
             if found is not None:
                 return found
             normalized = STATS.tmp_normalized
-            found = _fingerprint_details(value, budget, partial_ok)
+            found = _fingerprint_details(value, budget, partial_ok, sketch=sketch)
             # A normalized temp path is counted for the gaps line on every
             # occurrence, so it is never answered from the cache.
             if STATS.tmp_normalized == normalized:
@@ -414,19 +517,48 @@ def fingerprint_details(
                     _value_cache.clear()
                 _value_cache[key] = found
             return found
-    return _fingerprint_details(value, budget, partial_ok)
+        if type(value) in (tuple, frozenset):
+            # A deeply immutable value keeps its fingerprint between calls (see IDENTITY_LIMIT).
+            _current_caches()
+            entry = _identity_cache.get((id(value), partial_ok))
+            if entry is not None and entry[0] is value:  # the same object, not a reused id
+                return entry[1]
+            normalized = STATS.tmp_normalized
+            found = _fingerprint_details(value, budget, partial_ok, sketch=sketch)
+            if (
+                found[1] and found[0] not in STATUSES and STATS.last_visited >= IDENTITY_MIN_NODES
+                and STATS.tmp_normalized == normalized
+            ):
+                if len(_identity_cache) >= IDENTITY_LIMIT:
+                    _identity_cache.pop(next(iter(_identity_cache)))  # oldest first
+                _identity_cache[id(value), partial_ok] = (value, found)
+            return found
+    return _fingerprint_details(value, budget, partial_ok, sketch=sketch)
 
 
-def _fingerprint_details(value: Any, budget: Budget, partial_ok: bool) -> tuple[str, bool]:
+def _fingerprint_details(
+    value: Any, budget: Budget, partial_ok: bool, sketch: bool = False
+) -> tuple[str, bool]:
     walk = None
     try:
         out = hashlib.blake2b(digest_size=DIGEST_BYTES)
         walk = _Walk(budget, partial_ok)
         walk.encode(value, out)
+        STATS.last_visited = walk.visited
         return out.hexdigest() + (PARTIAL_MARK if walk.partial else ""), (
             walk.immutable and not walk.partial
         )
     except _Stop as stop:
+        if (
+            stop.status == UNKNOWN and sketch and walk is not None
+            and budget.max_nodes is not None and walk.visited > budget.max_nodes
+        ):
+            try:
+                return _sketch(value), False  # over the node ceiling: a sketch, never a guess
+            except _Stop as inner:
+                return inner.status, False
+            except Exception:
+                return FAILED, False
         return stop.status, False
     except RecursionError:
         return UNKNOWN, False

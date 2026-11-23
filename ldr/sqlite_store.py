@@ -12,7 +12,7 @@ from pathlib import Path
 from time import monotonic, sleep, time_ns
 from uuid import uuid4
 
-from .fingerprint import is_digest
+from .fingerprint import DEFAULT_WALK_CEILING, is_digest
 from .node import Node
 
 DEFAULT_BATCH_SIZE = 1000
@@ -181,6 +181,9 @@ def storage_settings(project_root, *, deep=False, boundary=False):
         raise ValueError("[tool.ldr.storage] last_calls must be a nonnegative integer")
     hard_cap_bytes = settings.get("hard_cap_bytes")
     max_recorded_calls = settings.get("max_recorded_calls", DEFAULT_MAX_RECORDED_CALLS)
+    walk_ceiling = settings.get("walk_ceiling", DEFAULT_WALK_CEILING)
+    if type(walk_ceiling) is not int or not 0 <= walk_ceiling < 2**31:
+        raise ValueError("[tool.ldr.storage] walk_ceiling must be a nonnegative integer (0 = no ceiling)")
     if hard_cap_bytes is not None and (
         type(hard_cap_bytes) is not int or not 0 < hard_cap_bytes < 2**63
     ):
@@ -227,7 +230,7 @@ def storage_settings(project_root, *, deep=False, boundary=False):
     return (
         batch_size, busy_timeout, max_trace_bytes, capture_lines, max_value_bytes,
         allowance["deep"], allowance["boundary"], first_calls, last_calls,
-        hard_cap_bytes, max_recorded_calls,
+        hard_cap_bytes, max_recorded_calls, walk_ceiling or None,
     )
 
 
@@ -271,6 +274,7 @@ class TraceStore:
         hard_cap_bytes=None,
         max_recorded_calls=DEFAULT_MAX_RECORDED_CALLS,
         reference_run=None,
+        walk_ceiling=DEFAULT_WALK_CEILING,
     ):
         self.path = path
         self.run_id = run_id
@@ -289,6 +293,8 @@ class TraceStore:
         self.max_recorded_calls = max_recorded_calls
         # The run whose per-call fingerprints each live call is compared with.
         self.reference_run = reference_run
+        # Nodes a value may need before it is sketched instead of walked (None: no ceiling).
+        self.walk_ceiling = walk_ceiling
 
     @classmethod
     def start(
@@ -306,6 +312,7 @@ class TraceStore:
         last_calls=DEFAULT_LAST_CALLS,
         hard_cap_bytes=None,
         max_recorded_calls=DEFAULT_MAX_RECORDED_CALLS,
+        walk_ceiling=DEFAULT_WALK_CEILING,
     ):
         directory = Path(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -331,6 +338,7 @@ class TraceStore:
             last_calls,
             hard_cap_bytes,
             max_recorded_calls,
+            walk_ceiling=walk_ceiling,
         )
         with closing(store._connect(allow_mode_change=True)) as connection:
             # Two invocations can race to set the journal mode on a new database.
@@ -505,7 +513,7 @@ class TraceStore:
             lookup.extend(
                 (run_id, fp, worker, ordinal, role, name)
                 for role, name, fp in parts
-                if role != "out" and is_digest(fp)
+                if role != "out" and is_digest(fp) and not fp.endswith("~")  # a sketch is not a value
             )
         connection.executemany(
             "INSERT INTO call_records_stage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records
@@ -912,7 +920,7 @@ class TraceStore:
     def settings(self):
         """Constructor arguments, so another process can open the same run."""
         # Attributes a run sets after opening the store are not constructor arguments.
-        later = ("full_tests", "reference_prefix")
+        later = ("full_tests", "reference_prefix", "uncap")
         return {
             key: value for key, value in vars(self).items()
             if not key.startswith("_") and key not in later

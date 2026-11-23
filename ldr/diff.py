@@ -6,7 +6,7 @@ import difflib
 import hashlib
 import json
 
-from .fingerprint import PARTIAL_MARK, REDACTED, is_digest
+from .fingerprint import PARTIAL_MARK, REDACTED, SKETCH_MARK, is_digest
 from .fingerprint import UNKNOWN as FP_UNKNOWN
 from .node import Node
 
@@ -50,7 +50,7 @@ def _compare_value(old_text, old_fp, new_text, new_fp) -> tuple[str, bool]:
     """
     if is_digest(old_fp) and is_digest(new_fp):
         if old_fp == new_fp:
-            return (_PARTIAL if old_fp.endswith(PARTIAL_MARK) else _EQUAL), False
+            return (_PARTIAL if old_fp.endswith((PARTIAL_MARK, SKETCH_MARK)) else _EQUAL), False
         return _DIFFERENT, old_text == new_text
     if REDACTED in (old_fp, new_fp):
         return _EQUAL, False
@@ -64,7 +64,7 @@ def _compare_fingerprints(old_fp, new_fp) -> tuple[str, bool]:
     if is_digest(old_fp) and is_digest(new_fp):
         if old_fp != new_fp:
             return _DIFFERENT, False
-        return (_PARTIAL if old_fp.endswith(PARTIAL_MARK) else _EQUAL), False
+        return (_PARTIAL if old_fp.endswith((PARTIAL_MARK, SKETCH_MARK)) else _EQUAL), False
     if FP_UNKNOWN in (old_fp, new_fp):
         return _UNKNOWN, False
     return _EQUAL, False  # absent or redacted on a side: not compared

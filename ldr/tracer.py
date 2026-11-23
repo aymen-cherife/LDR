@@ -16,7 +16,9 @@ from _thread import get_ident
 from dataclasses import dataclass, field
 from time import perf_counter_ns
 
-from .fingerprint import REDACTED, STATS, fingerprint, fingerprint_details
+from contextlib import nullcontext
+
+from .fingerprint import REDACTED, STATS, fingerprint, fingerprint_details, lifted as fingerprint_lifted
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
 from .redact import redact, same_text_policy, text_policy
 from .timing import CallTiming
@@ -34,6 +36,9 @@ def shape_of(value) -> tuple[str, int | None]:
     """
     kind = type(value)
     return (kind.__name__, len(value).bit_length() if kind in _SIZED else None)
+
+
+_NO_CONTEXT = nullcontext()
 
 
 def fp_value(value, name: str | None = None) -> str:
@@ -94,6 +99,7 @@ class Recorder:
         deep_functions: list[str] | None = None,
         boundary_modules: list[str] | None = None,
         build_tree: bool = True,
+        uncapped: list[str] | None = None,
     ):
         if max_nodes < 1:
             raise ValueError("max_nodes must be at least 1")
@@ -121,6 +127,9 @@ class Recorder:
         # Entry state of caller-owned containers, for calls that keep detail when no tree is built.
         self._mutable_evidence: dict[int, dict[str, tuple[int, str]]] = {}
         self.deep_functions = frozenset(deep_functions or ())
+        # Functions whose values are walked without the node ceiling (--uncap).
+        self.uncapped = frozenset(uncapped or ())
+        self._uncap_codes: dict[object, bool] = {}
         self.boundary_modules = tuple(boundary_modules or ())
         self.boundaries = None
         self._deep_codes: set[object] = set()
@@ -353,6 +362,20 @@ class Recorder:
                 previews[name] = "<mutated in call>"
         return previews
 
+    def _no_ceiling(self, code):
+        """A context in which fingerprints of this function's values have no node ceiling."""
+        if not self.uncapped:
+            return _NO_CONTEXT
+        wanted = self._uncap_codes.get(code)
+        if wanted is None:
+            identity = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
+            wanted = (
+                code.co_name in self.uncapped or code.co_qualname in self.uncapped
+                or identity in self.uncapped
+            )
+            self._uncap_codes[code] = wanted
+        return fingerprint_lifted() if wanted else _NO_CONTEXT
+
     def _lines_wanted(self, code) -> bool:
         """Hook point: whether to record which lines ran inside this function.
 
@@ -462,7 +485,8 @@ class Recorder:
         except Exception:
             arguments = {}
         try:
-            argument_fps = self._argument_fingerprints(code, frame, entering=True)
+            with self._no_ceiling(code):
+                argument_fps = self._argument_fingerprints(code, frame, entering=True)
         except Exception:
             argument_fps = {}
         node = Node(
@@ -534,11 +558,12 @@ class Recorder:
         self._timings[id(frame)] = timing
         if self.call_stream is None:
             return
-        inputs = (
-            node.in_fp
-            if node is not None
-            else self._argument_fingerprints(code, frame, entering=True)
-        )
+        with self._no_ceiling(code):
+            inputs = (
+                node.in_fp
+                if node is not None
+                else self._argument_fingerprints(code, frame, entering=True)
+            )
         identity = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
         function = f"{self.frame_prefix}{identity}"
         if function not in self.call_stream.locations:
@@ -871,7 +896,8 @@ class Recorder:
                 out = capture(return_value)
             if node_retained or stream is not None:
                 walked = STATS.nodes
-                out_fp = fp_value(return_value)
+                with self._no_ceiling(code):
+                    out_fp = fp_value(return_value)
                 self._charge(code, walked)
         if isinstance(entry, Node) and self._focus_matches(
             entry.frame_id, self._entry_segment(entry)
@@ -887,9 +913,11 @@ class Recorder:
             if saved:
                 changes = self._changed_arguments(saved, frame)
         if self.call_stream is not None:
+            with self._no_ceiling(code):
+                exit_fps = self._argument_fingerprints(code, frame)
             self.call_stream.close(
                 frame,
-                self._argument_fingerprints(code, frame),
+                exit_fps,
                 out_fp,
                 error,
                 out,
