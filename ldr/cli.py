@@ -21,7 +21,7 @@ from typing import Any
 
 from . import __version__
 from . import environment as run_environment
-from . import rerun as rerun_detail, reproduce, slowdown as slowdown_report
+from . import reproduce, slowdown as slowdown_report
 from .interpreter import CHILD_MARKER, RUNNING, SELECTED_BY, run_in_child
 from .sink import ENV as SINK_ENV, RemoteStore, sink_from_environment
 from .diff import (
@@ -57,8 +57,7 @@ from .tracer import Recorder, python_version_message
 from .value_capture import first_difference
 
 LDR_DIR = ".ldr"
-_KNOWN_RUNNERS = {"unittest", "pytest", "doctest", "pdb", "cProfile", "trace", "timeit"}
-_PROJECT_MARKERS = (".git", "pyproject.toml", "setup.cfg", "setup.py", "tox.ini")
+from .project import KNOWN_RUNNERS as _KNOWN_RUNNERS, infer_project_root as _infer_project_root, target_origin as _target_origin
 _PACKAGE_ROOT_EXCLUDES = {
     ".git", ".github", ".ldr", ".tox", ".venv", "build", "dist", "docs",
     "documentation", "examples", "scripts", "test", "tests", "tools", "venv",
@@ -162,54 +161,6 @@ def _infer_runner(target: str) -> str:
             return "pytest"
         return "run"
     return "module"
-
-
-def _target_origin(mode: str, target: str, rest: list[str]) -> str | None:
-    if mode in ("run", "pytest"):
-        file_part = target.split("::", 1)[0]
-        return os.path.realpath(file_part) if os.path.exists(file_part) else None
-    module_target = target
-    if target in _KNOWN_RUNNERS:
-        module_target = next((item for item in rest if item and not item.startswith("-")), "")
-    if not module_target:
-        return None
-    candidate = module_target.split("::", 1)[0]
-    while candidate:
-        try:
-            spec = importlib.util.find_spec(candidate)
-        except (AttributeError, ImportError, ModuleNotFoundError, ValueError):
-            spec = None
-        if spec and spec.origin:
-            return os.path.realpath(spec.origin)
-        candidate = candidate.rsplit(".", 1)[0] if "." in candidate else ""
-    return None
-
-
-def _infer_project_root(mode: str, target: str, rest: list[str], cwd: str) -> str:
-    origin = _target_origin(mode, target, rest)
-    start = os.path.dirname(origin) if origin and os.path.isfile(origin) else (origin or cwd)
-    fallback = current = os.path.realpath(start)
-    generic_roots = {
-        os.path.realpath(os.path.abspath(os.sep)),
-        os.path.realpath(tempfile.gettempdir()),
-    }
-    while True:
-        if current not in generic_roots and any(
-            os.path.exists(os.path.join(current, marker)) for marker in _PROJECT_MARKERS
-        ):
-            return current
-        parent = os.path.dirname(current)
-        if parent == current:
-            return fallback
-        if (
-            mode == "pytest"
-            and parent == cwd
-            and cwd not in generic_roots
-            and os.path.basename(current).lower() in {"test", "tests"}
-        ):
-            # A markerless project may keep its source beside the test directory.
-            fallback = cwd
-        current = parent
 
 
 def _display_scope(paths: list[str], cwd: str) -> list[str]:
@@ -592,6 +543,8 @@ def _environment_differences(store, source_run: str, current: dict | None) -> li
         return []
     if before is None or current is None:
         return []
+    from . import rerun as rerun_detail
+
     return [
         run_environment.describe_change(change)
         for change in run_environment.compare(before, current)
@@ -1290,6 +1243,8 @@ def main(argv=None) -> int:
     elif args.detail:
         if requested_mode != "run" or args.target is not None or args.rest:
             parser.error("--detail is used as: ldr run --detail ADDRESS")
+        from . import rerun as rerun_detail
+
         return rerun_detail.run_detail(
             args.detail, ldr_dir, lambda child_argv, seed: run_in_child(child_argv, initial_cwd, seed)
         )
@@ -1362,7 +1317,11 @@ def main(argv=None) -> int:
     if args.learn_volatility and not args.golden:
         parser.error("--learn-volatility is only valid while saving a snapshot")
 
-    rerun_plan = rerun_detail.load_plan(os.environ) if is_child else None
+    rerun_plan = None
+    if is_child and os.environ.get("LDR_RERUN"):  # a rerun for detail (rerun.py), else not loaded
+        from . import rerun as rerun_detail
+
+        rerun_plan = rerun_detail.load_plan(os.environ)
     store = None
     storage_warning = None
     try:
@@ -1430,7 +1389,7 @@ def main(argv=None) -> int:
                 + "; ".join(differences[:5]),
                 file=sys.stderr,
             )
-            return rerun_detail.ENVIRONMENT_DIFFERS
+            return 4  # rerun.ENVIRONMENT_DIFFERS
     numpy_hook = None
     if store is not None:
         numpy_hook = reproduce.install_numpy_hook(

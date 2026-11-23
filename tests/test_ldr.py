@@ -261,9 +261,10 @@ def test_identical_runs_produce_no_diff():
     assert diff_tree(r1.roots[0], r2.roots[0]) == []
 
 
-def test_nondeterminism_is_detected_and_excluded():
+def test_nondeterminism_is_detected_and_still_compared_with_a_note():
     """The single biggest first-session killer: unchanged code that hashes
-    differently every run because of time/uuid/random."""
+    differently every run because of time/uuid/random. It is learned, and a change in it
+    is shown with a note rather than left out."""
     import fixtures.nondet as nd
 
     r1 = record(lambda: nd.pipeline())
@@ -276,10 +277,13 @@ def test_nondeterminism_is_detected_and_excluded():
 
     r3 = record(lambda: nd.pipeline())
     changes = diff_tree(r1.roots[0], r3.roots[0])
-    assert all(c.kind == "unstable" for c in changes), changes
+    assert changes  # nothing is left out
+    stamp = [c for c in changes if c.name == "stamp"]
+    assert stamp and all(c.varied for c in stamp)  # the note applies
+    assert not [c for c in changes if c.name == "pure"]
 
 
-def test_unstable_child_does_not_make_parent_a_false_origin():
+def test_a_varying_child_is_the_origin_and_its_parent_only_downstream():
     import fixtures.nondet as nd
 
     r1 = record(lambda: nd.pipeline())
@@ -287,7 +291,9 @@ def test_unstable_child_does_not_make_parent_a_false_origin():
     mark_unstable(r1.roots[0], r2.roots[0])
     r3 = record(lambda: nd.pipeline())
     changes = diff_tree(r1.roots[0], r3.roots[0])
-    assert not [c for c in changes if c.kind == ORIGIN]
+    origins = [c for c in changes if c.kind == ORIGIN]
+    assert origins and all(c.varied for c in origins)  # an origin only where the value varied
+    assert all(c.name == "stamp" for c in origins)
 
 
 # --- render ---------------------------------------------------------

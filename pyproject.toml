@@ -14,7 +14,7 @@ test = ["pytest>=7"]
 pytest = ["pytest>=7"]
 
 [project.scripts]
-ldr = "ldr.cli:main"
+ldr = "ldr.launch:main"
 
 [tool.setuptools.packages.find]
 include = ["ldr*"]

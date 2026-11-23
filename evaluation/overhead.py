@@ -168,7 +168,14 @@ def measure(name, fixture, rounds, env):
         times["ldr"].append(timed(traced, root, env))
     plain_median = statistics.median(times["plain"])
     traced_median = statistics.median(times["ldr"])
+    # What this machine charges for starting the interpreter at all (`python -c pass`), run
+    # right after the rounds so it reflects the same conditions. A recorded run starts two
+    # interpreters (the launcher and the child that runs the program), a plain run one.
+    startup = statistics.median(timed([plain[0], "-c", "pass"], root, env) for _ in range(5))
     return {
+        "bare_python_startup_s": round(startup, 3),
+        "ldr_added_s": round(traced_median - plain_median, 3),
+        "ldr_added_minus_one_startup_s": round(traced_median - plain_median - startup, 3),
         "fixture": name,
         "plain_s": [round(t, 3) for t in times["plain"]],
         "ldr_s": [round(t, 3) for t in times["ldr"]],
@@ -281,7 +288,9 @@ def main() -> int:
             else:
                 print(
                     f"{item['fixture']:8s} plain {item['plain_median_s']:6.2f}s  "
-                    f"ldr {item['ldr_median_s']:6.2f}s  ratio {item['ratio']:5.2f}x",
+                    f"ldr {item['ldr_median_s']:6.2f}s  ratio {item['ratio']:5.2f}x  "
+                    f"python start-up {item['bare_python_startup_s']:5.2f}s  "
+                    f"LDR adds {item['ldr_added_s']:6.2f}s ({item['ldr_added_minus_one_startup_s']:6.2f}s beyond one start-up)",
                     flush=True,
                 )
     if args.json:
