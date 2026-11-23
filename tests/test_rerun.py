@@ -13,6 +13,7 @@ from ldr import rerun
 REPO = Path(__file__).resolve().parents[1]
 
 APP = """\
+import os
 import random
 import time
 
@@ -31,6 +32,14 @@ def lucky():
 
 def now():
     return time.time_ns()
+
+
+def process_number():
+    return os.getpid()
+
+
+def mark(value):
+    return value
 """
 
 TESTS = """\
@@ -48,11 +57,17 @@ def test_steady():
 def test_clock():
     for index in range(20):
         app.work(index)
-    app.work(app.now())
+    app.mark(app.now())
 
 
 def test_after():
     app.work(1)
+
+
+def test_pid():
+    for index in range(20):
+        app.work(index)
+    app.work(app.process_number())
 
 
 def test_flaky():
@@ -137,7 +152,8 @@ def test_a_rerun_that_cannot_match_says_so_and_is_never_shown(tmp_path):
     address = "test_app.py::test_clock/app.py:work#20"
     result = ldr(tmp_path, "run", "--detail", address)
     assert result.returncode == 5, result.stdout + result.stderr
-    assert "could not reproduce: likely order / time / network dependence" in result.stdout
+    # Only time-like values differ (the nanosecond clock), and the message says so.
+    assert "could not reproduce: the" in result.stdout and "time-like" in result.stdout
     assert "--full=test_app.py::test_clock" in result.stdout
     with database(tmp_path) as connection:
         statuses = [json.loads(row[0]) for row in connection.execute("SELECT status FROM runs ORDER BY started_ns")]
@@ -182,11 +198,11 @@ def test_a_different_recorded_environment_value_stops_the_rerun(tmp_path):
     assert "TZ" in result.stderr
 
 
-def test_a_script_address_has_no_test_to_rerun(tmp_path):
+def test_a_script_address_in_a_pytest_run_is_not_a_call_of_that_run(tmp_path):
     project(tmp_path)
     ldr(tmp_path, "pytest", "test_app.py::test_steady", expected=0)
     result = ldr(tmp_path, "run", "--detail", "app.py:work#3")
-    assert result.returncode == 2 and "pytest test" in result.stdout
+    assert result.returncode == 2 and "is not a call in run" in result.stdout
 
 
 def test_the_recorded_random_state_makes_the_rerun_see_the_same_numbers(tmp_path):
@@ -211,3 +227,12 @@ def test_show_prints_the_exact_command_when_detail_was_not_kept(tmp_path):
     assert f"ldr run --detail {address}" in result.stderr
     with database(tmp_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM runs").fetchone() == (1,)  # show never reruns
+
+
+def test_a_difference_that_is_not_time_like_gets_the_general_message(tmp_path):
+    project(tmp_path)
+    ldr(tmp_path, "pytest", "test_app.py::test_pid", expected=0)
+    result = ldr(tmp_path, "run", "--detail", "test_app.py::test_pid/app.py:work#20")
+    assert result.returncode == 5, result.stdout + result.stderr
+    assert "could not reproduce: likely order / time / network dependence" in result.stdout
+    assert "time-like" not in result.stdout
