@@ -355,6 +355,9 @@ class TraceStore:
         with closing(store._connect(allow_mode_change=True)) as connection:
             # Two invocations can race to set the journal mode on a new database.
             required_mode = _journal_mode()
+            # Pages freed by deleting old runs can be given back to the file. This only
+            # takes effect on a new database; an older one is converted by prune.
+            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
             deadline = monotonic() + busy_timeout
             while True:
                 try:

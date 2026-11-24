@@ -283,4 +283,24 @@ def prune(directory: str, keep: int = KEEP_RUNS) -> list[str]:
                 for table in _TABLES:
                     connection.execute(f"DELETE FROM {table} WHERE run_id IN ({marks})", chunk)
                 connection.execute(f"DELETE FROM runs WHERE id IN ({marks})", chunk)
+        shrink(connection)
         return doomed
+
+
+def shrink(connection: sqlite3.Connection) -> bool:
+    """Give the pages freed by deleted runs back to the file system. True when it was done.
+
+    A database made with incremental auto-vacuum frees just the empty pages at the end of
+    the file. An older database is converted by one VACUUM, which rewrites it once. If
+    another process holds the database, the file stays as it is: nothing is lost.
+    """
+    try:
+        if connection.execute("PRAGMA auto_vacuum").fetchone() == (2,):
+            connection.execute("PRAGMA incremental_vacuum").fetchall()
+        else:
+            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            connection.execute("VACUUM")
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        return True
+    except sqlite3.Error:
+        return False
