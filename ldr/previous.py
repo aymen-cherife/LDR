@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from contextlib import closing
 from pathlib import Path
 
@@ -135,19 +136,26 @@ class Lookup:
     def __init__(self, path: str, run_id: str, roots=None, timeout: float = 30):
         self.run_id = run_id
         self.roots = frozenset(roots) if roots is not None else None
-        self.connection = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=timeout)
+        # The recording thread that makes the lookups is not the thread that opens the connection
+        # (a program's calls can come from any thread), so the connection is shared under a lock.
+        self.connection = sqlite3.connect(
+            Path(path).as_uri() + "?mode=ro", uri=True, timeout=timeout, check_same_thread=False
+        )
         self.connection.execute("PRAGMA query_only = ON")
+        self.lock = threading.Lock()
 
     def covers(self, frame_id: str) -> bool:
         """Whether this call is in the part of the previous run that is compared."""
         return self.roots is None or root_of(frame_id) in self.roots
 
     def signature(self, frame_id: str):
-        row = self.connection.execute(self.QUERY, (self.run_id, frame_id)).fetchone()
+        with self.lock:
+            row = self.connection.execute(self.QUERY, (self.run_id, frame_id)).fetchone()
         return None if row is None else bytes(row[0])
 
     def close(self) -> None:
-        self.connection.close()
+        with self.lock:
+            self.connection.close()
 
 
 def _records(connection, run_id: str) -> str:

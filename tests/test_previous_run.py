@@ -205,3 +205,37 @@ def test_a_lookup_answers_with_the_signature_of_the_call_at_that_address(tmp_pat
         assert lookup.signature(address + "x") is None
     finally:
         lookup.close()
+
+
+THREADED = """\
+import threading
+
+
+def work(n):
+    return n * 2 + (7 if n == 12 else 0)
+
+
+def run():
+    for index in range(30):
+        work(index + 1)
+
+
+thread = threading.Thread(target=run)
+thread.start()
+thread.join()
+"""
+
+
+def test_a_program_that_calls_from_another_thread_still_looks_its_calls_up(tmp_path):
+    # The lookup's connection is made by the thread that starts the recording; the calls are
+    # made by another. It used to fail on the first call and give up for the rest of the run.
+    (tmp_path / "app.py").write_text(THREADED, encoding="utf-8")
+    ldr(tmp_path, "run", "app.py")
+    ldr(tmp_path, "run", "app.py")
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        summaries = [json.loads(row[0]) for row in connection.execute(
+            "SELECT s.summary FROM stream_summary s JOIN runs r ON r.id = s.run_id ORDER BY r.started_ns"
+        )]
+    assert len(summaries) == 2
+    assert "lookup_error" not in summaries[-1], summaries[-1].get("lookup_error")
+    assert report(tmp_path)["status"]["reference"]["compared"] >= 30
