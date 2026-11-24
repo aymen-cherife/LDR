@@ -215,62 +215,101 @@ def capture(value: Any, name: str | None = None) -> str:
             return "<unrepresentable>"
 
 
-def _state_value(value, active):
-    """Read focused state through built-ins and structural descriptors."""
+def _state_value(value):
+    """Render focused state with an explicit stack and a shared text buffer."""
+    pieces = []
+    active = set()
+    stack = [iter(((value, pieces),))]
+    while stack:
+        child = next(stack[-1], None)
+        if child is None:
+            stack.pop()
+        else:
+            stack.append(_state_parts(*child, active))
+    return "".join(pieces)
+
+
+def _state_parts(value, pieces, active):
     kind = type(value)
     if kind is str:
-        return repr(redact(value)[0])
+        pieces.append(repr(redact(value)[0]))
+        return
     if kind is bytes or kind is bytearray:
         clean, found = redact(bytes(value).decode("latin-1"))
-        return repr(clean) if found else repr(value)
+        pieces.append(repr(clean) if found else repr(value))
+        return
     if kind is int:
         try:
-            return repr(value)
+            pieces.append(repr(value))
         except ValueError:
-            return hex(value)
+            pieces.append(hex(value))
+        return
     if any(kind is plain for plain in _PLAIN_REPR):
-        return repr(value)
+        pieces.append(repr(value))
+        return
     if kind is types.MethodType:
-        return "<bound method>"
+        pieces.append("<bound method>")
+        return
     marker = id(value)
     if marker in active:
-        return "<cycle>"
+        pieces.append("<cycle>")
+        return
     active.add(marker)
     try:
         if kind is dict:
-            pairs = (
-                _state_value(key, active) + ": " + (
-                    repr(by_name_placeholder(item)) if is_secret_name(key) else _state_value(item, active)
-                )
-                for key, item in value.items()
-            )
-            return "{" + ", ".join(pairs) + "}"
-        if any(kind is container for container in (tuple, list, set, frozenset, collections.deque, array.array)):
-            parts = [_state_value(item, active) for item in value]
-            items = ", ".join(sorted(parts) if kind is set or kind is frozenset else parts)
-            if kind is list:
-                return "[" + items + "]"
-            if kind is tuple:
-                return "(" + items + ("," if len(parts) == 1 else "") + ")"
+            pieces.append("{")
+            for index, (key, item) in enumerate(value.items()):
+                if index:
+                    pieces.append(", ")
+                yield key, pieces
+                pieces.append(": ")
+                if is_secret_name(key):
+                    pieces.append(repr(by_name_placeholder(item)))
+                else:
+                    yield item, pieces
+            pieces.append("}")
+        elif kind is set or kind is frozenset:
+            parts = []
+            for item in value:
+                part = []
+                yield item, part
+                parts.append("".join(part))
+            items = ", ".join(sorted(parts))
             if kind is set:
-                return "{" + items + "}" if parts else "set()"
-            if kind is frozenset:
-                return "frozenset({" + items + "})" if parts else "frozenset()"
-            if kind is array.array:
-                return f"array({value.typecode!r}, [{items}])"
-            return "deque([" + items + "])"
-        reading = read(value)
-        if reading is None:
-            return f"<{type_label(kind)}>"
-        fields = []
-        for name, item in reading.fields:
-            if name is None:
-                fields.append(_state_value(item, active))
-            elif is_secret_name(name):
-                fields.append(f"{name}={by_name_placeholder(item)}")
+                pieces.append("{" + items + "}" if parts else "set()")
             else:
-                fields.append(f"{name}={_state_value(item, active)}")
-        return f"{reading.label}({', '.join(fields)})"
+                pieces.append("frozenset({" + items + "})" if parts else "frozenset()")
+        elif kind is tuple or kind is list or kind is collections.deque or kind is array.array:
+            if kind is list:
+                prefix, suffix = "[", "]"
+            elif kind is tuple:
+                prefix, suffix = "(", ",)" if len(value) == 1 else ")"
+            elif kind is array.array:
+                prefix, suffix = f"array({value.typecode!r}, [", "])"
+            else:
+                prefix, suffix = "deque([", "])"
+            pieces.append(prefix)
+            for index, item in enumerate(value):
+                if index:
+                    pieces.append(", ")
+                yield item, pieces
+            pieces.append(suffix)
+        else:
+            reading = read(value)
+            if reading is None:
+                pieces.append(f"<{type_label(kind)}>")
+                return
+            pieces.append(reading.label + "(")
+            for index, (name, item) in enumerate(reading.fields):
+                if index:
+                    pieces.append(", ")
+                if name is not None:
+                    pieces.append(name + "=")
+                if name is not None and is_secret_name(name):
+                    pieces.append(by_name_placeholder(item))
+                else:
+                    yield item, pieces
+            pieces.append(")")
     finally:
         active.remove(marker)
 
@@ -280,7 +319,7 @@ def capture_state(value: Any, name: str | None = None) -> str:
     if name is not None and is_secret_name(name):
         return by_name_placeholder(value)
     try:
-        rendered = _redact_text(_state_value(value, set()))
+        rendered = _redact_text(_state_value(value))
     except Exception:
         rendered = f"<{type_label(type(value))} state unavailable>"
     attributes = instance_dict(value)

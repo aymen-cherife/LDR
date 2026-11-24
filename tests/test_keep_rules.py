@@ -97,3 +97,52 @@ def test_recording_keeps_calls_and_values_past_old_caps(tmp_path):
     assert db.execute("SELECT COUNT(*) FROM call_records").fetchone() == (60,)
     assert db.execute("SELECT COUNT(*) FROM stream_values WHERE phase = 'return'").fetchone() == (60,)
     assert "INCOMPLETE" not in result.stdout
+
+
+def test_deep_values_and_cycles_are_recorded_in_full(tmp_path):
+    source = """\
+def keep(value):
+    return value
+
+nested = 0
+for _ in range(100_000):
+    nested = [nested]
+keep(nested)
+cycle = []
+cycle.append(cycle)
+keep(cycle)
+"""
+    db, run_id, result = run(tmp_path, source, "", "--full")
+    rows = db.execute(
+        "SELECT ordinal, payload FROM stream_values WHERE run_id = ? AND phase = 'return' ORDER BY ordinal",
+        (run_id,),
+    ).fetchall()
+    assert rows == [
+        (1, b"[" * 100_000 + b"0" + b"]" * 100_000),
+        (2, b'[{"type":"cycle","distance":1}]'),
+    ]
+    assert "RecursionError" not in result.stderr + result.stdout
+
+
+def test_first_eight_and_late_keep_rules_store_complete_values(tmp_path):
+    source = """\
+def work(index):
+    if index == 10:
+        raise ValueError("late")
+    return [index] if index == 11 else index
+
+for index in range(1, 13):
+    try:
+        work(index)
+    except ValueError:
+        pass
+"""
+    db, run_id, _ = run(tmp_path, source)
+    calls = kept(db, run_id, "work")
+    assert numbers(calls, "work") == [1, 2, 3, 4, 5, 6, 7, 8, 10, 11]
+    assert calls["app.py:work#10"]["kept"] == ["exception"]
+    assert calls["app.py:work#11"]["kept"] == ["new shape"]
+    assert db.execute(
+        "SELECT ordinal, payload FROM stream_values WHERE run_id = ? AND phase = 'return' ORDER BY ordinal",
+        (run_id,),
+    ).fetchall() == [(index, str(index).encode()) for index in range(1, 9)] + [(11, b"[11]")]

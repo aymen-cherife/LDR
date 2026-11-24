@@ -131,3 +131,45 @@ def test_a_run_reports_fingerprint_cost_per_function_and_normalized_paths(tmp_pa
     assert next(iter(summary["cost"]))["function"] == "big.py:big"
     assert summary["tmp_normalized"] >= 1
     assert "<tmp>/…" in text
+
+
+def test_existing_signatures_match_before_f1():
+    import datetime
+    import functools
+
+    class Slotted:
+        __slots__ = ("item",)
+
+        def __init__(self):
+            self.item = [1, "text"]
+
+    Slotted.__module__ = "__main__"
+    Slotted.__qualname__ = "Slotted"
+    cycle = []
+    cycle.append(cycle)
+    values = [
+        None, False, True, 2**90, -0.0, 1+2j, "a\ud800b", b"data", bytearray(b"data"),
+        [1, 2, 3], (1, [2, "x"]), {"b": {2, 1}, "a": frozenset(("y", "z"))},
+        cycle, Slotted(), datetime.date(2026, 1, 2), functools.partial(pow, 2, exp=3),
+        {"api_key": "synthetic-secret"},
+    ]
+    expected = [
+        "738096e476d3c5447c3cb95c39bfc964",
+        "3662d6121c293c1c21dc4d3401650d44",
+        "0583525866ce6d4c711b8d319b34a247",
+        "6a8e9b098598aa8136749f0a0a8ad819",
+        "a81f7a7ee7ae6bb90a1e49d8f2bf28be",
+        "d9f22fe501fa6bc5605cde9e4997f84b",
+        "f41daf77ae7d4e456bb72a2500031d3a",
+        "15e932a57154bf00e77207d21df287b4",
+        "941c4e6046f873615a3e36ff3e0febd2",
+        "5a4e73a5bb94ed4b11440532215a6d52",
+        "bb3ce60f0eecf0590a8332d24d43a2dd",
+        "f0a8d092bc3b5a07c5c0621f8257651b",
+        "bbf4d489e5714af2668ccb14e694aa4f",
+        "1bf4df7b880e7018adbbe80492e4c0d8",
+        "5faa8355ab36441793981b5c442555e3",
+        "cf19770a32347912497cdaedd06e56ce",
+        "redacted",
+    ]
+    assert [fingerprint(value) for value in values] == expected

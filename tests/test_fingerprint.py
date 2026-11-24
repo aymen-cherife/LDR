@@ -178,9 +178,9 @@ def test_objects_with_different_state_are_different_and_equal_state_is_equal():
     assert diff_tree(old.roots[0], other.roots[0])
 
 
-def test_budgets_make_oversized_values_unknown_not_slow_and_not_equal():
-    """Defect 3, as changed by Phase 2 rule 5: only the depth guard (or an explicit
-    node budget) makes a value `unknown`. A large value is walked, not skipped."""
+def test_only_the_node_budget_cuts_off_the_walk():
+    """Large values keep an exact signature when no comparison budget applies."""
+    from hashlib import blake2b
     import time
 
     from ldr.fingerprint import Budget, fingerprint, is_digest
@@ -194,14 +194,15 @@ def test_budgets_make_oversized_values_unknown_not_slow_and_not_equal():
     deep = 1
     for _ in range(10_000):
         deep = [deep]
+    expected = blake2b(b"l1[" * 10_000 + b"i1;" + b"]" * 10_000, digest_size=16).hexdigest()
     started = time.perf_counter()
-    assert fingerprint(deep) == "unknown"
+    assert fingerprint(deep) == expected
     assert time.perf_counter() - started < 0.5
 
 
 def test_a_fingerprint_never_depends_on_machine_load(monkeypatch):
     """A time budget would make the same value `complete` in one run and
-    `unknown` in the next, faking differences. Only node count and depth bound it."""
+    `unknown` in the next, faking differences. Only the comparison node budget bounds it."""
     import time
 
     from ldr.fingerprint import fingerprint, is_digest

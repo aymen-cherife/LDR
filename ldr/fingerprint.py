@@ -225,10 +225,21 @@ class _Walk:
         self.partial_ok = partial_ok
         self.partial = False  # some leaf could not be read; only its type is hashed
         self.immutable = True
-        self.active: list[int] = []
+        self.active: dict[int, int] = {}
         self.visited = 0
 
-    def encode(self, value: Any, out: hashlib.blake2b, depth: int = 0) -> None:
+    def encode(self, value: Any, out: hashlib.blake2b) -> None:
+        stack = [iter(((value, out),))]
+        while stack:
+            child = next(stack[-1], None)
+            if child is None:
+                stack.pop()
+            else:
+                children = self._encode(*child)
+                if children is not None:
+                    stack.append(children)
+
+    def _encode(self, value: Any, out: hashlib.blake2b):
         self.visited += 1
         budget = self.budget
         if budget.max_nodes is not None and self.visited > budget.max_nodes:
@@ -260,13 +271,16 @@ class _Walk:
         elif kind in (list, tuple, dict, set, frozenset):
             if kind is not tuple and kind is not frozenset:
                 self.immutable = False
-            self._container(kind, value, out, depth)
+            return self._container(kind, value, out)
         else:
             self.immutable = False
-            if not self._known_leaf(kind, value, out, depth):
-                self._object(value, out, depth)
+            if kind is types.MethodType or kind is functools.partial:
+                return self._callable(kind, value, out)
+            if not self._known_leaf(kind, value, out):
+                return self._object(value, out)
+        return None
 
-    def _known_leaf(self, kind: type, value: Any, out: hashlib.blake2b, depth: int) -> bool:
+    def _known_leaf(self, kind: type, value: Any, out: hashlib.blake2b) -> bool:
         """Exact standard types whose state we can read without user code."""
         if kind is type or kind is abc.ABCMeta:
             self._text(b"C", type_identity(value).encode(), out)
@@ -275,26 +289,6 @@ class _Walk:
             # A name, never a read: for a built-in bound method (``[].append``) that is the
             # name only, not the object it is bound to.
             self._text(b"Y", name.encode("utf-8", "surrogatepass"), out)
-        elif kind is types.MethodType:
-            # The function's name and the receiver's type. The receiver itself is not read:
-            # a method is a way to call something, not a value to compare.
-            out.update(b"Mt")
-            self.encode(value.__func__, out, depth + 1)
-            self._text(b"T", type_identity(type(value.__self__)).encode("utf-8", "surrogatepass"), out)
-        elif kind is functools.partial:
-            # The wrapped callable and every bound argument, read like any other value:
-            # secrets in them are redacted the same way. Keywords are an unordered set
-            # of names, so they are sorted.
-            out.update(b"Pa")
-            self.encode(value.func, out, depth + 1)
-            self.encode(value.args, out, depth + 1)
-            out.update(str(len(value.keywords)).encode() + b"{")
-            for key in sorted(value.keywords):
-                if is_secret_name(key):
-                    raise _Stop(REDACTED)
-                self._text(b"n", key.encode("utf-8", "surrogatepass"), out)
-                self.encode(value.keywords[key], out, depth + 1)
-            out.update(b"}")
         elif kind in (datetime.datetime, datetime.date, datetime.time):
             self._text(b"M", (type_label(kind) + value.isoformat()).encode(), out)
         elif kind is datetime.timedelta:
@@ -309,7 +303,29 @@ class _Walk:
             return False
         return True
 
-    def _object(self, value: Any, out: hashlib.blake2b, depth: int) -> None:
+    def _callable(self, kind, value, out):
+        if kind is types.MethodType:
+            # The function's name and the receiver's type. The receiver itself is not read:
+            # a method is a way to call something, not a value to compare.
+            out.update(b"Mt")
+            yield value.__func__, out
+            self._text(b"T", type_identity(type(value.__self__)).encode("utf-8", "surrogatepass"), out)
+        else:
+            # The wrapped callable and every bound argument, read like any other value:
+            # secrets in them are redacted the same way. Keywords are an unordered set
+            # of names, so they are sorted.
+            out.update(b"Pa")
+            yield value.func, out
+            yield value.args, out
+            out.update(str(len(value.keywords)).encode() + b"{")
+            for key in sorted(value.keywords):
+                if is_secret_name(key):
+                    raise _Stop(REDACTED)
+                self._text(b"n", key.encode("utf-8", "surrogatepass"), out)
+                yield value.keywords[key], out
+            out.update(b"}")
+
+    def _object(self, value: Any, out: hashlib.blake2b):
         reading = read(value)
         if reading is None:
             if not self.partial_ok:
@@ -320,9 +336,9 @@ class _Walk:
             return
         marker = id(value)
         if marker in self.active:
-            out.update(b"@" + str(len(self.active) - self.active.index(marker)).encode() + b";")
+            out.update(b"@" + str(len(self.active) - self.active[marker]).encode() + b";")
             return
-        self.active.append(marker)
+        self.active[marker] = len(self.active)
         try:
             self._text(b"O", reading.identity.encode("utf-8", "surrogatepass"), out)
             out.update(str(len(reading.fields)).encode() + b"{")
@@ -331,12 +347,12 @@ class _Walk:
                     if is_secret_name(name):
                         raise _Stop(REDACTED)
                     self._text(b"n", name.encode("utf-8", "surrogatepass"), out)
-                self.encode(item, out, depth + 1)
+                yield item, out
             out.update(b"}")
         finally:
-            self.active.pop()
+            del self.active[marker]
 
-    def _fast_items(self, value: Any, out: hashlib.blake2b, depth: int) -> bool:
+    def _fast_items(self, value: Any, out: hashlib.blake2b) -> bool:
         """Encode a homogeneous run of ints, floats, bools or strings in bulk.
 
         The bytes are the same as the per-item walk would write. Returns False,
@@ -372,33 +388,33 @@ class _Walk:
     def _text(tag: bytes, data: bytes, out: hashlib.blake2b) -> None:
         out.update(tag + str(len(data)).encode() + b":" + data)
 
-    def _container(self, kind: type, value: Any, out: hashlib.blake2b, depth: int) -> None:
+    def _container(self, kind: type, value: Any, out: hashlib.blake2b):
         marker = id(value)
         if marker in self.active:
             # A cycle: refer to the ancestor by distance, not by address.
-            out.update(b"@" + str(len(self.active) - self.active.index(marker)).encode() + b";")
+            out.update(b"@" + str(len(self.active) - self.active[marker]).encode() + b";")
             return
-        self.active.append(marker)
+        self.active[marker] = len(self.active)
         try:
             if kind is list or kind is tuple:
                 out.update((b"l" if kind is list else b"t") + str(len(value)).encode() + b"[")
-                if len(value) < FAST_PATH_MIN or not self._fast_items(value, out, depth):
+                if len(value) < FAST_PATH_MIN or not self._fast_items(value, out):
                     for item in value:
-                        self.encode(item, out, depth + 1)
+                        yield item, out
             elif kind is dict:
                 # Insertion order is part of the value.
                 out.update(b"d" + str(len(value)).encode() + b"{")
                 for key, item in value.items():
                     if is_secret_name(key):
                         raise _Stop(REDACTED)
-                    self.encode(key, out, depth + 1)
-                    self.encode(item, out, depth + 1)
+                    yield key, out
+                    yield item, out
             else:
                 # Sets have no order: sort the element digests.
                 parts = []
                 for item in value:
                     part = hashlib.blake2b(digest_size=DIGEST_BYTES)
-                    self.encode(item, part, depth + 1)
+                    yield item, part
                     parts.append(part.digest())
                 parts.sort()
                 out.update((b"e" if kind is set else b"z") + str(len(parts)).encode() + b"(")
@@ -406,7 +422,7 @@ class _Walk:
                     out.update(part)
             out.update(b"]")
         finally:
-            self.active.pop()
+            del self.active[marker]
 
 
 PARTIAL_MARK = "+"

@@ -33,7 +33,7 @@ def _json(value):
 class _Encoder:
     def __init__(self):
         self.data = bytearray()
-        self.ancestors = []
+        self.ancestors = {}
 
     def write(self, data):
         self.data.extend(data)
@@ -43,6 +43,18 @@ class _Encoder:
             raise _Redacted
 
     def encode(self, value):
+        stack = [iter((value,))]
+        done = object()
+        while stack:
+            child = next(stack[-1], done)
+            if child is done:
+                stack.pop()
+            else:
+                children = self._encode(child)
+                if children is not None:
+                    stack.append(children)
+
+    def _encode(self, value):
         kind = type(value)
         if value is None or kind is bool:
             self.write(_json(value))
@@ -80,7 +92,7 @@ class _Encoder:
             self.check_text(snapshot.decode("latin-1"))
             self.write(_json({"type": kind.__name__, "hex": snapshot.hex()}))
         elif _one_of(kind, (list, tuple, dict, set, frozenset)):
-            self.container(value, kind)
+            return self.container(value, kind)
         else:
             raise _Unsupported
 
@@ -91,12 +103,12 @@ class _Encoder:
                 _json(
                     {
                         "type": "cycle",
-                        "distance": len(self.ancestors) - self.ancestors.index(marker),
+                        "distance": len(self.ancestors) - self.ancestors[marker],
                     }
                 )
             )
             return
-        self.ancestors.append(marker)
+        self.ancestors[marker] = len(self.ancestors)
         if kind is not list:
             self.write(b'{"type":' + _json(kind.__name__) + b',"items":')
         self.write(b"[")
@@ -107,7 +119,7 @@ class _Encoder:
                 if index:
                     self.write(b",")
                 offset = len(self.data)
-                self.encode(item)
+                yield item
                 parts.append(bytes(self.data[offset:]))
             del self.data[start:]
             self.write(b",".join(sorted(parts)))
@@ -120,14 +132,14 @@ class _Encoder:
                     if is_secret_name(key):
                         raise _Redacted
                     self.write(b"[")
-                    self.encode(key)
+                    yield key
                     self.write(b",")
-                    self.encode(element)
+                    yield element
                     self.write(b"]")
                 else:
-                    self.encode(item)
+                    yield item
         self.write(b"]" if kind is list else b"]}")
-        self.ancestors.pop()
+        del self.ancestors[marker]
 
 
 def encode_local(value, name):
