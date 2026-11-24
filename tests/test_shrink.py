@@ -101,3 +101,27 @@ def test_nothing_is_vacuumed_when_nothing_was_deleted(tmp_path):
     before = os.path.getsize(database(tmp_path))
     assert previous.prune(str(tmp_path / ".ldr"), 5) == []
     assert os.path.getsize(database(tmp_path)) == before
+
+
+def test_prune_removes_only_finished_run_directories_for_deleted_rows(tmp_path):
+    from ldr import supervisor
+    from ldr.sqlite_store import SCHEMA
+    import json
+
+    ldr_dir = tmp_path / ".ldr"
+    for name, state in (("old", "finished"), ("live", "running"), ("kept", "finished")):
+        directory = ldr_dir / "runs" / name
+        directory.mkdir(parents=True)
+        (directory / "state.json").write_text(json.dumps({"state": state, "store_run_id": name}))
+    with closing(sqlite3.connect(database(tmp_path))) as connection, connection:
+        connection.executescript(SCHEMA)
+        invocation = json.dumps({"runner": "run", "target": "app.py", "arguments": []})
+        connection.executemany("INSERT INTO runs VALUES (?, ?, ?, ?)", [
+            ("old", 1, invocation, "{}"), ("live", 2, invocation, "{}"), ("kept", 3, invocation, "{}"),
+        ])
+
+    assert previous.prune(str(ldr_dir), 1) == ["old"]
+    assert not (ldr_dir / "runs" / "old").exists()
+    assert (ldr_dir / "runs" / "live").exists()
+    assert (ldr_dir / "runs" / "kept").exists()
+    assert not hasattr(supervisor, "KEEP_RUNS")

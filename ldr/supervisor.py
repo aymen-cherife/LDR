@@ -22,7 +22,6 @@ import time
 from . import processes
 
 RUNS = "runs"
-KEEP_RUNS = 50
 
 
 def run_directory(ldr_dir: str, run_id: str) -> str:
@@ -235,7 +234,6 @@ def supervise(rundir: str) -> int:
         state="finished", exit_code=code, message="\n".join(said) or None, ended_at=time.time(),
         store_run_id=run_id, child_ended_at=child_ended_at, pruned_at=time.time(),
     )
-    prune(ldr_dir)
     return code
 
 
@@ -270,18 +268,6 @@ def _progress(state: State, sink, ldr_dir: str, started: float) -> None:
         except OSError:
             pass
         time.sleep(1.0)
-
-
-def prune(ldr_dir: str, keep: int = KEEP_RUNS) -> None:
-    directory = os.path.join(ldr_dir, RUNS)
-    try:
-        runs = sorted((os.path.getmtime(os.path.join(directory, name)), name) for name in os.listdir(directory))
-    except OSError:
-        return
-    import shutil
-
-    for _, name in runs[:-keep]:
-        shutil.rmtree(os.path.join(directory, name), ignore_errors=True)
 
 
 def main(argv=None) -> int:

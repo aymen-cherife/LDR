@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -288,8 +289,19 @@ def prune(directory: str, keep: int = KEEP_RUNS) -> list[str]:
     path = Path(directory, "traces.sqlite3")
     if not path.exists():
         return []
+    from .supervisor import read_state
+
+    directories = {}
+    live = set()
+    for directory in path.parent.glob("runs/*"):
+        state = read_state(directory)
+        if state and (run_id := state.get("store_run_id")):
+            if state.get("state") == "finished":
+                directories[run_id] = directory
+            else:
+                live.add(run_id)
     with closing(sqlite3.connect(path, timeout=30)) as connection:
-        found = doomed(connection, keep)
+        found = [run_id for run_id in doomed(connection, keep) if run_id not in live]
         if not found:
             return []
         with connection:
@@ -299,7 +311,10 @@ def prune(directory: str, keep: int = KEEP_RUNS) -> list[str]:
                     connection.execute(f"DELETE FROM {table} WHERE run_id IN ({marks})", chunk)
                 connection.execute(f"DELETE FROM runs WHERE id IN ({marks})", chunk)
         shrink(connection)
-        return found
+    for run_id in found:
+        if directory := directories.get(run_id):
+            shutil.rmtree(directory, ignore_errors=True)
+    return found
 
 
 def shrink(connection: sqlite3.Connection) -> bool:
