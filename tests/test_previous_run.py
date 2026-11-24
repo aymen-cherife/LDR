@@ -176,37 +176,6 @@ def test_the_previous_run_is_never_held_in_memory():
     assert not hasattr(TraceStore, "read_reference")
 
 
-def test_the_lookup_of_one_call_uses_the_index_and_does_not_scan_the_previous_run(tmp_path):
-    # Without the index a lookup reads every call of the run: a second run of a large program
-    # took 12 times as long as the first.
-    from ldr.previous import Lookup
-
-    write(tmp_path)
-    ldr(tmp_path, "run", "app.py")
-    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
-        run, address = connection.execute("SELECT run_id, frame_id FROM call_records LIMIT 1").fetchone()
-        plan = " ".join(
-            row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + Lookup.QUERY, (run, address))
-        )
-    assert "call_records_frame" in plan and "SCAN" not in plan, plan
-    assert "frame_id=?" in plan, plan  # both equalities are used: the search is by address, not by run
-
-
-def test_a_lookup_answers_with_the_signature_of_the_call_at_that_address(tmp_path):
-    from ldr.previous import Lookup
-
-    write(tmp_path)
-    ldr(tmp_path, "run", "app.py")
-    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
-        run, address, signature = connection.execute("SELECT run_id, frame_id, signature FROM call_records LIMIT 1").fetchone()
-    lookup = Lookup(str(tmp_path / ".ldr" / "traces.sqlite3"), run)
-    try:
-        assert lookup.signature(address) == bytes(signature)
-        assert lookup.signature(address + "x") is None
-    finally:
-        lookup.close()
-
-
 THREADED = """\
 import threading
 
@@ -237,5 +206,98 @@ def test_a_program_that_calls_from_another_thread_still_looks_its_calls_up(tmp_p
             "SELECT s.summary FROM stream_summary s JOIN runs r ON r.id = s.run_id ORDER BY r.started_ns"
         )]
     assert len(summaries) == 2
-    assert "lookup_error" not in summaries[-1], summaries[-1].get("lookup_error")
+    assert "previous_error" not in summaries[-1], summaries[-1].get("previous_error")
     assert report(tmp_path)["status"]["reference"]["compared"] >= 30
+
+
+# ---- Hotfix step 2: the previous run is loaded once, into a dict, and never asked per call ----
+
+LIB = """\
+def work(n):
+    return n * 2 + ({delta} if n == 12 else 0)
+
+
+def many():
+    for index in range(30):
+        work(index + 1)
+"""
+
+SELECTS = ("SELECT", "WITH")
+
+
+def statements(connection):
+    seen = []
+    connection.set_trace_callback(seen.append)
+    return seen
+
+
+def test_the_previous_run_is_loaded_with_one_query_and_then_answers_without_sql(tmp_path):
+    from ldr import previous
+
+    write(tmp_path)
+    ldr(tmp_path, "run", "app.py")
+    path = tmp_path / ".ldr" / "traces.sqlite3"
+    with closing(sqlite3.connect(path)) as connection:
+        run, address, signature = connection.execute(
+            "SELECT run_id, frame_id, signature FROM call_records LIMIT 1"
+        ).fetchone()
+        seen = statements(connection)
+        loaded = previous.load(connection, run)
+        selects = [text for text in seen if text.lstrip().upper().startswith(SELECTS)]
+        assert len(selects) == 1 and "call_records" in selects[0], seen
+        seen.clear()
+        for _ in range(1000):
+            assert loaded.signature(address) == bytes(signature)
+            assert loaded.signature(address + "x") is None
+        assert seen == []  # no statement runs per call
+    assert len(loaded) > 0
+    assert not hasattr(previous, "Lookup")  # the per-call lookup is gone
+
+
+def test_the_load_can_be_limited_to_the_tests_two_runs_share(tmp_path):
+    from ldr import previous
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text(TEST_A, encoding="utf-8")
+    (tmp_path / "tests" / "test_b.py").write_text(TEST_B, encoding="utf-8")
+    ldr(tmp_path, "pytest", "tests")
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        run = connection.execute("SELECT id FROM runs").fetchone()[0]
+        everything = previous.load(connection, run)
+        only_b = previous.load(connection, run, roots=[previous.encode_node_id("tests/test_b.py::test_b1")])
+    assert 0 < len(only_b) < len(everything)
+    assert all(address.startswith("tests%2Ftest_b.py") or "test_b1" in address for address in only_b.addresses())
+
+
+def test_a_pytest_run_looks_up_the_run_that_shares_its_test_ids_not_the_latest_run(tmp_path):
+    (tmp_path / "lib.py").write_text(LIB.format(delta=0), encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_a.py").write_text("from lib import many\n\n\ndef test_a1():\n    many()\n", encoding="utf-8")
+    (tests / "test_b.py").write_text("from lib import many\n\n\ndef test_b1():\n    many()\n", encoding="utf-8")
+    ldr(tmp_path, "pytest", "tests/test_a.py", "tests/test_b.py")
+    first = report(tmp_path)["status"]["run_id"]
+    ldr(tmp_path, "pytest", "tests/test_a.py")  # the latest run: it shares no test with the next one
+    (tmp_path / "lib.py").write_text(LIB.format(delta=1), encoding="utf-8")
+    ldr(tmp_path, "pytest", "tests/test_b.py")
+    status = report(tmp_path)["status"]
+    assert status["reference"]["run_id"] == first
+    # work(12) differs from the run that shares the test, and the lookup found it while recording:
+    # it is beyond the first calls of the function yet it kept its detail.
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        kept = connection.execute(
+            "SELECT 1 FROM stream_calls WHERE run_id = ? AND frame_id LIKE '%lib.py:work#12'", (status["run_id"],)
+        ).fetchone()
+    assert kept is not None
+
+
+def test_a_script_loads_its_previous_run_when_it_starts(tmp_path):
+    write(tmp_path)
+    ldr(tmp_path, "run", "app.py")
+    write(tmp_path, delta=1)
+    ldr(tmp_path, "run", "app.py")
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        summary = json.loads(connection.execute(
+            "SELECT s.summary FROM stream_summary s JOIN runs r ON r.id = s.run_id ORDER BY r.started_ns DESC LIMIT 1"
+        ).fetchone()[0])
+    assert summary["previous_loaded"] == 30 and "previous_error" not in summary

@@ -379,12 +379,12 @@ def _restore_frame_shortcut(args, parser, ldr_dir: str) -> None:
 
 
 def _find_previous(store) -> None:
-    """Pick the run whose calls this run looks up while it records (see previous.py)."""
+    """A script's previous run (loaded when it starts). A pytest run picks its own after collection."""
     from contextlib import closing
 
     try:
         with closing(store._connect()) as connection:
-            store.reference_run, store.reference_roots = previous.provisional_run(connection, store.run_id)
+            store.reference_run, store.reference_roots = previous.script_run(connection, store.run_id), None
     except (OSError, sqlite3.Error):
         store.reference_run = store.reference_roots = None
 

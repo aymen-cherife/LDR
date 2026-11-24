@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import threading
 from contextlib import closing
 from pathlib import Path
 
@@ -89,73 +88,72 @@ def previous_run(connection, run_id: str) -> str | None:
     return None
 
 
-def provisional_run(connection, run_id: str) -> tuple[str | None, list[str] | None]:
-    """Which run to look calls up in while the program runs, and which tests it covers.
-
-    A pytest run's own tests are not known until they are collected, so the guess is the latest
-    earlier pytest run of the same command, else the latest earlier pytest run; the final
-    comparison (``previous_run``) is made afterwards from the tests both runs share.
-    """
+def script_run(connection, run_id: str) -> str | None:
+    """For a script (not pytest): the latest earlier run of exactly the same command. A pytest run
+    chooses its previous run once it has collected its tests (``run_for_tests``)."""
     invocation, earlier = _candidates(connection, run_id)
-    if invocation is None:
-        return None, None
+    if invocation is None or invocation.get("runner") == "pytest":
+        return None
     key = invocation_key(invocation)
-    if invocation.get("runner") != "pytest":
-        for other, text, status in earlier:
-            if not _skipped(json.loads(status)) and invocation_key(json.loads(text)) == key:
-                return other, None
-        return None, None
-    fallback = None
     for other, text, status in earlier:
-        if _skipped(json.loads(status)) or json.loads(text).get("runner") != "pytest":
-            continue
-        if invocation_key(json.loads(text)) == key:
-            fallback = other
-            break
-        fallback = fallback or other
-    if fallback is None:
-        return None, None
-    roots = [
-        encode_node_id(node) for (node,) in connection.execute(
-            "SELECT DISTINCT node_id FROM run_tests WHERE run_id = ?", (fallback,)
-        )
-    ]
-    return fallback, roots
+        if not _skipped(json.loads(status)) and invocation_key(json.loads(text)) == key:
+            return other
+    return None
 
 
-class Lookup:
-    """Per-call questions to the previous run, answered by SQLite (never held in memory)."""
+class Previous:
+    """The signatures of the previous run's calls, by address, held in memory.
 
-    # Without INDEXED BY, SQLite searches the run by the primary key's first column and reads
-    # every call of the run for each lookup: a second run took 12 times as long as the first.
-    QUERY = (
-        "SELECT signature FROM call_records INDEXED BY call_records_frame "
-        "WHERE run_id = ? AND frame_id = ? LIMIT 1"
-    )
+    Loaded in one query, so that a call asks a dict and never SQLite. ``roots`` limits it to the
+    tests (or the one test of a rerun) that both runs have; a call outside them is not compared.
+    """
 
-    def __init__(self, path: str, run_id: str, roots=None, timeout: float = 30):
+    def __init__(self, run_id: str, table: dict, roots=None):
         self.run_id = run_id
+        self.table = table
         self.roots = frozenset(roots) if roots is not None else None
-        # The recording thread that makes the lookups is not the thread that opens the connection
-        # (a program's calls can come from any thread), so the connection is shared under a lock.
-        self.connection = sqlite3.connect(
-            Path(path).as_uri() + "?mode=ro", uri=True, timeout=timeout, check_same_thread=False
-        )
-        self.connection.execute("PRAGMA query_only = ON")
-        self.lock = threading.Lock()
 
     def covers(self, frame_id: str) -> bool:
         """Whether this call is in the part of the previous run that is compared."""
         return self.roots is None or root_of(frame_id) in self.roots
 
     def signature(self, frame_id: str):
-        with self.lock:
-            row = self.connection.execute(self.QUERY, (self.run_id, frame_id)).fetchone()
-        return None if row is None else bytes(row[0])
+        return self.table.get(frame_id)
 
-    def close(self) -> None:
-        with self.lock:
-            self.connection.close()
+    def addresses(self):
+        return self.table.keys()
+
+    def __len__(self) -> int:
+        return len(self.table)
+
+
+def load(connection, run_id: str, roots=None) -> Previous:
+    """Read the previous run's (address, signature) rows with one query."""
+    wanted = frozenset(roots) if roots is not None else None
+    rows = connection.execute(
+        "SELECT frame_id, signature FROM call_records WHERE run_id = ?", (run_id,)
+    )
+    if wanted is None:
+        table = {address: bytes(signature) for address, signature in rows}
+    else:
+        table = {address: bytes(signature) for address, signature in rows if root_of(address) in wanted}
+    return Previous(run_id, table, wanted)
+
+
+def run_for_tests(connection, run_id: str, node_ids) -> tuple[str | None, list[str] | None]:
+    """Once a pytest run has collected its tests: the latest earlier pytest run that shares a test
+    with it, and the (encoded) ids of the tests they share."""
+    invocation, earlier = _candidates(connection, run_id)
+    if invocation is None:
+        return None, None
+    mine = set(node_ids)
+    for other, text, status in earlier:
+        if _skipped(json.loads(status)) or json.loads(text).get("runner") != "pytest":
+            continue
+        shared = tests_of(connection, other) & mine
+        if shared:
+            return other, [encode_node_id(node) for node in sorted(shared)]
+    return None, None
 
 
 def _records(connection, run_id: str) -> str:

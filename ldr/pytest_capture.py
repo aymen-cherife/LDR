@@ -78,6 +78,15 @@ class RuntimeCapture:
         except (OSError, EOFError, sqlite3.Error):
             pass  # secondary evidence: never lose the call stream over it
 
+    def pytest_collection_finish(self, session):
+        """The tests are known: the previous run is the latest one that shares a test with this one."""
+        stream = getattr(self.recorder, "call_stream", None)
+        if stream is not None:
+            try:
+                stream.load_previous_for_tests([item.nodeid for item in session.items])
+            except Exception:  # secondary: the comparison after the run does not depend on it
+                pass
+
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
         self.flush_tests()

@@ -4,13 +4,15 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from hashlib import blake2b
+from time import perf_counter
 from threading import RLock
 
 from .boundary import BoundaryStream
 from .deep import Timeline
 from .fingerprint import PARTIAL_MARK, REDACTED, SKETCH_MARK, SKETCH_TYPES, STATS, is_digest
-from .previous import Lookup
+from . import previous as previous_runs
 from .sqlite_store import DETAIL_RANK
 from .node import capture
 from .value_capture import capture_value
@@ -82,8 +84,9 @@ class CallStream:
         self.committed_deep_bytes = 0
         self.boundaries = BoundaryStream(store, worker) if store.max_boundary_bytes else None
         # The previous run is asked about each finished call in SQLite; none of it is held here.
-        self.lookup = None
-        self.lookup_error = None
+        self.previous = None  # the previous run's signatures by address (previous.Previous)
+        self.previous_error = None
+        self.previous_load_s = None
         self.preview_of = None
         self.flusher_ident = None
         if getattr(store, "remote", False):
@@ -92,13 +95,32 @@ class CallStream:
             self.flusher_ident = flusher.ident
         # Tests whose every call keeps detail (a rerun for detail), by address.
         self.full_tests = tuple(getattr(store, "full_tests", ()))
-        if store.reference_run:
+        if store.reference_run:  # a script, or a rerun: its previous run is known at the start
             prefix = getattr(store, "reference_prefix", None)
-            roots = [prefix] if prefix else getattr(store, "reference_roots", None)
-            try:
-                self.lookup = Lookup(store.path, store.reference_run, roots, store.busy_timeout)
-            except (OSError, sqlite3.Error) as exc:
-                self.lookup_error = type(exc).__name__
+            self._load_previous(store.reference_run, [prefix] if prefix else getattr(store, "reference_roots", None))
+
+    def _load_previous(self, run_id, roots) -> None:
+        """One query, once: after this a call is compared with a dict, never with SQLite."""
+        started = perf_counter()
+        try:
+            with closing(self.store._connect()) as connection:
+                self.previous = previous_runs.load(connection, run_id, roots)
+        except (OSError, sqlite3.Error) as exc:
+            self.previous_error = type(exc).__name__
+        self.previous_load_s = round(perf_counter() - started, 3)
+
+    def load_previous_for_tests(self, node_ids) -> None:
+        """A pytest run, once its tests are collected: the latest earlier run that shares a test."""
+        if self.previous is not None or self.store.reference_run:
+            return
+        try:
+            with closing(self.store._connect()) as connection:
+                run_id, roots = previous_runs.run_for_tests(connection, self.store.run_id, node_ids)
+        except (OSError, sqlite3.Error) as exc:
+            self.previous_error = type(exc).__name__
+            return
+        if run_id is not None:
+            self._load_previous(run_id, roots)
 
     @property
     def keeping_details(self):
@@ -399,14 +421,10 @@ class CallStream:
         The answer only decides which calls keep detail; the comparison that is reported is
         made from the stored rows after the run (previous.compare).
         """
-        if self.lookup is None or not self.lookup.covers(frame_id):
+        previous = self.previous
+        if previous is None or not previous.covers(frame_id):
             return None
-        try:
-            known = self.lookup.signature(frame_id)
-        except sqlite3.Error as exc:
-            self.lookup_error = type(exc).__name__
-            self.lookup = None
-            return None
+        known = previous.signature(frame_id)
         if known is None:
             return "new"
         if known != signature:
@@ -474,10 +492,13 @@ class CallStream:
                     "observed": self.deep_observed
                     + sum(timeline.observed for timeline in self.deep.values()),
                 }
-            if self.lookup is not None:
-                self.lookup.close()
-            if self.lookup_error:
-                summary["lookup_error"] = self.lookup_error
+            if self.previous is not None:
+                summary["previous_loaded"] = len(self.previous)
+                self.previous = None
+            if self.previous_load_s is not None:
+                summary["previous_load_s"] = self.previous_load_s
+            if self.previous_error:
+                summary["previous_error"] = self.previous_error
             if self.boundaries is not None:
                 summary["boundaries"] = self.boundaries.finish()
             self.active.clear()
