@@ -2,7 +2,7 @@ name: Core tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, phase-2]
   pull_request:
 
 concurrency:
@@ -13,9 +13,12 @@ permissions:
   contents: read
 
 jobs:
-  core-contract:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v5
@@ -28,28 +31,5 @@ jobs:
       - name: Install LDR and test dependencies
         run: python -m pip install -e ".[test]"
 
-      - name: Run core behavioral contract
-        run: |
-          python -m pytest -q \
-            tests/test_agent_contract.py::test_failed_test_preserves_exit_and_writes_machine_result \
-            tests/test_agent_contract.py::test_late_exception_survives_node_budget \
-            tests/test_agent_contract.py::test_caught_overflow_exception_does_not_outrank_later_failure \
-            tests/test_agent_contract.py::test_varargs_kwargs_locations_and_secret_redaction \
-            tests/test_agent_contract.py::test_named_snapshot_compares_across_checkout_directories \
-            tests/test_agent_contract.py::test_agent_can_select_a_frame_and_inspect_local_state \
-            tests/test_agent_contract.py::test_pytest_collection_does_not_consume_runtime_budget \
-            tests/test_agent_contract.py::test_pytest_report_selects_late_failure_over_runtime_attribute_probes \
-            tests/test_agent_contract.py::test_repeat_sampling_preserves_late_causal_success_before_assertion \
-            tests/test_agent_contract.py::test_sampled_hot_parent_does_not_discard_novel_causal_child \
-            tests/test_agent_contract.py::test_focused_capture_surfaces_nested_boolean_state_without_getters \
-            tests/test_agent_contract.py::test_focused_state_preserves_distinguishing_long_value_suffix \
-            tests/test_agent_contract.py::test_wildcard_inspection_exposes_late_stateful_invocation \
-            tests/test_navigation.py::test_capture_limits_only_appear_when_capture_is_incomplete \
-            tests/test_suggestions.py::test_ranked_shortcut_finds_completed_production_frame_and_captures_state \
-            tests/test_suggestions.py::test_ranking_is_deterministic_and_downranks_diagnostic_noise \
-            tests/test_suggestions.py::test_wrong_explicit_scope_warns_and_names_detected_root \
-            tests/test_suggestions.py::test_ranked_shortcut_inspects_all_calls_when_repetition_is_evidence \
-            tests/test_ldr.py::test_cli_pytest_mode_traces_the_code_under_test \
-            tests/test_ldr.py::test_verify_snapshots_then_diffs \
-            tests/test_ldr.py::test_run_mode_survives_a_real_crash \
-            tests/test_ldr.py::test_collection_failure_gets_an_honest_note_not_a_silent_pass
+      - name: Run the full suite
+        run: python -m pytest -q
