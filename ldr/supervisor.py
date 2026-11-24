@@ -164,7 +164,11 @@ def supervise(rundir: str) -> int:
     ldr_dir = os.path.join(spec["cwd"], ".ldr")
     state = State(rundir)
     started = time.time()
-    state.update(state="starting", pid=os.getpid(), started_at=spec["started"], run=os.path.basename(rundir))
+    from .machine import process_identity
+
+    identity = process_identity(os.getpid())
+    state.update(state="starting", pid=os.getpid(), pid_start=identity[0] if identity else None,
+                 started_at=spec["started"], run=os.path.basename(rundir))
     said: list[str] = []
     pumps: list[threading.Thread] = []
     holder: dict = {}
@@ -183,6 +187,7 @@ def supervise(rundir: str) -> int:
         except OSError:
             pass  # the progress thread writes the state again; the run itself must not fail over it
         threading.Thread(target=_progress, args=(state, sink, ldr_dir, started), daemon=True).start()
+        threading.Thread(target=_first_call, args=(state, sink, spec["started"]), daemon=True).start()
 
     code = 2
     try:
@@ -205,12 +210,36 @@ def supervise(rundir: str) -> int:
         prune_runs(ldr_dir, keep_runs(spec["project_root"]))
     except Exception as exc:
         said.append(f"LDR could not delete old runs: {type(exc).__name__}: {exc}")
+    try:  # LDR's own leftovers: runs whose supervisor died (see machine.py); a live run is never touched
+        from .machine import Report, clean_dead, scan_runs
+
+        fixed = Report()
+        clean_dead(ldr_dir, scan_runs(ldr_dir), fixed, rows=True)
+        said.extend(f"LDR fixed: {fix}" for fix in fixed.fixes)
+    except Exception as exc:
+        said.append(f"LDR could not clean dead runs: {type(exc).__name__}: {exc}")
     state.update(
         state="finished", exit_code=code, message="\n".join(said) or None, ended_at=time.time(),
         store_run_id=run_id,
     )
     prune(ldr_dir)
     return code
+
+
+def _first_call(state: State, sink, launched: float) -> None:
+    """The Python start time of this run: from the launch to the first recorded call."""
+    while state.fields.get("state") == "running":
+        run = sink.runs.get(sink.main_run) if sink.main_run else None
+        if run is not None:
+            with run.lock:
+                calls = sum(worker["fingerprinted"] for worker in run.counts.values())
+            if calls:
+                try:
+                    state.update(first_call_s=round(time.time() - launched, 2))
+                except OSError:
+                    pass
+                return
+        time.sleep(0.02)
 
 
 def _progress(state: State, sink, ldr_dir: str, started: float) -> None:

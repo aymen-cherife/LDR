@@ -265,38 +265,44 @@ _TABLES = (
 )
 
 
-def prune(directory: str, keep: int = KEEP_RUNS) -> list[str]:
-    """Delete every run of a target beyond the newest ``keep``. Returns the ids deleted.
+def doomed(connection, keep: int) -> list[str]:
+    """The runs beyond the newest ``keep`` of each target, with the reruns that belong to them.
 
     A target is a command (runner, target, arguments, ``--only``). A rerun made for detail
     belongs to the run it repeats: it is neither counted nor kept without it.
     """
+    groups: dict[str, list[str]] = {}
+    reruns: dict[str, list[str]] = {}
+    for run_id, text, status in connection.execute(
+        "SELECT id, invocation, status FROM runs WHERE status IS NOT NULL ORDER BY started_ns DESC, id DESC"
+    ):
+        status = json.loads(status)
+        if status.get("rerun"):
+            reruns.setdefault(status["rerun"].get("of"), []).append(run_id)
+        else:
+            groups.setdefault(invocation_key(json.loads(text)), []).append(run_id)
+    found = [run for runs in groups.values() for run in runs[keep:]]
+    found += [rerun for run in found for rerun in reruns.get(run, [])]
+    return found
+
+
+def prune(directory: str, keep: int = KEEP_RUNS) -> list[str]:
+    """Delete every run of a target beyond the newest ``keep``. Returns the ids deleted."""
     path = Path(directory, "traces.sqlite3")
     if not path.exists():
         return []
     with closing(sqlite3.connect(path, timeout=30)) as connection:
-        groups: dict[str, list[str]] = {}
-        reruns: dict[str, list[str]] = {}
-        for run_id, text, status in connection.execute(
-            "SELECT id, invocation, status FROM runs WHERE status IS NOT NULL ORDER BY started_ns DESC, id DESC"
-        ):
-            status = json.loads(status)
-            if status.get("rerun"):
-                reruns.setdefault(status["rerun"].get("of"), []).append(run_id)
-            else:
-                groups.setdefault(invocation_key(json.loads(text)), []).append(run_id)
-        doomed = [run for runs in groups.values() for run in runs[keep:]]
-        doomed += [rerun for run in doomed for rerun in reruns.get(run, [])]
-        if not doomed:
+        found = doomed(connection, keep)
+        if not found:
             return []
         with connection:
-            for chunk in (doomed[i:i + 200] for i in range(0, len(doomed), 200)):
+            for chunk in (found[i:i + 200] for i in range(0, len(found), 200)):
                 marks = ",".join("?" * len(chunk))
                 for table in _TABLES:
                     connection.execute(f"DELETE FROM {table} WHERE run_id IN ({marks})", chunk)
                 connection.execute(f"DELETE FROM runs WHERE id IN ({marks})", chunk)
         shrink(connection)
-        return doomed
+        return found
 
 
 def shrink(connection: sqlite3.Connection) -> bool:

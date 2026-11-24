@@ -1067,6 +1067,10 @@ def main(argv=None) -> int:
     launch_argv = list(argv)
     if argv and argv[0] == "show":
         return _show_saved(argv[1:], ldr_dir)
+    if argv and argv[0] == "check_machine":
+        from .machine import main as machine_main
+
+        return machine_main(argv[1:], ldr_dir)
     if argv and argv[0] == "status":
         from .status import main as status_main
 

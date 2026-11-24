@@ -83,6 +83,10 @@ def run(argv: list[str], project_root: str) -> int:
     rundir = run_directory(ldr_dir, run_id)
     os.makedirs(rundir, exist_ok=True)
     started = time.time()
+    from . import machine
+    from .previous import keep_runs
+
+    check = machine.Background(ldr_dir, keep_runs(project_root))  # beside the run's start: nothing waits for it
     spawn_detached(rundir, {"argv": argv, "project_root": project_root, "cwd": cwd,
                             "env": dict(os.environ), "started": started})
 
@@ -118,6 +122,8 @@ def run(argv: list[str], project_root: str) -> int:
             out.drain()
             err.drain()
             state = read_state(rundir) or {}
+            if check.ready() and not check.printed:
+                check.print_once()
             if state.get("state") == "finished":
                 out.drain()
                 err.drain()
@@ -145,8 +151,12 @@ def run(argv: list[str], project_root: str) -> int:
                 connection.close()
             except OSError:
                 pass
+    check.print_once()
     if state.get("message"):
         print(state["message"], file=sys.stderr)
+    report = check.finish(state)
+    if report is not None:
+        machine.save(ldr_dir, report, merge_after=started)
     return int(state.get("exit_code", 2))
 
 
