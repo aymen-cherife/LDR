@@ -107,3 +107,9 @@ def test_ldr_never_writes_to_git(tmp_path):
         for p in (tmp_path / ".git").rglob("*") if p.is_file()
     }
     assert after == before
+
+@pytest.mark.parametrize(("value", "code"), [("None", 0), ("7", 7), ("[]", 1), ("''", 1)])
+def test_system_exit_uses_python_exit_codes(tmp_path, value, code):
+    (tmp_path / "m.py").write_text(f"raise SystemExit({value})\n")
+    for flags in ((), ("--untraced-time",)):
+        assert ldr(tmp_path, "run", "m.py", *flags).returncode == code

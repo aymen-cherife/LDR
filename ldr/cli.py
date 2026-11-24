@@ -52,6 +52,10 @@ class _RunTimedOut(BaseException):
     pass
 
 
+def _system_exit_code(code):
+    return code if isinstance(code, int) else (0 if code is None else 1)
+
+
 def _record(
     fn,
     scope: list[str],
@@ -84,7 +88,7 @@ def _record(
         try:
             fn(recorder)
         except SystemExit as exc:
-            recorder.exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+            recorder.exit_code = _system_exit_code(exc.code)
         except _RunTimedOut as exc:
             recorder.crashed = True
             recorder.exit_code = 124
@@ -639,7 +643,7 @@ def _record_untraced_time(args, ldr_dir: str, key: str) -> int:
 
             code = int(pytest.main([args.target, *args.rest, "-q", "-p", "no:cacheprovider"]))
     except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        code = _system_exit_code(exc.code)
     seconds = time.perf_counter() - started
     files: dict[str, str] = {}
     try:
