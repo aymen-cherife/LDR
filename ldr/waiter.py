@@ -11,7 +11,7 @@ import threading
 import time
 from uuid import uuid4
 
-from .supervisor import alive, read_state, run_directory, spawn_detached
+from .supervisor import read_state, run_directory, spawn_detached
 
 PROGRESS_EVERY = 10.0  # seconds between progress lines when the output is not a terminal
 POLL = 0.05
@@ -75,6 +75,14 @@ def _forward_stdin(connection) -> None:
         pass
 
 
+def _supervisor_alive(state: dict) -> bool:
+    """Whether the process named in the state is the supervisor (its start time and name are checked,
+    because a number can be given to another process once the supervisor is gone)."""
+    from .machine import supervisor_alive
+
+    return bool(state.get("pid")) and supervisor_alive(state)
+
+
 def run(argv: list[str], project_root: str) -> int:
     cwd = os.getcwd()
     ldr_dir = os.path.join(cwd, ".ldr")
@@ -87,58 +95,54 @@ def run(argv: list[str], project_root: str) -> int:
     from .previous import keep_runs
 
     check = machine.Background(ldr_dir, keep_runs(project_root))  # beside the run's start: nothing waits for it
-    spawn_detached(rundir, {"argv": argv, "project_root": project_root, "cwd": cwd,
-                            "env": dict(os.environ), "started": started})
-
-    # The supervisor says where to send stdin once the program is running.
-    deadline = time.time() + 120
-    state = None
-    while time.time() < deadline:
-        state = read_state(rundir)
-        if state and (state.get("control") or state.get("state") == "finished"):
-            break
-        time.sleep(POLL)
-    else:
-        print(f"LDR: the run {run_id} did not start in 120 s (see {rundir})", file=sys.stderr)
+    launch = spawn_detached(rundir, {"argv": argv, "project_root": project_root, "cwd": cwd,
+                                     "env": dict(os.environ), "started": started})
+    state = read_state(rundir) or {}
+    if launch.returncode != 0 or not state.get("pid"):
+        reason = f"exit {launch.returncode}" if launch.returncode != 0 else "it wrote no process number"
+        detail = (launch.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-1:]
+        print(f"LDR: the launcher of run {run_id} failed ({reason}{': ' + detail[0] if detail else ''}); the run did not start (see {rundir})",
+              file=sys.stderr)
         return 2
-
-    connection = None
-    if state.get("control"):
-        try:
-            from multiprocessing.connection import Client
-
-            address, key = state["control"].rsplit("|", 1)
-            connection = Client(_address(address), authkey=bytes.fromhex(key))
-            threading.Thread(target=_forward_stdin, args=(connection,), daemon=True).start()
-        except Exception:
-            connection = None  # the program has no stdin
 
     out, err = _Tail(os.path.join(rundir, "stdout.log"), sys.stdout), _Tail(os.path.join(rundir, "stderr.log"), sys.stderr)
     interactive = bool(getattr(sys.stderr, "isatty", lambda: False)())
     next_progress = time.time() + PROGRESS_EVERY
-    gone = 0
+    connection = None
     try:
+        # No time limit: the run waits as long as the supervisor is alive, however slow the start.
         while True:
             out.drain()
             err.drain()
-            state = read_state(rundir) or {}
+            state = read_state(rundir) or state
+            if connection is None and state.get("control"):
+                # The supervisor says where to send stdin once the program is running.
+                try:
+                    from multiprocessing.connection import Client
+
+                    address, key = state["control"].rsplit("|", 1)
+                    connection = Client(_address(address), authkey=bytes.fromhex(key))
+                    threading.Thread(target=_forward_stdin, args=(connection,), daemon=True).start()
+                except Exception:
+                    connection = False  # the program has no stdin
             if check.ready() and not check.printed and state.get("first_call_s") is not None:
                 check.print_once(state)
             if state.get("state") == "finished":
-                out.drain()
-                err.drain()
                 break
-            # A supervisor that is gone without a result must not leave this waiting for ever.
-            gone = gone + 1 if state.get("pid") and not alive(state["pid"]) else 0
-            if gone > 100:  # about five seconds
+            if not _supervisor_alive(state):
+                state = read_state(rundir) or state  # the last word, in case it was written as it exited
                 out.drain()
                 err.drain()
+                if state.get("state") == "finished":
+                    break
                 print(f"LDR: the supervisor of run {run_id} is gone without a result (see {rundir})", file=sys.stderr)
                 return 2
             if not interactive and time.time() >= next_progress:
                 next_progress = time.time() + PROGRESS_EVERY
                 print(describe_progress(state), file=sys.stderr, flush=True)
             time.sleep(POLL)
+        out.drain()
+        err.drain()
     except KeyboardInterrupt:
         print(
             f"\nLDR: stopped waiting. The run continues; its result: ldr status {run_id}",
@@ -146,7 +150,7 @@ def run(argv: list[str], project_root: str) -> int:
         )
         return 130
     finally:
-        if connection is not None:
+        if connection:
             try:
                 connection.close()
             except OSError:
