@@ -5,8 +5,8 @@
 
 For each fixture, repeat and checkout: remove .ldr, run (the first run), run again (the second run,
 compared with the first), and record both. `rich` records both runs; the others only the second.
-Before each series `ldr check_machine` runs, and the series does not start on a machine it flags
-(it waits up to --wait seconds for it to clear, then stops).
+Before each series `ldr check_machine` runs and its output goes into the results. The harness never
+waits for it and never refuses to run: whoever reads the numbers reads the machine's facts beside them.
 
 Phases (seconds), from the clock times the run leaves in .ldr/runs/<id>/state.json and last.json:
   python    the command's start to the waiting command's own start (interpreter, imports)
@@ -44,17 +44,6 @@ def check_machine(checkout: Path, root: Path, env: dict) -> str:
     return result.stdout.strip()
 
 
-def wait_for_a_clean_machine(checkout: Path, root: Path, env: dict, seconds: int) -> str:
-    deadline = time.time() + seconds
-    while True:
-        text = check_machine(checkout, root, env)
-        if text.splitlines()[0].startswith("machine: ok"):
-            return text
-        if time.time() > deadline:
-            raise SystemExit("the machine is flagged; not timing:\n" + text)
-        time.sleep(20)
-
-
 def one(root: Path, command: list[str], env: dict) -> dict:
     overhead_started = time.time()
     started = time.perf_counter()
@@ -86,7 +75,6 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--only", nargs="+", default=["orders", "toolz", "rich"])
     parser.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "ldr-overhead"))
-    parser.add_argument("--wait", type=int, default=600)
     args = parser.parse_args()
     checkouts = dict(item.split("=", 1) for item in args.checkout)
     work = Path(args.work)
@@ -96,13 +84,13 @@ def main() -> int:
         for repeat in range(args.repeats):
             for label, checkout in checkouts.items():
                 env = overhead.environment(Path(checkout), root)
-                summary = wait_for_a_clean_machine(Path(checkout), root, env, args.wait)
+                summary = check_machine(Path(checkout), root, env)
                 overhead.clean(root)
                 first = one(root, traced, env)
                 second = one(root, traced, env)
                 results[label]["first"].append(first)
                 results[label]["second"].append(second)
-                print(json.dumps({"fixture": name, "repeat": repeat, "checkout": label, "check": summary.splitlines()[0][:160],
+                print(json.dumps({"fixture": name, "repeat": repeat, "checkout": label, "check": summary.splitlines(),
                                   "first": first, "second": second}), flush=True)
         medians = {
             label: {run: {key: round(statistics.median(item[key] for item in rows), 3) for key in rows[0]}

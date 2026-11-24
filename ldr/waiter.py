@@ -122,8 +122,8 @@ def run(argv: list[str], project_root: str) -> int:
             out.drain()
             err.drain()
             state = read_state(rundir) or {}
-            if check.ready() and not check.printed:
-                check.print_once()
+            if check.ready() and not check.printed and state.get("first_call_s") is not None:
+                check.print_once(state)
             if state.get("state") == "finished":
                 out.drain()
                 err.drain()
@@ -151,7 +151,7 @@ def run(argv: list[str], project_root: str) -> int:
                 connection.close()
             except OSError:
                 pass
-    check.print_once()
+    check.print_once(state)
     if state.get("message"):
         print(state["message"], file=sys.stderr)
     report = check.finish(state)

@@ -1,6 +1,6 @@
 """``ldr check_machine``: is this machine fit to run and to time a recording?
 
-One summary line, then one line per problem. It runs on its own and with every ``ldr run``.
+The facts on one line, the processes using the CPU, then one line per problem and per fix. It runs on its own and with every ``ldr run``.
 With a run nothing waits for it: the CPU sample runs beside the program's start and the result is
 printed when it is ready, and the Python start time is the run's own (launch to first recorded
 call). It never blocks a run and never changes an exit code.
@@ -11,6 +11,10 @@ LDR's (another process, another file, a live run) is never touched: the line giv
 the exact command to run, for Windows and for Linux.
 
 No dependency: Windows system calls through ctypes, /proc on Linux.
+
+It reports facts. There is no threshold in it: no CPU share is "busy", no start time is "slow", no
+age makes a run "old". A problem is something that is objectively wrong: a run whose process is
+gone, a locked database, stored runs beyond keep_runs, less free disk than the database is big.
 """
 
 from __future__ import annotations
@@ -19,7 +23,6 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -27,14 +30,6 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from . import processes
 
-MIN_FREE_BYTES = 2 * 2**30
-MIN_FREE_FRACTION = 0.03
-BUSY_PERCENT = 60.0  # of all the CPU, over the sample
-HOG_PERCENT = 30.0  # of one core, by a process that is not LDR's
-DATABASE_BIG_BYTES = 5 * 2**30
-PYTHON_START_SECONDS = 3.0  # `python -c pass`
-FIRST_CALL_SECONDS = 10.0  # launch of the run to its first recorded call
-ORPHAN_ROW_HOURS = 6  # an unfinished run row that no run directory owns, older than this, is dead
 SAMPLE_SECONDS = 1.0
 WINDOWS = os.name == "nt"
 
@@ -50,7 +45,7 @@ class Problem:
     def line(self) -> str:
         extra = ""
         if self.windows or self.linux:
-            extra = f" Windows: {self.windows}  Linux: {self.linux}"
+            extra = f" - stop: Windows `{self.windows}`  Linux `{self.linux}`"
         return f"- {self.text}{extra}"
 
     def data(self) -> dict:
@@ -59,18 +54,75 @@ class Problem:
 
 @dataclass
 class Report:
-    summary: str = ""
     problems: list = field(default_factory=list)
     fixes: list = field(default_factory=list)
     facts: dict = field(default_factory=dict)
     cost: dict = field(default_factory=dict)
+    context: str = "alone"
+    ldr_dir: str = ""
+    sample: dict | None = None  # raw CPU sample: {"percent", "processes": {pid: percent}}
+    processes: list = field(default_factory=list)  # filled by finalize()
+
+    def finalize(self, first_call_s: float | None = None) -> "Report":
+        """Name the processes of the CPU sample (LDR's own, or not) and build the facts line.
+
+        Done when the report is shown, not when the sample is taken: by then the run's supervisor has
+        written its process number, so that LDR's own processes are recognised."""
+        if first_call_s is not None:
+            self.facts["first_call_s"] = first_call_s
+        self.processes = []
+        if self.sample:
+            ours = _ldr_pids(scan_runs(self.ldr_dir)) if self.ldr_dir else {os.getpid()}
+            names = {pid: name for pid, _, name in list_processes()}
+            for pid, percent in sorted(self.sample["processes"].items(), key=lambda item: -item[1]):
+                identity = process_identity(pid)
+                self.processes.append({
+                    "pid": pid, "name": names.get(pid, "?"), "percent_of_one_core": percent, "ldr": pid in ours,
+                    "started": time.strftime("%d %b %H:%M", time.localtime(identity[0])) if identity else "?",
+                })
+        self.facts["processes"] = self.processes
+        return self
+
+    def summary(self) -> str:
+        facts = self.facts
+        head = "machine: " + (f"{len(self.problems)} problem(s)" if self.problems else "ok")
+        parts = [f"{facts.get('runs_alive', 0)} run(s) alive"]
+        if "disk_free_gb" in facts:
+            parts.append(f"disk {facts['disk_free_gb']} GB free ({facts['disk_free_percent']}%)")
+        if "database_mb" in facts:
+            parts.append(f"database {facts['database_mb']} MB")
+        parts.append(f"runs stored {facts.get('runs_stored', 0)} / keep_runs {facts.get('keep_runs', '?')}")
+        if "cpu_percent" in facts:
+            parts.append(f"CPU {facts['cpu_percent']:.0f}% busy")
+        if "python_start_s" in facts and self.context == "alone":
+            parts.append(f"python start {facts['python_start_s']} s")
+        if self.context == "run":
+            parts.append(f"first call {facts['first_call_s']} s" if "first_call_s" in facts else "first call: none")
+        python = facts["python"]
+        parts.append(f"Python {python['version']}")
+        parts.append("venv " + ("yes" if python["venv"] else "no"))
+        parts.append(f"check {self.cost.get('wall_s', 0)} s wall, {self.cost.get('cpu_s', 0)} s CPU")
+        return head + " - " + ", ".join(parts)
+
+    def process_lines(self) -> list[str]:
+        shown = self.processes if self.context == "alone" else self.processes[:5]
+        lines = []
+        for item in shown:
+            label = f"  {item['name']} (process {item['pid']}, started {item['started']}) {item['percent_of_one_core']:.0f}% of one core"
+            if item["ldr"]:
+                lines.append(label + " - LDR")
+            else:
+                lines.append(label + f" - stop: Windows `taskkill /PID {item['pid']} /F`  Linux `kill {item['pid']}`")
+        if self.context == "run" and len(self.processes) > len(shown):
+            lines.append(f"  and {len(self.processes) - len(shown)} more: ldr check_machine lists them all")
+        return lines
 
     def lines(self) -> list[str]:
-        return [self.summary, *(p.line() for p in self.problems), *(f"- fixed: {fix}" for fix in self.fixes)]
+        return [self.summary(), *self.process_lines(), *(p.line() for p in self.problems), *(f"fixed: {fix}" for fix in self.fixes)]
 
     def data(self) -> dict:
         return {
-            "summary": self.summary, "problems": [p.data() for p in self.problems], "fixes": list(self.fixes),
+            "summary": self.summary(), "problems": [p.data() for p in self.problems], "fixes": list(self.fixes),
             "facts": self.facts, "cost": self.cost,
         }
 
@@ -294,8 +346,8 @@ def supervisor_alive(state: dict) -> bool:
 
 
 def scan_runs(ldr_dir: str) -> dict:
-    """The runs in .ldr/runs: {"live": [...], "dead": [...], "empty": [...]} (run directories)."""
-    result = {"live": [], "dead": [], "empty": [], "owned": {}}
+    """The runs in .ldr/runs: {"live": [...], "dead": [...], "unstarted": [...]} (run directories)."""
+    result = {"live": [], "dead": [], "unstarted": [], "owned": {}}
     base = os.path.join(ldr_dir, "runs")
     try:
         names = os.listdir(base)
@@ -307,8 +359,7 @@ def scan_runs(ldr_dir: str) -> dict:
             with open(os.path.join(directory, "state.json"), encoding="utf-8") as handle:
                 state = json.load(handle)
         except (OSError, ValueError):
-            if time.time() - os.path.getmtime(directory) > 600:
-                result["empty"].append(directory)
+            result["unstarted"].append(directory)  # no state yet: a run that is starting (or a launch that failed)
             continue
         if state.get("store_run_id"):
             result["owned"][state["store_run_id"]] = name
@@ -348,7 +399,10 @@ def unfinished_rows(connection) -> list[tuple[str, int]]:
 
 
 def clean_dead(ldr_dir: str, scan: dict, report: Report, *, rows: bool) -> None:
-    """Mark dead runs finished and (when ``rows``) remove the rows of runs nobody owns any more."""
+    """Mark dead runs finished and (when ``rows``) remove the rows of runs that no process can own.
+
+    A row of an unfinished run is deleted when the run's own state says its supervisor is dead, or
+    when it belongs to no run directory and nothing is alive or starting that could have made it."""
     dead_ids = []
     for directory in scan["dead"]:
         try:
@@ -358,12 +412,10 @@ def clean_dead(ldr_dir: str, scan: dict, report: Report, *, rows: bool) -> None:
         report.fixes.append(f"marked dead run {os.path.basename(directory)} finished (its supervisor was gone)")
         if owned:
             dead_ids.append(owned)
-    for directory in scan["empty"]:
-        shutil.rmtree(directory, ignore_errors=True)
-        report.fixes.append(f"removed the empty run directory {os.path.basename(directory)}")
     database = os.path.join(ldr_dir, "traces.sqlite3")
     if not rows or not os.path.exists(database):
         return
+    nobody_can_own_an_orphan = not scan["live"] and not scan["unstarted"]
     live_ids = set()
     for directory in scan["live"]:
         try:
@@ -374,11 +426,10 @@ def clean_dead(ldr_dir: str, scan: dict, report: Report, *, rows: bool) -> None:
     try:
         with closing(sqlite3.connect(database, timeout=2)) as connection:
             stale = []
-            for run_id, started_ns in unfinished_rows(connection):
+            for run_id, _started in unfinished_rows(connection):
                 if run_id in live_ids:
                     continue
-                old = time.time() - started_ns / 1e9 > ORPHAN_ROW_HOURS * 3600
-                if run_id in dead_ids or (run_id not in scan["owned"] and old):
+                if run_id in dead_ids or (run_id not in scan["owned"] and nobody_can_own_an_orphan):
                     stale.append(run_id)
             if stale:
                 delete_rows(connection, stale)
@@ -390,7 +441,7 @@ def clean_dead(ldr_dir: str, scan: dict, report: Report, *, rows: bool) -> None:
 # ---------------------------------------------------------------- the checks
 
 def _antivirus(ldr_dir: str, report: Report) -> None:
-    """Windows: whether real-time scanning covers .ldr, when that can be read without admin."""
+    """Windows: what can be read, without admin, about real-time scanning and .ldr (a fact, not a problem)."""
     if not WINDOWS:
         return
     import winreg
@@ -410,48 +461,34 @@ def _antivirus(ldr_dir: str, report: Report) -> None:
         exclusions = read(base + r"\Exclusions\Paths")
     except OSError:
         exclusions = None
+    path = os.path.normcase(os.path.abspath(ldr_dir))
     report.facts["antivirus"] = {
         "real_time_scanning": None if disabled is None else not disabled,
         "exclusions_readable": exclusions is not None,
+        "ldr_excluded": None if exclusions is None else any(
+            path.startswith(os.path.normcase(os.path.abspath(item))) for item in exclusions
+        ),
     }
-    if disabled or exclusions is None:
-        return  # off, or not readable without admin: nothing to say
-    path = os.path.normcase(os.path.abspath(ldr_dir))
-    if not any(path.startswith(os.path.normcase(os.path.abspath(item))) for item in exclusions):
-        report.problems.append(Problem(
-            "antivirus", f"real-time antivirus scanning covers {ldr_dir}; it slows every write and can hold files",
-            windows=f'Add-MpPreference -ExclusionPath "{ldr_dir}"  (administrator PowerShell)', linux="n/a",
-        ))
 
 
 def _python_start(report: Report) -> None:
     started = time.perf_counter()
-    processes.run([sys.executable, "-c", "pass"], capture_output=True, check=False, timeout=60)
-    seconds = round(time.perf_counter() - started, 2)
-    report.facts["python_start_s"] = seconds
-    if seconds > PYTHON_START_SECONDS:
-        report.problems.append(Problem(
-            "python_start", f"starting Python takes {seconds} s (normally under {PYTHON_START_SECONDS:g} s): "
-            "something is slowing process starts (antivirus, a busy CPU or disk)",
-        ))
+    processes.run([sys.executable, "-c", "pass"], capture_output=True, check=False, timeout=300)
+    report.facts["python_start_s"] = round(time.perf_counter() - started, 2)
 
 
 def check(ldr_dir: str, *, keep: int, context: str = "alone", fix: bool = True, sample: bool = True, python_start: bool = True) -> Report:
     """Run every check. ``context`` is "alone" or "run"; with a run, fixes that touch the database
-    wait for the end of the run, and the Python start time is the run's own."""
+    wait for the end of the run, and the Python start time is the run's own (the first call)."""
     started, cpu_started = time.perf_counter(), time.process_time()
-    report = Report()
-    facts = report.facts
     ldr_dir = os.path.abspath(ldr_dir)
+    report = Report(context=context, ldr_dir=ldr_dir)
+    facts = report.facts
     # disk
     probe = ldr_dir if os.path.isdir(ldr_dir) else os.path.dirname(ldr_dir)
     usage = shutil.disk_usage(probe)
     facts["disk_free_gb"] = round(usage.free / 2**30, 1)
-    if usage.free < MIN_FREE_BYTES or usage.free < usage.total * MIN_FREE_FRACTION:
-        report.problems.append(Problem(
-            "disk", f"only {usage.free / 2**30:.1f} GB free on the disk of {probe} ({usage.free / usage.total:.0%})",
-            windows="cleanmgr /d " + os.path.splitdrive(probe)[0].rstrip(":"), linux=f"du -xh --max-depth=2 {probe} | sort -h | tail",
-        ))
+    facts["disk_free_percent"] = round(usage.free / usage.total * 100, 1)
     # LDR's runs
     scan = scan_runs(ldr_dir)
     facts["runs_alive"], facts["runs_dead"] = len(scan["live"]), len(scan["dead"])
@@ -460,16 +497,18 @@ def check(ldr_dir: str, *, keep: int, context: str = "alone", fix: bool = True, 
     # the database
     database = os.path.join(ldr_dir, "traces.sqlite3")
     stored = beyond = 0
+    size = 0
     if os.path.exists(database):
         size = os.path.getsize(database) + (os.path.getsize(database + "-wal") if os.path.exists(database + "-wal") else 0)
         facts["database_mb"] = round(size / 2**20)
-        if size > DATABASE_BIG_BYTES:
-            report.problems.append(Problem("database_size", f"the database is {size / 2**30:.1f} GB"))
         locked = _database_locked(database, exclusive=not scan["live"])
         if locked:
             who = holders(database)
-            names = ", ".join(f"{name or '?'} (process {pid})" for pid, name in who) or "a process that could not be named"
-            number = who[0][0] if who else None
+            ours = _ldr_pids(scan)
+            names = ", ".join(f"{name or '?'} (process {pid})" + (" - LDR" if pid in ours else "") for pid, name in who) \
+                or "a process that could not be named"
+            others = [(pid, name) for pid, name in who if pid not in ours]
+            number = others[0][0] if others else None
             report.problems.append(Problem(
                 "database_locked", f"the database is locked, held by {names}", number=number,
                 windows=f"taskkill /PID {number} /F" if number else None, linux=f"kill {number}" if number else None,
@@ -489,14 +528,17 @@ def check(ldr_dir: str, *, keep: int, context: str = "alone", fix: bool = True, 
             "keep_runs", f"{beyond} stored run(s) are beyond keep_runs = {keep}"
             + (" (deleted at the end of this run)" if context == "run" else ""),
         ))
-    # CPU, from the sample
+    if size and usage.free < size:
+        report.problems.append(Problem(
+            "disk", f"{usage.free / 2**30:.1f} GB free is less than the database ({size / 2**30:.1f} GB): the next run may not fit",
+        ))
+    # CPU: the processes using it, from the sample (no judgement)
     if sample:
-        _cpu(report, scan)
+        report.sample = sample_cpu()
+        facts["cpu_percent"] = report.sample["percent"]
     # Python
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
     facts["python"] = {"version": sys.version.split()[0], "venv": sys.prefix if in_venv else None, "executable": sys.executable}
-    if not os.path.exists(sys.executable) or (in_venv and not os.path.isdir(_venv_home())):
-        report.problems.append(Problem("python", "the Python of this environment is missing: recreate the virtual environment"))
     if context == "alone" and python_start:
         _python_start(report)
     _antivirus(ldr_dir, report)
@@ -509,23 +551,14 @@ def check(ldr_dir: str, *, keep: int, context: str = "alone", fix: bool = True, 
             deleted = previous.prune(ldr_dir, keep)
             if deleted:
                 report.fixes.append(f"deleted {len(deleted)} stored run(s) beyond keep_runs = {keep}")
-        report.problems = [p for p in report.problems if not (
-            (p.kind == "dead_run" and report.fixes) or (p.kind == "keep_runs" and context == "alone" and beyond and fix)
-        )]
+        fixed_kinds = set()
+        if any(fix.startswith("marked dead run") for fix in report.fixes):
+            fixed_kinds.add("dead_run")
+        if context == "alone" and beyond and any("beyond keep_runs" in fix for fix in report.fixes):
+            fixed_kinds.add("keep_runs")
+        report.problems = [p for p in report.problems if p.kind not in fixed_kinds]
     report.cost = {"wall_s": round(time.perf_counter() - started, 3), "cpu_s": round(time.process_time() - cpu_started, 3)}
-    report.summary = summarize(report, context)
-    return report
-
-
-def _venv_home() -> str:
-    try:
-        with open(os.path.join(sys.prefix, "pyvenv.cfg"), encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("home"):
-                    return line.split("=", 1)[1].strip()
-    except OSError:
-        pass
-    return sys.prefix
+    return report.finalize()
 
 
 def _database_locked(database: str, *, exclusive: bool) -> bool:
@@ -543,29 +576,6 @@ def _database_locked(database: str, *, exclusive: bool) -> bool:
     except sqlite3.OperationalError as exc:
         return "locked" in str(exc) or "busy" in str(exc)
     return False
-
-
-def _cpu(report: Report, scan: dict) -> None:
-    sampled = sample_cpu()
-    report.facts["cpu_percent"] = sampled["percent"]
-    ours = _ldr_pids(scan)
-    hogs = sorted(
-        ((pid, percent) for pid, percent in sampled["processes"].items()
-         if percent >= HOG_PERCENT and pid not in ours and pid != 0),
-        key=lambda item: -item[1],
-    )[:3]
-    names = {pid: name for pid, _, name in list_processes()}
-    report.facts["busy_processes"] = [{"pid": pid, "name": names.get(pid, "?"), "percent_of_one_core": percent} for pid, percent in hogs]
-    if sampled["percent"] >= BUSY_PERCENT and not hogs:
-        report.problems.append(Problem("cpu", f"the CPU is {sampled['percent']:.0f}% busy and no single process explains it"))
-    for pid, percent in hogs:
-        identity = process_identity(pid)
-        report.problems.append(Problem(
-            "cpu_process", f"{names.get(pid, '?')} (process {pid}, started "
-            f"{time.strftime('%d %b %H:%M', time.localtime(identity[0])) if identity else '?'}) uses {percent:.0f}% of one core; "
-            f"the CPU is {sampled['percent']:.0f}% busy",
-            number=pid, windows=f"taskkill /PID {pid} /F", linux=f"kill {pid}",
-        ))
 
 
 def _ldr_pids(scan: dict) -> set[int]:
@@ -591,25 +601,11 @@ def _ldr_pids(scan: dict) -> set[int]:
     return family
 
 
-def summarize(report: Report, context: str) -> str:
-    facts = report.facts
-    parts = [f"{facts.get('runs_alive', 0)} run(s) alive", f"disk {facts.get('disk_free_gb', '?')} GB free"]
-    if "database_mb" in facts:
-        parts.append(f"database {facts['database_mb']} MB, {facts['runs_stored']} run(s) stored of keep_runs {facts['keep_runs']}")
-    if "cpu_percent" in facts:
-        parts.append(f"CPU {facts['cpu_percent']:.0f}%")
-    if "python_start_s" in facts:
-        parts.append(f"python start {facts['python_start_s']} s")
-    parts.append(f"Python {facts['python']['version']}")
-    parts.append(f"check {report.cost.get('wall_s', 0)} s wall, {report.cost.get('cpu_s', 0)} s CPU")
-    head = "machine: " + (f"{len(report.problems)} problem(s)" if report.problems else "ok")
-    return head + " - " + ", ".join(parts)
-
-
 # ---------------------------------------------------------------- with a run
 
 class Background:
-    """The check of a run: starts at once, reports when the CPU sample is ready, never waits."""
+    """The check of a run: starts at once, never waits, and is shown when the CPU sample is ready and
+    the run's first call is known (or at the end of the run)."""
 
     def __init__(self, ldr_dir: str, keep: int):
         self.ldr_dir, self.keep = ldr_dir, keep
@@ -622,35 +618,34 @@ class Background:
         try:
             self.report = check(self.ldr_dir, keep=self.keep, context="run")
         except Exception as exc:  # a check must never disturb a run
-            self.report = Report(summary=f"machine: the check failed ({type(exc).__name__}: {exc})")
+            failed = Report(context="run")
+            failed.facts["python"] = {"version": sys.version.split()[0], "venv": None}
+            failed.problems.append(Problem("check_failed", f"the check failed ({type(exc).__name__}: {exc})"))
+            self.report = failed
 
     def ready(self) -> bool:
         return self.report is not None
 
-    def print_once(self, stream=None) -> None:
-        if self.report is not None and not self.printed:
-            self.printed = True
-            print("\n".join(f"[ldr] {line}" if i == 0 else line for i, line in enumerate(self.report.lines())),
-                  file=stream or sys.stderr, flush=True)
+    def print_once(self, state: dict | None = None, stream=None) -> None:
+        if self.report is None or self.printed:
+            return
+        self.printed = True
+        self.report.finalize((state or {}).get("first_call_s")) if self.report.sample else None
+        if "first_call_s" in (state or {}):
+            self.report.facts["first_call_s"] = state["first_call_s"]
+        lines = self.report.lines()
+        print("\n".join(f"[ldr] {line}" if i == 0 else line for i, line in enumerate(lines)), file=stream or sys.stderr, flush=True)
 
-    def finish(self, state: dict, stream=None) -> Report | None:
-        """After the run: add the run's own Python start time; save the result."""
+    def finish(self, state: dict) -> Report | None:
+        """After the run: the report with the run's first call (launch to first recorded call)."""
         if self.report is None:
-            self.thread.join(5)
+            self.thread.join(30)
         report = self.report
         if report is None:
             return None
-        seconds = state.get("first_call_s")
-        if seconds is not None:
-            report.facts["python_start_s"] = seconds
-            report.facts["python_start_measured"] = "launch of the run to its first recorded call"
-            if seconds > FIRST_CALL_SECONDS:
-                problem = Problem(
-                    "python_start", f"the run took {seconds} s from launch to its first recorded call "
-                    f"(normally under {FIRST_CALL_SECONDS:g} s): process starts are slow on this machine",
-                )
-                report.problems.append(problem)
-                print(problem.line(), file=stream or sys.stderr, flush=True)
+        if state.get("first_call_s") is not None:
+            report.facts["first_call_s"] = state["first_call_s"]
+            report.facts["first_call_measured"] = "launch of the run to its first recorded call"
         return report
 
 

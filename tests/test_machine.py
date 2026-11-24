@@ -1,5 +1,5 @@
-"""Hotfix step 1: ``ldr check_machine``. One summary line, then one line per problem; LDR's own
-leftovers are fixed and said so; what is not LDR's is only named, with the number and the commands."""
+"""``ldr check_machine``: facts, never thresholds. The facts on one line, the processes using the CPU,
+then the objective problems and the fixes; what is not LDR's is only named, with the stop commands."""
 
 import json
 import os
@@ -75,27 +75,146 @@ def kinds(report):
     return [problem.kind for problem in report.problems]
 
 
-def test_the_summary_comes_first_then_one_line_per_problem(ldr_dir, monkeypatch):
-    monkeypatch.setattr(machine.shutil, "disk_usage", lambda path: type("U", (), {"total": 100 * 2**30, "free": 2**30})())
-    report = quick(ldr_dir)
-    lines = report.lines()
-    assert lines[0].startswith("machine: 1 problem(s)") and lines[1].startswith("- only 1.0 GB free")
-    assert len(lines) == 2
-
-
-def test_a_machine_without_problems_says_ok_and_how_much_it_cost(ldr_dir):
-    report = quick(ldr_dir)
-    assert report.summary.startswith("machine: ok - ") and "check " in report.summary
+def test_the_first_line_has_every_fact_and_ok_when_there_is_no_problem(ldr_dir):
+    report = quick(ldr_dir, sample=True, python_start=True)
+    line = report.summary()
+    assert line.startswith("machine: ok - 0 run(s) alive, disk ")
+    for part in ("GB free (", "runs stored 0 / keep_runs 2", "% busy", "python start ", "Python 3.", "venv ", "s wall, ", "s CPU"):
+        assert part in line, (part, line)
+    assert "first call" not in line  # alone: a run's first call does not exist
     assert report.cost["wall_s"] >= 0 and report.cost["cpu_s"] >= 0
-    assert len(report.lines()) == 1
 
 
-def test_low_disk_is_a_problem_with_the_commands(ldr_dir, monkeypatch):
-    monkeypatch.setattr(machine.shutil, "disk_usage", lambda path: type("U", (), {"total": 100 * 2**30, "free": 5 * 2**30})())
-    assert "disk" not in kinds(quick(ldr_dir))  # 5 GB of 100 is enough
-    monkeypatch.setattr(machine.shutil, "disk_usage", lambda path: type("U", (), {"total": 100 * 2**30, "free": 2 * 2**30 - 1})())
+def test_with_a_run_the_line_has_the_first_call_and_no_python_start(ldr_dir):
+    report = machine.check(str(ldr_dir), keep=2, context="run", sample=False)
+    assert "first call: none" in report.summary() and "python start" not in report.summary()
+    report.finalize(first_call_s=1.25)
+    assert "first call 1.25 s" in report.summary()
+
+
+def test_the_line_counts_problems(ldr_dir):
+    write_state(ldr_dir, "dead", state="running", pid=dead_pid(), started_at=time.time())
+    report = quick(ldr_dir, fix=False)
+    assert report.summary().startswith("machine: 1 problem(s) - ")
+    assert report.lines()[1].startswith("- run dead died without a result")
+
+
+def test_no_threshold_is_left_in_the_check():
+    source = (REPO / "ldr" / "machine.py").read_text(encoding="utf-8")
+    for name in ("MIN_FREE_BYTES", "MIN_FREE_FRACTION", "BUSY_PERCENT", "HOG_PERCENT", "DATABASE_BIG_BYTES",
+                 "PYTHON_START_SECONDS", "FIRST_CALL_SECONDS", "ORPHAN_ROW_HOURS"):
+        assert name not in source, name
+    harness = (REPO / "evaluation" / "run_phases.py").read_text(encoding="utf-8")
+    assert "--wait" not in harness and "wait_for_a_clean_machine" not in harness
+
+
+def test_a_machine_with_little_free_disk_but_room_for_the_database_has_no_problem(ldr_dir, monkeypatch):
+    monkeypatch.setattr(machine.shutil, "disk_usage", lambda path: type("U", (), {"total": 100 * 2**30, "free": 2**20})())
+    assert "disk" not in kinds(quick(ldr_dir))  # no database yet: nothing needs the room
+
+
+def test_less_free_disk_than_the_database_is_a_problem(ldr_dir, monkeypatch):
+    database(ldr_dir).close()
+    big = ldr_dir / "traces.sqlite3"
+    with open(big, "ab") as handle:
+        handle.truncate(3 * 2**20)
+    monkeypatch.setattr(machine.shutil, "disk_usage", lambda path: type("U", (), {"total": 100 * 2**30, "free": 2 * 2**20})())
     problem = next(p for p in quick(ldr_dir).problems if p.kind == "disk")
-    assert problem.windows and problem.linux
+    assert "less than the database" in problem.text
+    monkeypatch.setattr(machine.shutil, "disk_usage", lambda path: type("U", (), {"total": 100 * 2**30, "free": 4 * 2**20})())
+    assert "disk" not in kinds(quick(ldr_dir))
+
+
+def test_a_run_that_died_a_moment_ago_is_dead_there_is_no_age_rule(ldr_dir):
+    directory = write_state(ldr_dir, "justnow", state="running", pid=dead_pid(), started_at=time.time())
+    report = quick(ldr_dir)
+    assert json.loads((directory / "state.json").read_text(encoding="utf-8"))["state"] == "finished"
+    assert any("marked dead run justnow" in fix for fix in report.fixes)
+    assert "fixed: marked dead run justnow finished (its supervisor was gone)" in report.lines()
+
+
+def test_the_rows_of_a_dead_run_are_deleted_and_a_live_runs_rows_are_kept(ldr_dir):
+    me = machine.process_identity(os.getpid())
+    connection = database(ldr_dir)
+    add_run(connection, "dead_row", finished=False)
+    add_run(connection, "live_row", finished=False)
+    add_run(connection, "orphan", finished=False)
+    add_run(connection, "done", finished=True)
+    connection.close()
+    write_state(ldr_dir, "d", state="running", pid=dead_pid(), started_at=time.time() - 60, store_run_id="dead_row")
+    write_state(ldr_dir, "l", state="running", pid=os.getpid(), pid_start=me[0], started_at=time.time(), store_run_id="live_row")
+    report = quick(ldr_dir)
+    with closing(sqlite3.connect(ldr_dir / "traces.sqlite3")) as connection:
+        left = {row[0] for row in connection.execute("SELECT id FROM runs")}
+    assert left == {"live_row", "orphan", "done"}  # a live run exists: the orphan may be its own
+    assert any("deleted the rows of 1 run(s) that never finished" in fix for fix in report.fixes)
+
+
+def test_an_unfinished_row_that_no_run_owns_is_deleted_when_nothing_is_alive_or_starting(ldr_dir):
+    connection = database(ldr_dir)
+    add_run(connection, "orphan", finished=False)
+    connection.close()
+    (ldr_dir / "runs" / "starting").mkdir(parents=True)  # a run directory with no state yet: it may own the row
+    quick(ldr_dir)
+    with closing(sqlite3.connect(ldr_dir / "traces.sqlite3")) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+    (ldr_dir / "runs" / "starting").rmdir()
+    report = quick(ldr_dir)
+    with closing(sqlite3.connect(ldr_dir / "traces.sqlite3")) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert any("deleted the rows of 1 run(s)" in fix for fix in report.fixes)
+
+
+def test_the_processes_using_the_cpu_are_facts_with_stop_commands_and_ldrs_own_have_none(ldr_dir, monkeypatch):
+    stranger = processes.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    supervisor = processes.Popen([sys.executable, "-c", "import time; time.sleep(60)"])  # stands for a live run's supervisor
+    try:
+        identity = machine.process_identity(supervisor.pid)
+        write_state(ldr_dir, "l", state="running", pid=supervisor.pid, pid_start=identity[0], started_at=time.time())
+        monkeypatch.setattr(machine, "sample_cpu", lambda seconds=1: {"percent": 95.0, "cpus": 8, "processes": {stranger.pid: 90.0, supervisor.pid: 99.0}})
+        report = quick(ldr_dir, sample=True)
+        assert not [p for p in report.problems if p.kind.startswith("cpu")]  # facts, never problems
+        assert "CPU 95% busy" in report.summary()
+        lines = report.process_lines()
+        assert f"process {supervisor.pid}" in lines[0] and lines[0].endswith("- LDR") and "taskkill" not in lines[0]  # highest first
+        assert f"taskkill /PID {stranger.pid} /F" in lines[1] and f"kill {stranger.pid}" in lines[1]
+        assert stranger.poll() is None  # not LDR's: never touched
+    finally:
+        for process in (stranger, supervisor):
+            process.kill()
+            process.wait()
+
+
+def test_alone_lists_every_process_and_with_a_run_the_top_five_then_the_count(ldr_dir, monkeypatch):
+    many = {pid: float(100 - pid % 90) for pid in range(5000, 5012)}
+    monkeypatch.setattr(machine, "sample_cpu", lambda seconds=1: {"percent": 10.0, "cpus": 8, "processes": many})
+    alone = quick(ldr_dir, sample=True)
+    assert len(alone.process_lines()) == 12 and not any("more" in line for line in alone.process_lines())
+    during = machine.check(str(ldr_dir), keep=2, context="run", sample=True)
+    lines = during.process_lines()
+    assert len(lines) == 6 and lines[-1] == "  and 7 more: ldr check_machine lists them all"
+
+
+def test_nothing_is_busy_or_slow_however_high_the_numbers(ldr_dir, monkeypatch):
+    monkeypatch.setattr(machine, "sample_cpu", lambda seconds=1: {"percent": 100.0, "cpus": 8, "processes": {os.getpid(): 800.0}})
+    report = quick(ldr_dir, sample=True)
+    assert report.problems == []
+    report = machine.Background(str(ldr_dir), 2).finish({"first_call_s": 3600.0}) or report
+    assert report.problems == []  # an hour to the first call is a fact, not a problem
+
+
+def test_the_runs_own_first_call_is_a_fact_in_the_result(ldr_dir):
+    background = machine.Background(str(ldr_dir), 2)
+    background.thread.join(30)
+    report = background.finish({"first_call_s": 42.0})
+    assert report.facts["first_call_s"] == 42.0 and "launch of the run to its first recorded call" in report.facts["first_call_measured"]
+
+
+def test_the_antivirus_facts_are_read_when_possible_and_never_a_problem(ldr_dir):
+    report = quick(ldr_dir)
+    assert "antivirus" not in kinds(report)
+    if os.name == "nt":
+        assert set(report.facts["antivirus"]) == {"real_time_scanning", "exclusions_readable", "ldr_excluded"}
 
 
 def test_a_dead_run_is_marked_finished_and_said(ldr_dir):
@@ -158,25 +277,6 @@ def test_the_process_identity_of_this_process_and_of_a_missing_one():
     assert machine.process_identity(0) is None
 
 
-def test_the_rows_of_a_dead_run_are_deleted_and_a_live_run_keeps_its_rows(ldr_dir):
-    me = machine.process_identity(os.getpid())
-    connection = database(ldr_dir)
-    add_run(connection, "dead_row", finished=False)
-    add_run(connection, "live_row", finished=False)
-    add_run(connection, "recent_orphan", finished=False, age_hours=1)
-    add_run(connection, "old_orphan", finished=False, age_hours=10)
-    add_run(connection, "done", finished=True)
-    connection.close()
-    write_state(ldr_dir, "d", state="running", pid=dead_pid(), started_at=time.time() - 60, store_run_id="dead_row")
-    write_state(ldr_dir, "l", state="running", pid=os.getpid(), pid_start=me[0], started_at=time.time(), store_run_id="live_row")
-    report = quick(ldr_dir)
-    with closing(sqlite3.connect(ldr_dir / "traces.sqlite3")) as connection:
-        left = {row[0] for row in connection.execute("SELECT id FROM runs")}
-        assert not connection.execute("SELECT 1 FROM stream_budget WHERE run_id IN ('dead_row', 'old_orphan')").fetchone()
-    assert left == {"live_row", "recent_orphan", "done"}
-    assert any("deleted the rows of 2 run(s) that never finished" in fix for fix in report.fixes)
-
-
 def test_runs_beyond_keep_runs_are_deleted_when_alone_and_only_named_during_a_run(ldr_dir):
     connection = database(ldr_dir)
     for index in range(4):
@@ -216,95 +316,38 @@ def test_a_locked_database_names_the_process_that_holds_it(ldr_dir):
     assert "database_locked" not in kinds(quick(ldr_dir))
 
 
-def test_a_busy_process_that_is_not_ldrs_is_named_with_its_number_and_never_stopped(ldr_dir, monkeypatch):
-    stranger = processes.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    try:
-        monkeypatch.setattr(machine, "sample_cpu", lambda seconds=1: {"percent": 70.0, "cpus": 8, "processes": {stranger.pid: 95.0, os.getpid(): 90.0}})
-        report = quick(ldr_dir, sample=True)
-        problems = [p for p in report.problems if p.kind == "cpu_process"]
-        assert [p.number for p in problems] == [stranger.pid]  # this process is not named
-        assert f"taskkill /PID {stranger.pid} /F" == problems[0].windows and f"kill {stranger.pid}" == problems[0].linux
-        assert stranger.poll() is None  # still running: it is not LDR's
-    finally:
-        stranger.kill()
-        stranger.wait()
-
-
-def test_the_processes_of_a_live_ldr_run_are_not_blamed(ldr_dir, monkeypatch):
-    me = machine.process_identity(os.getpid())
-    write_state(ldr_dir, "l", state="running", pid=os.getpid(), pid_start=me[0], program_pid=os.getpid(), started_at=time.time())
-    monkeypatch.setattr(machine, "sample_cpu", lambda seconds=1: {"percent": 40.0, "cpus": 8, "processes": {os.getpid(): 99.0}})
-    assert not [p for p in quick(ldr_dir, sample=True).problems if p.kind.startswith("cpu")]
-
-
-def test_a_busy_cpu_with_no_single_culprit_is_a_problem(ldr_dir, monkeypatch):
-    monkeypatch.setattr(machine, "sample_cpu", lambda seconds=1: {"percent": 85.0, "cpus": 8, "processes": {}})
-    assert "cpu" in kinds(quick(ldr_dir, sample=True))
-
-
-def test_slow_python_start_is_a_problem(ldr_dir, monkeypatch):
-    monkeypatch.setattr(machine, "PYTHON_START_SECONDS", 0.0)
-    assert "python_start" in kinds(quick(ldr_dir, python_start=True))
-
-
-def test_the_runs_own_python_start_time_is_judged_from_the_state(ldr_dir, tmp_path):
-    background = machine.Background(str(ldr_dir), 2)
-    background.thread.join(30)
-    report = background.finish({"first_call_s": 42.0})
-    assert report.facts["python_start_s"] == 42.0 and "python_start" in kinds(report)
-    assert "launch of the run to its first recorded call" in report.facts["python_start_measured"]
-
-
-def test_a_broken_python_environment_is_a_problem(ldr_dir, monkeypatch):
-    monkeypatch.setattr(machine.sys, "prefix", str(ldr_dir))
-    monkeypatch.setattr(machine, "_venv_home", lambda: str(ldr_dir / "gone"))
-    assert "python" in kinds(quick(ldr_dir))
-
-
-@pytest.mark.skipif(os.name != "nt", reason="the antivirus check is Windows only")
-def test_antivirus_scanning_that_covers_ldr_is_a_problem_only_when_readable(ldr_dir, monkeypatch):
-    import types
-
-    values = {"DisableRealtimeMonitoring": 0}
-    paths = {"value": None}
-
-    class Key:
-        def __init__(self, name):
-            self.name = name
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    def open_key(root, subkey):
-        if subkey.endswith("Exclusions\\Paths") and paths["value"] is None:
-            raise PermissionError("denied")
-        return Key(subkey)
-
-    fake = types.SimpleNamespace(
-        HKEY_LOCAL_MACHINE=0, OpenKey=open_key, QueryValueEx=lambda key, name: (values[name], 4),
-        QueryInfoKey=lambda key: (0, len(paths["value"] or []), 0), EnumValue=lambda key, i: (paths["value"][i], "", 1),
+def test_a_locked_database_names_the_process_that_holds_it(ldr_dir):
+    database(ldr_dir).close()
+    path = str(ldr_dir / "traces.sqlite3")
+    holder = processes.Popen(
+        [sys.executable, "-c",
+         "import sqlite3,sys,time\n"
+         "c=sqlite3.connect(sys.argv[1]); c.isolation_level=None; c.execute('BEGIN EXCLUSIVE')\n"
+         "print('held', flush=True); time.sleep(60)", path],
+        stdout=subprocess.PIPE, text=True,
     )
-    monkeypatch.setitem(sys.modules, "winreg", fake)
-    assert "antivirus" not in kinds(quick(ldr_dir))  # exclusions not readable without admin: no claim
-    paths["value"] = [r"C:\elsewhere"]
-    problem = next(p for p in quick(ldr_dir).problems if p.kind == "antivirus")
-    assert "Add-MpPreference" in problem.windows
-    paths["value"] = [str(ldr_dir.parent)]
-    assert "antivirus" not in kinds(quick(ldr_dir))
-    paths["value"] = [r"C:\elsewhere"]
-    values["DisableRealtimeMonitoring"] = 1
-    assert "antivirus" not in kinds(quick(ldr_dir))
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        report = quick(ldr_dir)
+        problem = next(p for p in report.problems if p.kind == "database_locked")
+        # the virtual environment's python.exe starts the real interpreter: the holder is it or its child
+        family = {holder.pid} | {pid for pid, parent, _ in machine.list_processes() if parent == holder.pid}
+        assert problem.number in family, report.lines()
+        assert str(problem.number) in problem.windows and str(problem.number) in problem.linux
+        assert report.facts["database_locked"] is True
+    finally:
+        holder.kill()
+        holder.wait()
+    assert "database_locked" not in kinds(quick(ldr_dir))
 
 
 def test_check_machine_alone_prints_the_summary_first_and_exits_zero(tmp_path):
     (tmp_path / ".ldr").mkdir()
     result = ldr(tmp_path, "check_machine", expected=0)
-    assert result.stdout.splitlines()[0].startswith("machine: ")
+    first = result.stdout.splitlines()[0]
+    assert first.startswith("machine: ") and "python start " in first and "first call" not in first
     data = json.loads((tmp_path / ".ldr" / "machine.json").read_text(encoding="utf-8"))
-    assert data["summary"] == result.stdout.splitlines()[0] and "cost" in data
+    assert data["summary"] == first and "cost" in data
     as_json = json.loads(ldr(tmp_path, "check_machine", "--json", expected=0).stdout)
     assert as_json["facts"]["python"]["version"].startswith("3.")
 
@@ -316,8 +359,9 @@ def test_every_run_prints_the_check_keeps_its_exit_code_and_saves_the_result(tmp
     assert "[ldr] machine: " in result.stderr
     data = json.loads((tmp_path / ".ldr" / "last.json").read_text(encoding="utf-8"))
     machine_result = data["status"]["machine"]
-    assert machine_result["summary"].startswith("machine: ") and machine_result["facts"]["python_start_s"] > 0
-    assert "launch of the run to its first recorded call" in machine_result["facts"]["python_start_measured"]
+    assert machine_result["summary"].startswith("machine: ") and machine_result["facts"]["first_call_s"] > 0
+    assert "launch of the run to its first recorded call" in machine_result["facts"]["first_call_measured"]
+    assert "first call " in machine_result["summary"] and "python start" not in machine_result["summary"]
 
 
 def test_a_check_that_fails_does_not_fail_the_run(tmp_path):
@@ -330,4 +374,4 @@ def test_a_check_that_fails_does_not_fail_the_run(tmp_path):
         env=dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO), str(tmp_path)])),
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "machine: the check failed" in result.stderr
+    assert "the check failed" in result.stderr and "check broke" in result.stderr
