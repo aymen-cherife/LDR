@@ -168,13 +168,15 @@ def clean(root: Path) -> None:
     for a moment after `ldr` returns, and a database left behind would make the next run a second run
     (compared with the previous one), so wait until it is gone."""
     for leftover in (".ldr", ".hypothesis"):
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 600
+        problems: list[str] = []
         while True:
-            shutil.rmtree(root / leftover, ignore_errors=True)
+            shutil.rmtree(root / leftover, onexc=lambda function, path, error: problems.append(f"{path}: {error}"))
             if not (root / leftover).exists():
                 break
             if time.monotonic() > deadline:
-                raise SystemExit(f"cannot remove {root / leftover}")
+                raise SystemExit(f"cannot remove {root / leftover}: {problems[-1:]}")
+            problems.clear()
             time.sleep(0.5)
 
 

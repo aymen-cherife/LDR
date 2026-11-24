@@ -35,18 +35,32 @@ def calls_of(root: Path) -> int:
         return connection.execute("SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run,)).fetchone()[0]
 
 
+def loop_of(root: Path):
+    """The time of the calls alone, for a fixture that writes it (rich-scaled), else None."""
+    file = root / "loop_seconds.txt"
+    if not file.exists():
+        return None
+    value = float(file.read_text())
+    file.unlink()
+    return value
+
+
 def measure(name, fixture, rounds, checkouts, work):
     root, plain, traced = fixture
     times = {"plain": []} | {label: [] for label in checkouts}
+    loops = {label: [] for label in ["plain", *checkouts]}
     calls = {}
     for _ in range(rounds):
         overhead.clean(root)
         times["plain"].append(overhead.timed(plain, root, overhead.environment(overhead.REPO, root)))
+        loops["plain"].append(loop_of(root))
         for label, checkout in checkouts.items():
             env = overhead.environment(Path(checkout), root)
             overhead.clean(root)
             overhead.timed(traced, root, env)  # the previous run
+            loop_of(root)
             times[label].append(overhead.timed(traced, root, env))
+            loops[label].append(loop_of(root))
             calls[label] = calls_of(root)
     # What the comparison costs on the recording thread, timed from inside (one more run each).
     inside = {}
@@ -67,7 +81,11 @@ def measure(name, fixture, rounds, checkouts, work):
         }
         for item in glob.glob(str(root / "lookup.json.*")):
             os.unlink(item)
-    row = {"fixture": name, "calls": calls, "inside_s": inside, "median_s": {k: round(statistics.median(v), 3) for k, v in times.items()},
+    if all(value is not None for series in loops.values() for value in series):
+        loop_row = {label: round(statistics.median(series), 4) for label, series in loops.items()}
+    else:
+        loop_row = None
+    row = {"fixture": name, "calls": calls, "inside_s": inside, "loop_median_s": loop_row, "median_s": {k: round(statistics.median(v), 3) for k, v in times.items()},
            "all_s": {k: [round(t, 3) for t in v] for k, v in times.items()}}
     labels = list(checkouts)
     reference = labels[0]

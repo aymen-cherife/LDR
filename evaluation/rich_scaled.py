@@ -21,6 +21,10 @@ in bulk ...), and from the whole run how often a value was one that an earlier c
 already walked, and how often it had changed since. The fixture builds each value with the
 composition of the sample nearest in size, and exactly the recorded number of nodes.
 
+The objects are made of the same kinds of nodes as the originals, but they are plain objects with
+an instance `__dict__`: rich's `Style` and others use `__slots__`. So the fixture cannot say what
+a walk that watches dictionaries would cover (see evaluation/repeated_walks.py, run on rich itself).
+
 What the fixture does not copy: the work rich does between the calls, who calls whom (the driver
 loop makes every call), exceptions, and growth during a call other than an object that is empty
 at entry and full at exit (a receiver being constructed: 94% of the nodes that values gained during
