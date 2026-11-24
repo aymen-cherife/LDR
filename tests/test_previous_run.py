@@ -302,3 +302,11 @@ def test_a_script_loads_its_previous_run_when_it_starts(tmp_path):
             "SELECT s.summary FROM stream_summary s JOIN runs r ON r.id = s.run_id ORDER BY r.started_ns DESC LIMIT 1"
         ).fetchone()[0])
     assert summary["previous_loaded"] == 30 and "previous_error" not in summary
+
+
+def test_no_edit_requires_the_same_executed_files():
+    from ldr.previous import same_files
+
+    assert same_files({"app.py": "a"}, {"app.py": "a"})
+    assert not same_files({"app.py": "a"}, {"app.py": "a", "other.py": "b"})
+    assert not same_files({"app.py": "a", "other.py": "b"}, {"app.py": "a"})

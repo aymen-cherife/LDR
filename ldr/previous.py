@@ -166,9 +166,8 @@ def tests_of(connection, run_id: str) -> set[str]:
 
 
 def same_files(before: dict, after: dict) -> bool:
-    """Every file executed by both runs has the same content hash in both."""
-    shared = before.keys() & after.keys()
-    return bool(shared) and all(before[name] == after[name] for name in shared)
+    """Both runs executed the same files with the same content hashes."""
+    return bool(before) and before == after
 
 
 def compare(
@@ -183,7 +182,7 @@ def compare(
 
     For pytest the comparison covers the tests present in both runs (or only ``prefix``, a
     rerun's one test); the others are counted as not compared. ``files`` are the two runs' file
-    hashes: when every file both executed is unchanged, a difference carries the note.
+    hashes: when both runs executed the same unchanged files, a difference carries the note.
     """
     pytest = connection.execute("SELECT 1 FROM run_tests WHERE run_id = ? LIMIT 1", (run_id,)).fetchone() is not None
     ours, theirs = _records(connection, run_id), _records(connection, previous)
