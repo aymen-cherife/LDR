@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from ldr import rerun
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -45,7 +46,6 @@ def mark(value):
 TESTS = """\
 import os
 import app
-from ldr import processes
 
 
 def test_steady():

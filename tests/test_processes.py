@@ -74,16 +74,17 @@ def test_the_helper_runs_a_process_and_returns_its_output():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows creation flags")
-def test_the_supervisor_has_no_window_a_new_process_group_and_breakaway(monkeypatch):
+def test_the_supervisor_has_no_window_a_new_process_group_and_breakaway(monkeypatch, tmp_path):
     from ldr import supervisor
 
     flags = []
 
     class Fake:
+        pid = 0  # no such process: the supervisor's number is looked up and found missing
         stdin = type("S", (), {"write": lambda self, data: None, "close": lambda self: None})()
 
     monkeypatch.setattr(processes.subprocess, "Popen", lambda command, **kwargs: flags.append(kwargs["creationflags"]) or Fake())
-    supervisor._start_real("run-directory", b"{}")
+    supervisor._start_real(str(tmp_path), b"{}")
     assert flags == [0x08000000 | 0x00000200 | 0x01000000]  # no window, new group, breakaway; not DETACHED_PROCESS (0x8)
 
     def refuse_breakaway(command, **kwargs):
@@ -94,5 +95,19 @@ def test_the_supervisor_has_no_window_a_new_process_group_and_breakaway(monkeypa
 
     flags.clear()
     monkeypatch.setattr(processes.subprocess, "Popen", refuse_breakaway)
-    supervisor._start_real("run-directory", b"{}")
+    supervisor._start_real(str(tmp_path), b"{}")
     assert flags == [0x08000000 | 0x00000200 | 0x01000000, 0x08000000 | 0x00000200]
+
+
+def test_a_process_that_does_not_capture_its_output_still_writes_to_ours():
+    # With CREATE_NO_WINDOW a child's console is its own: streams not given would be lost.
+    code = (
+        "import sys\n"
+        "from ldr import processes\n"
+        "processes.run([sys.executable, '-c', \"import sys; print('out-text'); print('err-text', file=sys.stderr)\"])\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+                            env=dict(os.environ, PYTHONPATH=str(REPO)))
+    assert "out-text" in result.stdout and "err-text" in result.stderr, (result.stdout, result.stderr)
+    child = subprocess.run([sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"], input="piped in", capture_output=True, text=True)
+    assert child.stdout == "piped in"

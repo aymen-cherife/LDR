@@ -13,12 +13,12 @@ from contextlib import closing
 from pathlib import Path
 
 from ldr.sqlite_store import TraceStore
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
 TEMPLATE = """\
 import os
-from ldr import processes
 
 
 def f(n):

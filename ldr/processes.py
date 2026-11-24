@@ -10,13 +10,23 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
-def _options(kwargs: dict) -> dict:
+def _options(kwargs: dict, skip: tuple = ()) -> dict:
     if CREATE_NO_WINDOW:
         kwargs["creationflags"] = kwargs.get("creationflags", 0) | CREATE_NO_WINDOW
+        # A process made with CREATE_NO_WINDOW gets a console of its own, and a stream that is not
+        # given explicitly would go to that hidden console and be lost: pass this process's own.
+        for name, stream in (("stdin", sys.__stdin__), ("stdout", sys.__stdout__), ("stderr", sys.__stderr__)):
+            if name not in kwargs and name not in skip and not kwargs.get("capture_output") and not (name == "stdin" and "input" in kwargs):
+                try:
+                    stream.fileno()
+                except (AttributeError, OSError, ValueError):
+                    continue  # no such stream (a program without a console)
+                kwargs[name] = stream
     return kwargs
 
 
@@ -37,4 +47,4 @@ def check_call(command, **kwargs) -> int:
 
 
 def check_output(command, **kwargs):
-    return subprocess.check_output(command, **_options(kwargs))
+    return subprocess.check_output(command, **_options(kwargs, skip=("stdout",)))

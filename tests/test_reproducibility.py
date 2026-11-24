@@ -14,6 +14,7 @@ import pytest
 
 from ldr import reproduce
 from ldr.pytest_capture import RuntimeCapture
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -48,7 +49,6 @@ def test_the_users_hash_seed_is_kept_and_anything_else_is_chosen():
 
 APP_SEED = """\
 import os
-from ldr import processes
 print("SEED", os.environ.get("PYTHONHASHSEED"), os.environ.get("LDR_HASH_SEED_SOURCE"))
 print("ORDER", list({"alpha", "beta", "gamma", "delta", "epsilon"}))
 """

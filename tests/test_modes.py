@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -15,7 +16,6 @@ def f(n):
 """
 TESTS = """\
 import app
-from ldr import processes
 
 
 def test_one():

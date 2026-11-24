@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from ldr import rerun
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -30,7 +31,6 @@ print("lucky", lucky(), "total", total)
 
 CLOCK = """\
 import time
-from ldr import processes
 
 
 def work(n):
