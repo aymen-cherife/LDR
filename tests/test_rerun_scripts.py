@@ -86,3 +86,8 @@ def test_a_script_whose_value_is_the_clock_says_the_difference_is_time_like(tmp_
     assert result.returncode == 5, result.stdout + result.stderr
     assert "time-like" in result.stdout and "clock" in result.stdout
     assert "ldr run app.py --full" in result.stdout
+
+
+def test_rerun_needs_a_match_for_every_compared_call():
+    counts = {"compared": 2, "same": 1, "different": 0, "new": 0, "missing": 0, "not_compared": 1}
+    assert not rerun.verified({"reference": counts})[0]

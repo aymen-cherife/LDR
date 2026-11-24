@@ -125,7 +125,11 @@ def verified(status: dict) -> tuple[bool, str]:
         f"{counts['same']} of {counts['compared']} call(s) matched, {counts['different']} differ, "
         f"{counts['new']} new, {counts['missing']} missing"
     )
-    ok = bool(counts["compared"]) and not (counts["different"] or counts["new"] or counts["missing"])
+    ok = (
+        bool(counts["compared"])
+        and counts["same"] == counts["compared"]
+        and not (counts["different"] or counts["new"] or counts["missing"] or reference.get("not_compared"))
+    )
     return ok, summary
 
 
