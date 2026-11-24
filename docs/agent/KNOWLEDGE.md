@@ -27,6 +27,8 @@ synced to a disk.
 
 Normal work never edits the knowledge folder.
 
+To edit a Drive file, start from a raw download; never write back the normal read, which adds Markdown escapes.
+
 Only when Aymen explicitly asks for a knowledge update during `wrap`:
 
 - You may rewrite `LE-TOPO.md` and `phase-handoff.md`, update the status
