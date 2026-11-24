@@ -641,7 +641,7 @@ class Background:
     def finish(self, state: dict) -> Report | None:
         """After the run: the report with the run's first call (launch to first recorded call)."""
         if self.report is None:
-            self.thread.join(30)
+            self.thread.join()
         report = self.report
         if report is None:
             return None

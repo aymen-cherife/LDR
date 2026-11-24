@@ -92,14 +92,13 @@ def spawn_detached(rundir: str, spec: dict):
     """Start the supervisor so that killing this process, or its whole tree, does not stop it.
 
     The waiting command starts a short-lived launcher, which starts the real supervisor
-    detached, writes its process number into ``state.json`` and exits at once: the supervisor then
-    has no living parent to share a fate with. ``spec`` (what to run) travels through the launcher's
-    stdin to the supervisor's stdin. Returns the launcher's finished process (exit code, stderr).
+    detached, sends its process identity over stdout, and exits. Only the supervisor
+    writes the state file. The run specification travels through stdin.
     """
     command = [sys.executable, "-m", "ldr.supervisor", "--detach", rundir]
     return processes.run(
         command, input=json.dumps(spec).encode("utf-8"),
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
 
 
@@ -121,11 +120,7 @@ def _start_real(rundir: str, spec: bytes) -> None:
     from .machine import process_identity
 
     identity = process_identity(process.pid)
-    try:
-        with open(os.path.join(rundir, "state.json"), "x", encoding="utf-8") as handle:  # the supervisor may have written it
-            json.dump({"state": "starting", "pid": process.pid, "pid_start": identity[0] if identity else None}, handle)
-    except FileExistsError:
-        pass
+    print(json.dumps({"pid": process.pid, "pid_start": identity[0] if identity else None}), flush=True)
 
 
 def _pump(stream, path: str) -> None:

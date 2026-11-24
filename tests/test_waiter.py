@@ -27,7 +27,9 @@ def stub_launcher(monkeypatch, make):
     """Replace the launcher: ``make(rundir)`` writes what the launcher would, returns (code, stderr)."""
     def spawn(rundir, spec):
         code, stderr = make(Path(rundir))
-        return type("Launch", (), {"returncode": code, "stderr": stderr})()
+        state = supervisor.read_state(rundir) or {}
+        identity = {key: state[key] for key in ("pid", "pid_start") if key in state}
+        return processes.subprocess.CompletedProcess([], code, json.dumps(identity).encode(), stderr)
     monkeypatch.setattr(waiter, "spawn_detached", spawn)
 
 
@@ -39,18 +41,19 @@ def test_a_normal_run_returns_the_programs_exit_code(tmp_path):
     assert state["state"] == "finished" and state["pid"] and state["pid_start"]
 
 
-def test_the_launcher_writes_the_supervisors_pid_before_it_exits(tmp_path):
+def test_the_launcher_reports_the_supervisors_pid_before_it_exits(tmp_path):
     rundir = tmp_path / ".ldr" / "runs" / "r1"
     rundir.mkdir(parents=True)
     (tmp_path / "app.py").write_text("import time\n\n\ndef f():\n    time.sleep(30)\n\n\nf()\n", encoding="utf-8")
     spec = {"argv": ["run", "app.py"], "project_root": str(tmp_path), "cwd": str(tmp_path), "env": dict(ENV), "started": time.time()}
     launch = supervisor.spawn_detached(str(rundir), spec)
-    state = json.loads((rundir / "state.json").read_text(encoding="utf-8"))
+    identity = json.loads(launch.stdout)
     try:
         assert launch.returncode == 0
-        assert state["pid"] and machine.process_identity(state["pid"]) is not None  # written, and alive
+        assert identity["pid"] and machine.process_identity(identity["pid"]) is not None
     finally:
-        for pid in (state.get("pid"), json.loads((rundir / "state.json").read_text(encoding="utf-8")).get("program_pid")):
+        state = supervisor.read_state(rundir) or {}
+        for pid in (state.get("program_pid"), identity.get("pid")):
             if pid:
                 processes.run(["taskkill", "/PID", str(pid), "/F", "/T"] if os.name == "nt" else ["kill", str(pid)], capture_output=True)
 
@@ -190,3 +193,49 @@ def test_killing_the_waiting_commands_whole_tree_does_not_stop_the_run(tmp_path)
             break
         time.sleep(0.5)
     assert state.get("state") == "finished" and state.get("exit_code") == 0
+
+
+def miss_first_state_read(directory, env):
+    """Model a state file that cannot be opened during the launcher handoff."""
+    (directory / "sitecustomize.py").write_text(
+        "import sys\n"
+        "if sys.orig_argv[1:3] in (['-m', 'ldr'], ['-m', 'ldr.cli']):\n"
+        "    from ldr import waiter\n"
+        "    read_state = waiter.read_state\n"
+        "    def miss_once(directory):\n"
+        "        waiter.read_state = read_state\n"
+        "        return None\n"
+        "    waiter.read_state = miss_once\n",
+        encoding="utf-8",
+    )
+    env["PYTHONPATH"] = os.pathsep.join((str(directory), env["PYTHONPATH"]))
+
+
+def test_a_check_ready_only_at_run_end_is_printed_once(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    class EndOnlyCheck:
+        printed = False
+        report = None
+
+        def ready(self):
+            return self.report is not None
+
+        def print_once(self, state):
+            if self.ready() and not self.printed:
+                print("[ldr] machine: ready")
+                self.printed = True
+
+        def finish(self, state):
+            self.report = object()
+            return self.report
+
+    def make(rundir):
+        write_state(rundir, state="finished", pid=os.getpid(), exit_code=7)
+        return 0, b""
+
+    stub_launcher(monkeypatch, make)
+    monkeypatch.setattr(machine, "Background", lambda *args: EndOnlyCheck())
+    monkeypatch.setattr(machine, "save", lambda *args, **kwargs: None)
+    assert waiter.run(["run", "app.py"], str(tmp_path)) == 7
+    assert capsys.readouterr().out.count("[ldr] machine: ready") == 1

@@ -5,6 +5,7 @@ so killing this process does not stop the run.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -97,14 +98,18 @@ def run(argv: list[str], project_root: str) -> int:
     check = machine.Background(ldr_dir, keep_runs(project_root))  # beside the run's start: nothing waits for it
     launch = spawn_detached(rundir, {"argv": argv, "project_root": project_root, "cwd": cwd,
                                      "env": dict(os.environ), "started": started})
-    state = read_state(rundir) or {}
-    if launch.returncode != 0 or not state.get("pid"):
+    try:
+        identity = json.loads(launch.stdout or b"{}")
+    except (ValueError, UnicodeError):
+        identity = {}
+    if launch.returncode != 0 or not identity.get("pid"):
         reason = f"exit {launch.returncode}" if launch.returncode != 0 else "it wrote no process number"
         detail = (launch.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-1:]
         print(f"LDR: the launcher of run {run_id} failed ({reason}{': ' + detail[0] if detail else ''}); the run did not start (see {rundir})",
               file=sys.stderr)
         return 2
 
+    state = {"state": "starting", **identity}
     out, err = _Tail(os.path.join(rundir, "stdout.log"), sys.stdout), _Tail(os.path.join(rundir, "stderr.log"), sys.stderr)
     interactive = bool(getattr(sys.stderr, "isatty", lambda: False)())
     next_progress = time.time() + PROGRESS_EVERY
@@ -136,7 +141,7 @@ def run(argv: list[str], project_root: str) -> int:
                 if state.get("state") == "finished":
                     break
                 print(f"LDR: the supervisor of run {run_id} is gone without a result (see {rundir})", file=sys.stderr)
-                return 2
+                break
             if not interactive and time.time() >= next_progress:
                 next_progress = time.time() + PROGRESS_EVERY
                 print(describe_progress(state), file=sys.stderr, flush=True)
@@ -155,10 +160,10 @@ def run(argv: list[str], project_root: str) -> int:
                 connection.close()
             except OSError:
                 pass
-    check.print_once(state)
     if state.get("message"):
         print(state["message"], file=sys.stderr)
     report = check.finish(state)
+    check.print_once(state)
     if report is not None:
         machine.save(ldr_dir, report, merge_after=started)
     return int(state.get("exit_code", 2))

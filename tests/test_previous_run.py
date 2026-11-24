@@ -35,10 +35,15 @@ for index in range(30):
 """
 
 
-def ldr(project, *args, expected=0):
+def ldr(project, *args, expected=0, miss_state=False):
+    env = dict(os.environ, PYTHONPATH=str(REPO))
+    if miss_state:
+        from test_waiter import miss_first_state_read
+
+        miss_first_state_read(project, env)
     result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
-        env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
+        env=env, capture_output=True, text=True, timeout=300,
     )
     assert result.returncode == expected, result.stdout + result.stderr
     return result
@@ -169,7 +174,7 @@ def test_the_number_of_runs_kept_is_a_setting(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[tool.ldr.storage]\nkeep_runs = 3\n", encoding="utf-8")
     write(tmp_path)
     for _ in range(5):
-        ldr(tmp_path, "run", "app.py")
+        ldr(tmp_path, "run", "app.py", miss_state=True)
     assert len(runs(tmp_path)) == 3
 
 

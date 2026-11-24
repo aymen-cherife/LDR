@@ -525,6 +525,9 @@ def test_entry_file_failure_is_never_hidden_by_only(tmp_path):
         "    assert double(3) == 999  # deliberately wrong\n" % tmp_path
     )
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
+    from test_waiter import miss_first_state_read
+
+    miss_first_state_read(tmp_path, env)
     r = processes.run(
         [sys.executable, "-m", "ldr.cli", "pytest", str(test_file),
          "--only", str(lib)],  # scope excludes the test file on purpose
