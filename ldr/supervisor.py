@@ -200,6 +200,7 @@ def supervise(rundir: str) -> int:
         said.append(f"LDR could not supervise the run: {type(exc).__name__}: {exc}")
     for thread in pumps:
         thread.join(10)
+    child_ended_at = time.time()
     sink = holder.get("sink")
     run_id = None
     if sink is not None and sink.main_run:
@@ -220,7 +221,7 @@ def supervise(rundir: str) -> int:
         said.append(f"LDR could not clean dead runs: {type(exc).__name__}: {exc}")
     state.update(
         state="finished", exit_code=code, message="\n".join(said) or None, ended_at=time.time(),
-        store_run_id=run_id,
+        store_run_id=run_id, child_ended_at=child_ended_at, pruned_at=time.time(),
     )
     prune(ldr_dir)
     return code

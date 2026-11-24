@@ -1371,6 +1371,7 @@ def main(argv=None) -> int:
         print(message, file=sys.stderr)
         return 2
     execution_finished = time.perf_counter()
+    execution_finished_at = time.time()
 
     missing_workers = pytest_capture.merge() if pytest_capture and pytest_capture.workers else []
     status = _status(recorder)
@@ -1475,8 +1476,10 @@ def main(argv=None) -> int:
             status["hot_functions"] = slowdown_report.hot_functions(calls, costs, seconds)
             status["hot_functions_of"] = status["call_stream"]["started"]
             if requested_mode in {"run", "pytest", "module"}:
+                compared_at = time.perf_counter()
                 if comparison := _compare_with_previous(store, rerun_plan, executed):
                     status["reference"] = comparison
+                status["timing"]["comparison_seconds"] = round(time.perf_counter() - compared_at, 6)
             status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1
             status["call_stream"]["summaries"] = len(stream_summaries)
             status["call_stream"]["capture_lines"] = store.capture_lines
@@ -1645,6 +1648,7 @@ def main(argv=None) -> int:
         status["timing"].update(
             {
                 "postprocess_seconds": round(time.perf_counter() - execution_finished, 6),
+                "execution_finished_at": execution_finished_at,
                 "total_seconds": round(time.perf_counter() - total_started, 6),
             }
         )
@@ -1778,6 +1782,7 @@ def main(argv=None) -> int:
     status["timing"].update(
         {
             "postprocess_seconds": round(time.perf_counter() - execution_finished, 6),
+            "execution_finished_at": execution_finished_at,
             "total_seconds": round(time.perf_counter() - total_started, 6),
         }
     )
