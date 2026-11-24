@@ -174,3 +174,34 @@ def test_the_number_of_runs_kept_is_a_setting(tmp_path):
 
 def test_the_previous_run_is_never_held_in_memory():
     assert not hasattr(TraceStore, "read_reference")
+
+
+def test_the_lookup_of_one_call_uses_the_index_and_does_not_scan_the_previous_run(tmp_path):
+    # Without the index a lookup reads every call of the run: a second run of a large program
+    # took 12 times as long as the first.
+    from ldr.previous import Lookup
+
+    write(tmp_path)
+    ldr(tmp_path, "run", "app.py")
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        run, address = connection.execute("SELECT run_id, frame_id FROM call_records LIMIT 1").fetchone()
+        plan = " ".join(
+            row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + Lookup.QUERY, (run, address))
+        )
+    assert "call_records_frame" in plan and "SCAN" not in plan, plan
+    assert "frame_id=?" in plan, plan  # both equalities are used: the search is by address, not by run
+
+
+def test_a_lookup_answers_with_the_signature_of_the_call_at_that_address(tmp_path):
+    from ldr.previous import Lookup
+
+    write(tmp_path)
+    ldr(tmp_path, "run", "app.py")
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        run, address, signature = connection.execute("SELECT run_id, frame_id, signature FROM call_records LIMIT 1").fetchone()
+    lookup = Lookup(str(tmp_path / ".ldr" / "traces.sqlite3"), run)
+    try:
+        assert lookup.signature(address) == bytes(signature)
+        assert lookup.signature(address + "x") is None
+    finally:
+        lookup.close()

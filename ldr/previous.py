@@ -125,6 +125,13 @@ def provisional_run(connection, run_id: str) -> tuple[str | None, list[str] | No
 class Lookup:
     """Per-call questions to the previous run, answered by SQLite (never held in memory)."""
 
+    # Without INDEXED BY, SQLite searches the run by the primary key's first column and reads
+    # every call of the run for each lookup: a second run took 12 times as long as the first.
+    QUERY = (
+        "SELECT signature FROM call_records INDEXED BY call_records_frame "
+        "WHERE run_id = ? AND frame_id = ? LIMIT 1"
+    )
+
     def __init__(self, path: str, run_id: str, roots=None, timeout: float = 30):
         self.run_id = run_id
         self.roots = frozenset(roots) if roots is not None else None
@@ -136,10 +143,7 @@ class Lookup:
         return self.roots is None or root_of(frame_id) in self.roots
 
     def signature(self, frame_id: str):
-        row = self.connection.execute(
-            "SELECT signature FROM call_records WHERE run_id = ? AND frame_id = ? LIMIT 1",
-            (self.run_id, frame_id),
-        ).fetchone()
+        row = self.connection.execute(self.QUERY, (self.run_id, frame_id)).fetchone()
         return None if row is None else bytes(row[0])
 
     def close(self) -> None:
