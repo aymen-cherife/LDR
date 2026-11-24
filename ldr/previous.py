@@ -7,9 +7,8 @@ Every run is compared with the previous run of the same target (n against n-1):
 * any other run is compared with the latest earlier run of exactly the same command (runner,
   target, arguments and ``--only``; the scope LDR infers is not part of it).
 
-Nothing here holds the previous run in memory. While the program runs, each finished call asks
-SQLite for the signature of the call at the same address (``Lookup``); after the run, the whole
-comparison is a join between the two runs' rows (``compare``).
+The recorder loads the previous run's signatures once and looks them up in memory.
+The final report compares the two runs' rows in SQLite.
 """
 
 from __future__ import annotations

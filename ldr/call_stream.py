@@ -83,7 +83,6 @@ class CallStream:
         self.deep_bytes_in_flight = 0
         self.committed_deep_bytes = 0
         self.boundaries = BoundaryStream(store, worker) if store.max_boundary_bytes else None
-        # The previous run is asked about each finished call in SQLite; none of it is held here.
         self.previous = None  # the previous run's signatures by address (previous.Previous)
         self.previous_error = None
         self.previous_load_s = None
