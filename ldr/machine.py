@@ -347,7 +347,7 @@ def supervisor_alive(state: dict) -> bool:
 
 def scan_runs(ldr_dir: str) -> dict:
     """The runs in .ldr/runs: {"live": [...], "dead": [...], "unstarted": [...]} (run directories)."""
-    result = {"live": [], "dead": [], "unstarted": [], "owned": {}}
+    result = {"live": [], "dead": [], "unstarted": [], "owned": {}, "dead_ids": set()}
     base = os.path.join(ldr_dir, "runs")
     try:
         names = os.listdir(base)
@@ -364,6 +364,8 @@ def scan_runs(ldr_dir: str) -> dict:
         if state.get("store_run_id"):
             result["owned"][state["store_run_id"]] = name
         if state.get("state") == "finished":
+            if state.get("dead") and state.get("store_run_id"):
+                result["dead_ids"].add(state["store_run_id"])
             continue
         (result["live"] if supervisor_alive(state) else result["dead"]).append(directory)
     return result
@@ -374,7 +376,7 @@ def mark_dead(directory: str) -> str | None:
     path = os.path.join(directory, "state.json")
     with open(path, encoding="utf-8") as handle:
         state = json.load(handle)
-    state.update(state="finished", exit_code=2, ended_at=time.time(),
+    state.update(state="finished", dead=True, exit_code=2, ended_at=time.time(),
                  message="LDR marked this run dead: its supervisor process was gone without a result (ldr check_machine)")
     temporary = f"{path}.{os.getpid()}.tmp"
     with open(temporary, "w", encoding="utf-8") as handle:
@@ -403,7 +405,7 @@ def clean_dead(ldr_dir: str, scan: dict, report: Report, *, rows: bool) -> None:
 
     A row of an unfinished run is deleted when the run's own state says its supervisor is dead, or
     when it belongs to no run directory and nothing is alive or starting that could have made it."""
-    dead_ids = []
+    dead_ids = set(scan["dead_ids"])
     for directory in scan["dead"]:
         try:
             owned = mark_dead(directory)
@@ -411,7 +413,7 @@ def clean_dead(ldr_dir: str, scan: dict, report: Report, *, rows: bool) -> None:
             continue
         report.fixes.append(f"marked dead run {os.path.basename(directory)} finished (its supervisor was gone)")
         if owned:
-            dead_ids.append(owned)
+            dead_ids.add(owned)
     database = os.path.join(ldr_dir, "traces.sqlite3")
     if not rows or not os.path.exists(database):
         return

@@ -375,3 +375,15 @@ def test_a_check_that_fails_does_not_fail_the_run(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "the check failed" in result.stderr and "check broke" in result.stderr
+
+
+def test_a_later_check_removes_rows_of_a_run_already_marked_dead(ldr_dir):
+    with closing(database(ldr_dir)) as connection:
+        add_run(connection, "dead", finished=False)
+    write_state(ldr_dir, "dead", state="running", pid=0, store_run_id="dead")
+    quick(ldr_dir, context="run")
+
+    quick(ldr_dir)
+
+    with closing(sqlite3.connect(ldr_dir / "traces.sqlite3")) as connection:
+        assert connection.execute("SELECT id FROM runs").fetchall() == []
