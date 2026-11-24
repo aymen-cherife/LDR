@@ -1,8 +1,9 @@
-"""SQLite persistence for bounded, already-captured trace trees."""
+"""SQLite persistence for recorded calls and trace trees."""
 
 import json
 import marshal
 import os
+import shutil
 import sqlite3
 import tomllib
 from contextlib import closing
@@ -13,30 +14,14 @@ from time import monotonic, sleep, time_ns
 from uuid import uuid4
 
 from .fingerprint import DEFAULT_WALK_CEILING, is_digest
-from .node import Node
+from .node import Node, capture_error
 
 DEFAULT_BATCH_SIZE = 1000
 DEFAULT_BUSY_TIMEOUT = 30
-DEFAULT_TRACE_BYTES = 16 * 1024 * 1024
 # Phase 2 rule 2. Placeholders, TO MEASURE: detail for the first N calls of each
 # function, and (on demand, later) the last K.
 DEFAULT_FIRST_CALLS = 8
 DEFAULT_LAST_CALLS = 3
-# Placeholders, TO MEASURE. The hard cap defaults to four times the normal detail
-# budget. The ceiling is the number of calls after which a run stops recording.
-DEFAULT_HARD_CAP_FACTOR = 4
-DEFAULT_MAX_RECORDED_CALLS = 10_000_000
-# Why a call kept detail, lowest priority first. A higher rank may use more of the
-# space between max_trace_bytes and hard_cap_bytes (rank 4 may use all of it).
-DETAIL_RANK = {
-    "first N": 0,
-    "deep": 1,
-    "first call": 1,
-    "new shape": 2,
-    "differs from reference": 3,
-    "exception": 4,
-    "full": 4,  # a rerun of one test keeps every call of it
-}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, started_ns INTEGER NOT NULL, invocation TEXT NOT NULL, status TEXT
@@ -151,6 +136,31 @@ CREATE TABLE IF NOT EXISTS run_sections (
 VALUE_FIELDS = ("in", "out", "in_fp", "out_fp", "input_changes")
 
 
+def recording_failure(path, error, calls, address):
+    try:
+        free = shutil.disk_usage(Path(path).parent).free
+    except OSError:
+        free = None
+    return {
+        "error": capture_error(error),
+        "calls_recorded": calls,
+        "last_address": address,
+        "free_disk_bytes": free,
+        "next_command": "ldr check_machine",
+    }
+
+
+def recording_failure_text(failure):
+    free = failure["free_disk_bytes"]
+    space = f"{free:,} bytes free" if free is not None else "free disk space unavailable"
+    address = failure["last_address"] or "(no call recorded)"
+    return (
+        f"RECORDING INCOMPLETE: {failure['error']}. {failure['calls_recorded']:,} call(s) recorded. "
+        f"Last address: {address}. Disk: {space}. Run {failure['next_command']}, resolve the write "
+        "failure, then replay the original run command."
+    )
+
+
 def _journal_mode():
     # Older SQLite can corrupt a WAL database when writers race a checkpoint.
     # https://sqlite.org/wal.html#the_wal_reset_bug
@@ -179,68 +189,25 @@ def storage_settings(project_root, *, deep=False, boundary=False):
             raise TypeError("[tool.ldr.storage] must be a table")
     batch_size = settings.get("batch_size", DEFAULT_BATCH_SIZE)
     busy_timeout = settings.get("busy_timeout", DEFAULT_BUSY_TIMEOUT)
-    max_trace_bytes = settings.get("max_trace_bytes", DEFAULT_TRACE_BYTES)
     capture_lines = settings.get("capture_lines", False)
-    max_value_bytes = settings.get("max_value_bytes", 0)
     first_calls = settings.get("first_calls", DEFAULT_FIRST_CALLS)
     last_calls = settings.get("last_calls", DEFAULT_LAST_CALLS)
     if type(first_calls) is not int or not 0 < first_calls < 2**31:
         raise ValueError("[tool.ldr.storage] first_calls must be a positive integer")
     if type(last_calls) is not int or not 0 <= last_calls < 2**31:
         raise ValueError("[tool.ldr.storage] last_calls must be a nonnegative integer")
-    hard_cap_bytes = settings.get("hard_cap_bytes")
-    max_recorded_calls = settings.get("max_recorded_calls", DEFAULT_MAX_RECORDED_CALLS)
     walk_ceiling = settings.get("walk_ceiling", DEFAULT_WALK_CEILING)
     if type(walk_ceiling) is not int or not 0 <= walk_ceiling < 2**31:
         raise ValueError("[tool.ldr.storage] walk_ceiling must be a nonnegative integer (0 = no ceiling)")
-    if hard_cap_bytes is not None and (
-        type(hard_cap_bytes) is not int or not 0 < hard_cap_bytes < 2**63
-    ):
-        raise ValueError("[tool.ldr.storage] hard_cap_bytes must be a positive integer")
-    if type(max_recorded_calls) is not int or not 0 < max_recorded_calls < 2**63:
-        raise ValueError("[tool.ldr.storage] max_recorded_calls must be a positive integer")
     for name, value in (
         ("batch_size", batch_size),
         ("busy_timeout", busy_timeout),
-        ("max_trace_bytes", max_trace_bytes),
     ):
         if type(value) is not int or not 0 < value < 2**63:
             raise ValueError(f"[tool.ldr.storage] {name} must be a positive integer")
     if type(capture_lines) is not bool:
         raise TypeError("[tool.ldr.storage] capture_lines must be true or false")
-    if capture_lines and "max_trace_bytes" not in settings:
-        raise ValueError(
-            "[tool.ldr.storage] capture_lines requires an explicit max_trace_bytes"
-        )
-    if type(max_value_bytes) is not int or not 0 <= max_value_bytes < 2**63:
-        raise ValueError(
-            "[tool.ldr.storage] max_value_bytes must be a nonnegative integer"
-        )
-    if max_value_bytes and (
-        "max_trace_bytes" not in settings or max_value_bytes > max_trace_bytes
-    ):
-        raise ValueError(
-            "[tool.ldr.storage] max_value_bytes requires an explicit max_trace_bytes at least as large"
-        )
-    allowance = {}
-    for flag, active in (("deep", deep), ("boundary", boundary)):
-        name = f"max_{flag}_bytes"
-        value = settings.get(name, 0)
-        if type(value) is not int or not 0 <= value < 2**63:
-            raise ValueError(f"[tool.ldr.storage] {name} must be a nonnegative integer")
-        if active and (
-            "max_trace_bytes" not in settings or not 0 < value <= max_trace_bytes
-        ):
-            raise ValueError(
-                f"--{flag} requires explicit [tool.ldr.storage] {name} and max_trace_bytes "
-                f"with 0 < {name} <= max_trace_bytes"
-            )
-        allowance[flag] = value if active else 0
-    return (
-        batch_size, busy_timeout, max_trace_bytes, capture_lines, max_value_bytes,
-        allowance["deep"], allowance["boundary"], first_calls, last_calls,
-        hard_cap_bytes, max_recorded_calls, walk_ceiling or None,
-    )
+    return batch_size, busy_timeout, capture_lines, deep, boundary, first_calls, last_calls, walk_ceiling or None
 
 
 def _timeline(timeline):
@@ -273,15 +240,11 @@ class TraceStore:
         run_id,
         batch_size,
         busy_timeout,
-        max_trace_bytes=DEFAULT_TRACE_BYTES,
         capture_lines=False,
-        max_value_bytes=0,
-        max_deep_bytes=0,
-        max_boundary_bytes=0,
+        capture_deep=False,
+        capture_boundaries=False,
         first_calls=DEFAULT_FIRST_CALLS,
         last_calls=DEFAULT_LAST_CALLS,
-        hard_cap_bytes=None,
-        max_recorded_calls=DEFAULT_MAX_RECORDED_CALLS,
         reference_run=None,
         walk_ceiling=DEFAULT_WALK_CEILING,
         reference_roots=None,
@@ -290,17 +253,11 @@ class TraceStore:
         self.run_id = run_id
         self.batch_size = batch_size
         self.busy_timeout = busy_timeout
-        self.max_trace_bytes = max_trace_bytes
         self.capture_lines = capture_lines
-        self.max_value_bytes = max_value_bytes
-        self.max_deep_bytes = max_deep_bytes
-        self.max_boundary_bytes = max_boundary_bytes
+        self.capture_deep = capture_deep
+        self.capture_boundaries = capture_boundaries
         self.first_calls = first_calls
         self.last_calls = last_calls
-        self.hard_cap_bytes = max(
-            hard_cap_bytes or DEFAULT_HARD_CAP_FACTOR * max_trace_bytes, max_trace_bytes
-        )
-        self.max_recorded_calls = max_recorded_calls
         # The run whose per-call fingerprints each live call is compared with.
         self.reference_run = reference_run
         # The tests of that run that this run is compared with (pytest), or None for all calls.
@@ -315,15 +272,11 @@ class TraceStore:
         invocation,
         batch_size,
         busy_timeout,
-        max_trace_bytes=DEFAULT_TRACE_BYTES,
         capture_lines=False,
-        max_value_bytes=0,
-        max_deep_bytes=0,
-        max_boundary_bytes=0,
+        capture_deep=False,
+        capture_boundaries=False,
         first_calls=DEFAULT_FIRST_CALLS,
         last_calls=DEFAULT_LAST_CALLS,
-        hard_cap_bytes=None,
-        max_recorded_calls=DEFAULT_MAX_RECORDED_CALLS,
         walk_ceiling=DEFAULT_WALK_CEILING,
     ):
         directory = Path(directory)
@@ -341,15 +294,11 @@ class TraceStore:
             uuid4().hex,
             batch_size,
             busy_timeout,
-            max_trace_bytes,
             capture_lines,
-            max_value_bytes,
-            max_deep_bytes,
-            max_boundary_bytes,
+            capture_deep,
+            capture_boundaries,
             first_calls,
             last_calls,
-            hard_cap_bytes,
-            max_recorded_calls,
             walk_ceiling=walk_ceiling,
         )
         with closing(store._connect(allow_mode_change=True)) as connection:
@@ -382,138 +331,41 @@ class TraceStore:
                     "INSERT INTO runs VALUES (?, ?, ?, NULL)",
                     (store.run_id, time_ns(), _json(invocation)),
                 )
-                connection.execute(
-                    "INSERT INTO stream_budget (run_id) VALUES (?)", (store.run_id,)
-                )
-                if store.max_value_bytes:
-                    connection.execute(
-                        "INSERT INTO stream_value_budget (run_id) VALUES (?)",
-                        (store.run_id,),
-                    )
-                if store.max_deep_bytes:
-                    connection.execute(
-                        "INSERT INTO stream_deep_budget (run_id) VALUES (?)", (store.run_id,)
-                    )
-                if store.max_boundary_bytes:
-                    connection.execute(
-                        "INSERT INTO stream_boundary_budget (run_id) VALUES (?)", (store.run_id,)
-                    )
         return store
 
-    def plan_detail(self, rows, used, value_used, deep_used):
-        """Decide which detail rows, value bodies and deep steps fit, without writing.
-
-        Detail kept only because it is one of the first N must fit the normal
-        budget (``max_trace_bytes``). Each keep rule has a higher limit, up to
-        ``hard_cap_bytes`` for exceptions, so when space runs out the lower
-        priorities are dropped first. The writer and a child that only sends its
-        records use this same plan, so both reach the same counts.
-        """
-        span = max(0, self.hard_cap_bytes - self.max_trace_bytes)
-        kept = []
-        dropped = {}
-        for row in rows:
-            ordinal, frame_id, parent, payload, _, _, reason = row
-            size = len(payload) + len(frame_id.encode("utf-8", "surrogatepass"))
-            limit = self.max_trace_bytes + span * DETAIL_RANK.get(reason, 0) // 4
-            if used + size > limit:
-                dropped[reason] = dropped.get(reason, 0) + 1
-                continue
-            used += size
-            kept.append(row)
-        values = []
-        if self.max_value_bytes:
-            for ordinal, _, _, _, data, _, _ in kept:
-                for phase, name, blob in data:
-                    if (
-                        value_used + len(blob) <= self.max_value_bytes
-                        and used + len(blob) <= self.hard_cap_bytes
-                    ):
-                        values.append((ordinal, phase, name, blob))
-                        used += len(blob)
-                        value_used += len(blob)
-        deep = []
-        if self.max_deep_bytes:
-            limit = min(self.hard_cap_bytes - used, self.max_deep_bytes - deep_used)
-            added = 0
-            for ordinal, _, _, _, _, timeline, _ in kept:
-                if timeline is None:
-                    continue
-                observed, steps = _timeline(timeline)
-                retained = []
-                for data in steps:
-                    if added + len(data) > limit:
-                        break
-                    retained.append(data)
-                    added += len(data)
-                deep.append((ordinal, observed, retained))
-            deep_used += added
-            used += added
-        return kept, dropped, values, deep, used, value_used, deep_used
-
     def append_stream(self, worker, rows, fingerprints=(), sizes=()):
-        """Write every fingerprint row, and the detail that fits (see ``plan_detail``)."""
+        """Commit one batch of fingerprints and all selected detail."""
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             self._append_fingerprints(connection, worker, fingerprints)
-            if sizes:
-                connection.executemany(
-                    "INSERT INTO value_sizes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [(self.run_id, worker, *size) for size in sizes],
-                )
-            used, value_used, deep_used = self._budgets(connection)
-            kept, dropped, values, deep, used, value_used, deep_used = self.plan_detail(
-                rows, used, value_used, deep_used
+            connection.executemany(
+                "INSERT INTO value_sizes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [(self.run_id, worker, *size) for size in sizes],
             )
             connection.executemany(
                 "INSERT INTO stream_calls VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                    (self.run_id, worker, ordinal, frame_id, parent, payload)
-                    for ordinal, frame_id, parent, payload, _, _, _ in kept
-                ],
+                [(self.run_id, worker, ordinal, address, parent, payload)
+                 for ordinal, address, parent, payload, _, _ in rows],
             )
-            if self.max_value_bytes:
+            connection.executemany(
+                "INSERT INTO stream_values VALUES (?, ?, ?, ?, ?, ?)",
+                [(self.run_id, worker, ordinal, phase, name, blob)
+                 for ordinal, _, _, _, values, _ in rows for phase, name, blob in values],
+            )
+            for ordinal, _, _, _, _, timeline in rows:
+                if timeline is None:
+                    continue
+                observed, steps = _timeline(timeline)
+                key = (self.run_id, worker, ordinal)
+                connection.execute(
+                    "INSERT INTO stream_deep_frames VALUES (?, ?, ?, ?, ?)",
+                    (*key, observed, len(steps)),
+                )
                 connection.executemany(
-                    "INSERT INTO stream_values VALUES (?, ?, ?, ?, ?, ?)",
-                    [(self.run_id, worker, *value) for value in values],
+                    "INSERT INTO stream_deep_steps VALUES (?, ?, ?, ?, ?)",
+                    [(*key, index, data) for index, data in enumerate(steps, 1)],
                 )
-                connection.execute(
-                    "UPDATE stream_value_budget SET used_bytes = ? WHERE run_id = ?",
-                    (value_used, self.run_id),
-                )
-            if self.max_deep_bytes:
-                for ordinal, observed, retained in deep:
-                    key = (self.run_id, worker, ordinal)
-                    connection.execute(
-                        "INSERT INTO stream_deep_frames VALUES (?, ?, ?, ?, ?)",
-                        (*key, observed, len(retained)),
-                    )
-                    connection.executemany(
-                        "INSERT INTO stream_deep_steps VALUES (?, ?, ?, ?, ?)",
-                        [(*key, index, data) for index, data in enumerate(retained, 1)],
-                    )
-                connection.execute(
-                    "UPDATE stream_deep_budget SET used_bytes = ? WHERE run_id = ?",
-                    (deep_used, self.run_id),
-                )
-            connection.execute(
-                "UPDATE stream_budget SET used_bytes = ? WHERE run_id = ?",
-                (used, self.run_id),
-            )
-        return len(kept), value_used, deep_used, dropped
-
-    def _budgets(self, connection):
-        def read(table):
-            row = connection.execute(
-                f"SELECT used_bytes FROM {table} WHERE run_id = ?", (self.run_id,)
-            ).fetchone()
-            return row[0] if row else 0
-
-        return (
-            read("stream_budget"),
-            read("stream_value_budget") if self.max_value_bytes else 0,
-            read("stream_deep_budget") if self.max_deep_bytes else 0,
-        )
+        return len(rows)
 
     def _append_fingerprints(self, connection, worker, fingerprints):
         """One packed record per call, and a lookup row per argument and return digest.
@@ -571,48 +423,22 @@ class TraceStore:
                 (self.run_id,),
             ).fetchone()
             (size,) = connection.execute(
-                "SELECT used_bytes FROM stream_deep_budget WHERE run_id = ?", (self.run_id,)
+                "SELECT COALESCE(SUM(length(payload)), 0) FROM stream_deep_steps WHERE run_id = ?", (self.run_id,)
             ).fetchone()
         return {"frames": stored, "retained": retained, "bytes": size}
 
-    def plan_boundaries(self, rows, used, boundary_used):
-        limit = min(self.max_trace_bytes - used, self.max_boundary_bytes - boundary_used)
-        added = 0
-        admitted = []
-        for ordinal, payload in rows:
-            if added + len(payload) > limit:
-                continue
-            added += len(payload)
-            admitted.append((ordinal, payload))
-        return admitted, added
-
     def append_boundaries(self, worker, rows):
         with closing(self._connect()) as connection, connection:
-            connection.execute("BEGIN IMMEDIATE")
-            (used,) = connection.execute(
-                "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (self.run_id,)
-            ).fetchone()
-            (boundary_used,) = connection.execute(
-                "SELECT used_bytes FROM stream_boundary_budget WHERE run_id = ?", (self.run_id,)
-            ).fetchone()
-            admitted, added = self.plan_boundaries(rows, used, boundary_used)
             connection.executemany(
                 "INSERT INTO stream_boundaries VALUES (?, ?, ?, ?)",
-                [(self.run_id, worker, ordinal, payload) for ordinal, payload in admitted],
+                [(self.run_id, worker, ordinal, payload) for ordinal, payload in rows],
             )
-            connection.execute(
-                "UPDATE stream_budget SET used_bytes = ? WHERE run_id = ?", (used + added, self.run_id)
-            )
-            connection.execute(
-                "UPDATE stream_boundary_budget SET used_bytes = ? WHERE run_id = ?",
-                (boundary_used + added, self.run_id),
-            )
-        return len(admitted), boundary_used + added, self.max_trace_bytes - used - added
+        return len(rows)
 
     def boundary_bytes_used(self):
         with closing(self._connect()) as connection:
             (used,) = connection.execute(
-                "SELECT used_bytes FROM stream_boundary_budget WHERE run_id = ?", (self.run_id,)
+                "SELECT COALESCE(SUM(length(payload)), 0) FROM stream_boundaries WHERE run_id = ?", (self.run_id,)
             ).fetchone()
         return used
 
@@ -830,7 +656,7 @@ class TraceStore:
     def value_bytes_used(self):
         with closing(self._connect()) as connection:
             (used,) = connection.execute(
-                "SELECT used_bytes FROM stream_value_budget WHERE run_id = ?",
+                "SELECT COALESCE(SUM(length(payload)), 0) FROM stream_values WHERE run_id = ?",
                 (self.run_id,),
             ).fetchone()
         return used

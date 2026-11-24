@@ -1,13 +1,10 @@
-"""Bounded, typed JSON for complete values already fingerprinted by LDR."""
+"""Typed JSON for complete values already fingerprinted by LDR."""
 
 import json
 import math
 
-from .fingerprint import DEFAULT_BUDGET, PARTIAL_MARK, REDACTED, is_digest
+from .fingerprint import PARTIAL_MARK, REDACTED, is_digest
 from .redact import contains_secret, is_secret_name
-
-# Full value retention keeps its own node limit; the fingerprint walk has none.
-VALUE_NODE_LIMIT = 10_000
 
 # Shared, so each value does not build its own encoder. Same bytes as json.dumps.
 _ENCODER = json.JSONEncoder(separators=(",", ":"), allow_nan=False)
@@ -34,30 +31,18 @@ def _json(value):
 
 
 class _Encoder:
-    def __init__(self, limit):
-        self.limit = limit
+    def __init__(self):
         self.data = bytearray()
         self.ancestors = []
-        self.nodes = 0
 
     def write(self, data):
-        if len(self.data) + len(data) > self.limit:
-            raise _Incomplete
         self.data.extend(data)
 
     def check_text(self, value):
-        if len(value) > self.limit - len(self.data):
-            raise _Incomplete
         if contains_secret(value):
             raise _Redacted
 
     def encode(self, value):
-        self.nodes += 1
-        if (
-            self.nodes > VALUE_NODE_LIMIT
-            or len(self.ancestors) > DEFAULT_BUDGET.max_depth
-        ):
-            raise _Incomplete
         kind = type(value)
         if value is None or kind is bool:
             self.write(_json(value))
@@ -65,8 +50,6 @@ class _Encoder:
             self.check_text(value)
             self.write(_json(value))
         elif kind is int:
-            if (value.bit_length() + 3) // 4 > self.limit - len(self.data):
-                raise _Incomplete
             self.write(
                 _json(
                     value
@@ -93,8 +76,6 @@ class _Encoder:
                 )
             )
         elif _one_of(kind, (bytes, bytearray)):
-            if len(value) * 2 > self.limit - len(self.data):
-                raise _Incomplete
             snapshot = bytes(value)
             self.check_text(snapshot.decode("latin-1"))
             self.write(_json({"type": kind.__name__, "hex": snapshot.hex()}))
@@ -149,23 +130,23 @@ class _Encoder:
         self.ancestors.pop()
 
 
-def encode_local(value, name, limit):
+def encode_local(value, name):
     """Encode one local without collecting previews or fingerprints."""
     if is_secret_name(name):
         return b'{"status":"redacted"}'
-    encoder = _Encoder(limit)
+    encoder = _Encoder()
     try:
         encoder.encode(value)
     except _Redacted:
         return b'{"status":"redacted"}'
     except _Unsupported:
         return b'{"status":"unsupported"}'
-    except (_Incomplete, RuntimeError, ValueError):
+    except (RuntimeError, ValueError):
         return b'{"status":"partial"}'
     return b'{"status":"complete","value":' + bytes(encoder.data) + b"}"
 
 
-def capture_value(value, fingerprint, limit):
+def capture_value(value, fingerprint):
     """Return shape, fallback status and optional complete payload. Never invokes app code."""
     if fingerprint == REDACTED:
         return {"status": REDACTED}, None
@@ -181,12 +162,14 @@ def capture_value(value, fingerprint, limit):
     if not is_digest(fingerprint):
         return {"status": fingerprint or "unknown", "shape": shape}, None
     fallback = {"status": "partial", "shape": shape}
-    if not limit or fingerprint.endswith(PARTIAL_MARK):
+    if fingerprint.endswith(PARTIAL_MARK):
         return fallback, None
-    encoder = _Encoder(limit)
+    encoder = _Encoder()
     try:
         encoder.encode(value)
-    except (_Incomplete, RuntimeError, ValueError):
+    except _Redacted:
+        return {"status": REDACTED}, None
+    except (_Unsupported, RuntimeError, ValueError):
         return fallback, None
     return fallback, bytes(encoder.data)
 

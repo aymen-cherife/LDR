@@ -51,7 +51,7 @@ def test_failed_test_preserves_exit_and_writes_machine_result(tmp_path):
     assert "calculate(x=4) -> 8" in (tmp_path / ".ldr" / "last.txt").read_text()
 
 
-def test_late_exception_survives_node_budget(tmp_path):
+def test_late_exception_is_recorded(tmp_path):
     (tmp_path / "late.py").write_text(
         "def leaf(x):\n    return x\n"
         "def fail():\n"
@@ -59,7 +59,7 @@ def test_late_exception_survives_node_budget(tmp_path):
         "    raise RuntimeError('late')\n"
         "fail()\n"
     )
-    result = invoke(tmp_path, "run", "late.py", "--max-nodes", "10")
+    result = invoke(tmp_path, "run", "late.py")
     assert result.returncode == 1
     output = (tmp_path / ".ldr" / "last.txt").read_text()
     assert "fail() ! RuntimeError: late" in output
@@ -83,7 +83,7 @@ def test_caught_overflow_exception_does_not_outrank_later_failure(tmp_path):
         "    raise RuntimeError('actual')\n"
         "fail()\n"
     )
-    result = invoke(tmp_path, "run", "mixed.py", "--max-nodes", "10")
+    result = invoke(tmp_path, "run", "mixed.py")
     assert result.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
     errors = [failure["error"] for failure in payload["failures"]]
@@ -187,8 +187,6 @@ def test_agent_can_select_a_frame_and_inspect_local_state(tmp_path):
         "test_state.py",
         "--frame",
         selected,
-        "--max-state-steps",
-        "20",
     )
     assert inspected.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
@@ -232,8 +230,6 @@ def test_pytest_collection_does_not_consume_runtime_budget(tmp_path):
         "test_late.py::test_late",
         "--only",
         str(tmp_path),
-        "--max-nodes",
-        "10",
     )
     assert result.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
@@ -262,8 +258,6 @@ def test_pytest_report_selects_late_failure_over_runtime_attribute_probes(tmp_pa
         "test_overflow_report.py::test_overflow_report",
         "--only",
         str(tmp_path),
-        "--max-nodes",
-        "10",
     )
     assert result.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
@@ -296,8 +290,6 @@ def test_every_repeated_call_is_recorded_and_the_late_causal_call_is_in_the_fail
         "test_hot_then_cause.py::test_hot_then_cause",
         "--only",
         str(tmp_path),
-        "--max-nodes",
-        "20",
     )
     assert result.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
@@ -340,8 +332,6 @@ def test_sampled_hot_parent_does_not_discard_novel_causal_child(tmp_path):
         "test_sampled_parent.py::test_sampled_parent",
         "--only",
         str(tmp_path),
-        "--max-nodes",
-        "30",
     )
     assert result.returncode == 1
     payload = json.loads((tmp_path / ".ldr" / "last.json").read_text())
@@ -357,7 +347,7 @@ def test_sampled_hot_parent_does_not_discard_novel_causal_child(tmp_path):
     assert "calculate(value=3) -> 6" in (tmp_path / ".ldr" / "last.txt").read_text()
 
 
-def test_focused_state_history_obeys_its_own_budget(tmp_path):
+def test_focused_state_history_records_every_step(tmp_path):
     (tmp_path / "state_loop.py").write_text(
         "def accumulate():\n"
         "    total = 0\n"
@@ -380,13 +370,11 @@ def test_focused_state_history_obeys_its_own_budget(tmp_path):
         "state_loop.py",
         "--frame",
         selected,
-        "--max-state-steps",
-        "3",
     )
     assert second.returncode == 0
     frame = json.loads((tmp_path / ".ldr" / "last.json").read_text())["inspection"]["frames"][0]
-    assert len(frame["state_steps"]) == 3
-    assert frame["state_truncated"] is True
+    assert len(frame["state_steps"]) == 43
+    assert frame["state_truncated"] is False
 
 
 def test_focused_state_preserves_distinguishing_long_value_suffix(tmp_path):

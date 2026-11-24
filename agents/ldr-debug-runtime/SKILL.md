@@ -50,7 +50,7 @@ ldr inspect tests/test_feature.py::test_case \
 Look for the first invocation whose inputs, nested boolean state, callee
 results, or ordered state transitions violate the expected invariant. Broad
 traces sample repetitive calls to protect useful late evidence; the JSON status
-reports both sampling and hard-budget overflow explicitly.
+reports an incomplete recording when a write fails.
 
 For a behavioral regression, run the same command before and after the patch. Every run is compared with the previous run of the same target, and the output names what changed:
 

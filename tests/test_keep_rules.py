@@ -1,4 +1,4 @@
-"""Phase 2 rule 3: detail kept for what can be decided at return, with caps and a drop order."""
+"""Phase 2 rule 3: detail kept for what can be decided at return, according to the keep rules."""
 
 import json
 import os
@@ -85,57 +85,15 @@ def test_an_argument_changed_by_the_call_is_marked_with_both_fingerprints(tmp_pa
     assert payload["input_preview"]["items"] == "[]"  # read at entry, so it is the real entry state
 
 
-def test_the_normal_budget_drops_first_n_detail_before_keep_rules(tmp_path):
-    source = (
-        "def steady(n):\n    return n\n\n\n"
-        "def boom(n):\n    raise ValueError(n)\n\n\n"
-        "for n in range(300):\n    steady(n % 3)\n"
-        "for n in range(3):\n    try:\n        boom(n)\n    except ValueError:\n        pass\n"
-    )
-    connection, run_id, result = run(
-        tmp_path, source, "max_trace_bytes = 1200\nhard_cap_bytes = 40000\nfirst_calls = 500\n"
-    )
-    report = json.loads((tmp_path / ".ldr" / "last.json").read_bytes())
-    dropped = report["status"]["call_stream"]["dropped"]
-    assert dropped["first N"] > 0 and "exception" not in dropped
-    assert numbers(kept(connection, run_id, "boom"), "boom") == [1, 2, 3]
-    (used,) = connection.execute(
-        "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (run_id,)
-    ).fetchone()
-    assert used <= 40000
-    assert "DETAIL DROPPED" in result.stdout and "first N" in result.stdout
 
 
-def test_the_hard_cap_drops_lower_priority_detail_first(tmp_path):
-    source = (
-        "def boom(n):\n    raise ValueError(n)\n\n\n"
-        "def make(n):\n    return 'x' * n\n\n\n"
-        "for n in range(60):\n    try:\n        boom(n)\n    except ValueError:\n        pass\n"
-        "for n in range(1, 400):\n    make(n)\n"
-    )
-    connection, run_id, _ = run(
-        tmp_path, source, "max_trace_bytes = 800\nhard_cap_bytes = 4000\nfirst_calls = 8\n"
-    )
-    report = json.loads((tmp_path / ".ldr" / "last.json").read_bytes())
-    dropped = report["status"]["call_stream"]["dropped"]
-    (used,) = connection.execute(
-        "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (run_id,)
-    ).fetchone()
-    # Exceptions may use the space up to the hard cap. New-shape detail stops at half of it
-    # (rank 2 of 4), so it is dropped while exception detail is still being kept.
-    assert 800 + 3200 * 2 // 4 < used <= 4000
-    assert dropped.get("new shape", 0) > 0 and dropped.get("exception", 0) > 0
 
 
-def test_passing_the_fingerprint_ceiling_stops_the_run_and_says_so(tmp_path):
-    source = "def f(n):\n    return n\n\n\nfor n in range(200):\n    f(n)\n"
-    connection, run_id, result = run(
-        tmp_path, source, "max_recorded_calls = 50\n"
-    )
-    report = json.loads((tmp_path / ".ldr" / "last.json").read_bytes())
-    incomplete = report["status"]["incomplete"]
-    assert "50" in incomplete
-    assert connection.execute(
-        "SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run_id,)
-    ).fetchone()[0] <= 50
-    assert "INCOMPLETE" in result.stdout
+
+
+def test_recording_keeps_calls_and_values_past_old_caps(tmp_path):
+    source = "def work(value):\n    return value\n\nfor index in range(60):\n    work([index] * 11000)\n"
+    db, _, result = run(tmp_path, source, "max_recorded_calls = 50\nmax_trace_bytes = 100\nmax_value_bytes = 50\nfirst_calls = 60\n")
+    assert db.execute("SELECT COUNT(*) FROM call_records").fetchone() == (60,)
+    assert db.execute("SELECT COUNT(*) FROM stream_values WHERE phase = 'return'").fetchone() == (60,)
+    assert "INCOMPLETE" not in result.stdout

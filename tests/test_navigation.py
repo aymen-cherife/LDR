@@ -77,8 +77,6 @@ def test_late_distinct_inputs_are_all_recorded_not_sampled(tmp_path):
         "many.py::test_many",
         "--only",
         str(tmp_path),
-        "--max-calls-per-function",
-        "8",
     )
     assert result.returncode == 1
     _, payload = load_result(tmp_path)

@@ -165,26 +165,11 @@ _repr.maxset = 6
 _repr.maxarray = 6
 _repr.maxlevel = 3
 
-# A focused inspection is already bounded by max_state_steps, so it can afford
-# enough value detail to distinguish nearby runtime states.  This remains
-# reprlib-bounded and uses the same redaction path as broad capture.
-_state_repr = _StructuralRepr()
-_state_repr.maxstring = 320
-_state_repr.maxother = 500
-_state_repr.maxlist = 10
-_state_repr.maxtuple = 10
-_state_repr.maxdict = 10
-_state_repr.maxset = 10
-_state_repr.maxarray = 10
-_state_repr.maxlevel = 4
-
-
 # Default object.__repr__ embeds the memory address. Across two processes
 # that address is always different, so on real code EVERY object-valued
 # argument reads as a behaviour change. Found the hard way on tqdm: the
 # real regression was buried under a dozen address-only diffs.
 _ADDR = re.compile(r"(?<= at )0x[0-9a-fA-F]{6,16}(?=>)")
-_STATE_SIGNAL = re.compile(r"(?:visible|layout|enabled|active|valid|closed|dirty)$")
 
 
 def _redact_text(rendered: str) -> str:
@@ -230,14 +215,74 @@ def capture(value: Any, name: str | None = None) -> str:
             return "<unrepresentable>"
 
 
+def _state_value(value, active):
+    """Read focused state through built-ins and structural descriptors."""
+    kind = type(value)
+    if kind is str:
+        return repr(redact(value)[0])
+    if kind is bytes or kind is bytearray:
+        clean, found = redact(bytes(value).decode("latin-1"))
+        return repr(clean) if found else repr(value)
+    if kind is int:
+        try:
+            return repr(value)
+        except ValueError:
+            return hex(value)
+    if any(kind is plain for plain in _PLAIN_REPR):
+        return repr(value)
+    if kind is types.MethodType:
+        return "<bound method>"
+    marker = id(value)
+    if marker in active:
+        return "<cycle>"
+    active.add(marker)
+    try:
+        if kind is dict:
+            pairs = (
+                _state_value(key, active) + ": " + (
+                    repr(by_name_placeholder(item)) if is_secret_name(key) else _state_value(item, active)
+                )
+                for key, item in value.items()
+            )
+            return "{" + ", ".join(pairs) + "}"
+        if any(kind is container for container in (tuple, list, set, frozenset, collections.deque, array.array)):
+            parts = [_state_value(item, active) for item in value]
+            items = ", ".join(sorted(parts) if kind is set or kind is frozenset else parts)
+            if kind is list:
+                return "[" + items + "]"
+            if kind is tuple:
+                return "(" + items + ("," if len(parts) == 1 else "") + ")"
+            if kind is set:
+                return "{" + items + "}" if parts else "set()"
+            if kind is frozenset:
+                return "frozenset({" + items + "})" if parts else "frozenset()"
+            if kind is array.array:
+                return f"array({value.typecode!r}, [{items}])"
+            return "deque([" + items + "])"
+        reading = read(value)
+        if reading is None:
+            return f"<{type_label(kind)}>"
+        fields = []
+        for name, item in reading.fields:
+            if name is None:
+                fields.append(_state_value(item, active))
+            elif is_secret_name(name):
+                fields.append(f"{name}={by_name_placeholder(item)}")
+            else:
+                fields.append(f"{name}={_state_value(item, active)}")
+        return f"{reading.label}({', '.join(fields)})"
+    finally:
+        active.remove(marker)
+
+
 def capture_state(value: Any, name: str | None = None) -> str:
-    """Capture a focused local plus bounded, side-effect-free boolean object state."""
+    """Capture a focused local and its side-effect-free boolean object state."""
     if name is not None and is_secret_name(name):
         return by_name_placeholder(value)
     try:
-        rendered = _redact_text(_state_repr.repr(value))
+        rendered = _redact_text(_state_value(value, set()))
     except Exception:
-        rendered = capture(value, name)
+        rendered = f"<{type_label(type(value))} state unavailable>"
     attributes = instance_dict(value)
     if attributes is None:
         return rendered
@@ -247,11 +292,8 @@ def capture_state(value: Any, name: str | None = None) -> str:
     for key, item in attributes.items():
         if is_secret_name(key):
             continue
-        normalized = key.lstrip("_").lower()
-        if type(item) is bool and (_STATE_SIGNAL.search(normalized) or len(state) < 4):
+        if type(item) is bool:
             state.append((key, item))
-        if len(nested) >= 128:
-            continue
         child_attributes = instance_dict(item)
         if child_attributes is None:
             continue
@@ -267,7 +309,7 @@ def capture_state(value: Any, name: str | None = None) -> str:
             item[0],
         )
     )
-    selected = state[:8] + nested[:8]
+    selected = state + nested
     if not selected:
         return rendered
     detail = ", ".join(f"{key}={item}" for key, item in selected)
@@ -284,26 +326,12 @@ def count_redacted(roots: list[Node]) -> int:
     return total
 
 
-_ERROR_SCAN_LIMIT = 200_000
-
-
 def capture_error(error: BaseException) -> str:
-    """Bound exception text while keeping pytest's useful assertion detail.
-
-    ``str(error)`` is called, as Python's traceback and pytest do, so LDR adds
-    no new risk, but it is guarded: a raising ``__str__`` never fails the run,
-    huge messages are cut before the detectors run, and secrets are redacted
-    before the text is shortened (so none is left half-visible).
-    """
+    """Keep the redacted exception text, even when it is too long to print."""
     try:
-        raw = str(error)
-        if len(raw) > _ERROR_SCAN_LIMIT:
-            raw = raw[: _ERROR_SCAN_LIMIT // 2] + raw[-_ERROR_SCAN_LIMIT // 2 :]
-        detail = _redact_text(raw)
+        detail = _redact_text(str(error))
     except Exception:
         detail = "<message unavailable>"
-    if len(detail) > 600:
-        detail = detail[:450] + f"... <{len(detail) - 550} chars omitted> ..." + detail[-100:]
     try:
         name = type(error).__name__
     except Exception:

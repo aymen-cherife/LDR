@@ -82,7 +82,7 @@ measurements on the selected tests.
 
 ## Line budget audit
 
-**24 KiB (24,576 bytes) matched full-trace line hits in this pilot.** It rounds up the observed cutoff of 23,495 serialized bytes, which retained an executed old patched line in all 9 of the 12 reproduced cases where the full completed-call trace contained one. The smallest measured cutoff for a majority was 16,381 bytes, with 7 of 12 hits. Four of the 16 attempted cases were excluded, and seven of the nine hits came from tqdm. The general line-capture budget stays unset.
+**24 KiB (24,576 bytes) matched full-trace line hits in this pilot.** It rounds up the observed cutoff of 23,495 serialized bytes, which retained an executed old patched line in all 9 of the 12 reproduced cases where the full completed-call trace contained one. The smallest measured cutoff for a majority was 16,381 bytes, with 7 of 12 hits. Four of the 16 attempted cases were excluded, and seven of the nine hits came from tqdm.
 
 Shimari et al. studied 831 real Java bugs from Defects4J. Keeping the latest 1,024 events per instrumented location retained all observed bug-affected states in 84.3% of cases. Total storage grows with the number of locations. The study measures a per-location retention policy, while the pilot measures one serialized byte budget shared by an entire run. [Published study](https://doi.org/10.1016/j.scico.2024.103117) · [Buffer methodology](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4598613)
 
@@ -103,7 +103,7 @@ Shimari et al. studied 831 real Java bugs from Defects4J. Keeping the latest 1,0
 
 The audit uses all listed BugsInPy cases from the three chosen repositories. It requires the upstream regression test to fail on the buggy version, pass on the fixed version, and still fail with recording. The same fixed test files and helpers are used on both versions. PySnooper/1 and cookiecutter/1 passed on both versions on this host. tqdm/7 failed on both. tqdm/3 had no eligible deleted or replaced Python line in the old production code. Four measured tqdm cases had one unfinished call each.
 
-A hit is a retained call that executed a production line deleted or replaced by the fix. A hit is evidence that the patched code was reached. For each case, the script sums the UTF-8 bytes of persisted call payloads and frame IDs in completion order up through the first such call. It checks its total against SQLite's budget accounting. The 64 MiB audit ceiling provided headroom to measure the entire completed trace in every eligible case. The thresholds use recorded prefix sizes, which can vary slightly on rerun because payloads include timings. This audit excludes SQLite page overhead and insertion-only fault locations. [BugsInPy revision](https://github.com/soarsmu/BugsInPy/tree/11c5f1eea954a42132cfd06bf257766a7963e0fd) · [Patch-based fault-location methodology](https://link.springer.com/article/10.1007/s10664-024-10475-3)
+A hit is a retained call that executed a production line deleted or replaced by the fix. A hit is evidence that the patched code was reached. For each case, the script sums the UTF-8 bytes of persisted call payloads and frame IDs in completion order up through the first such call. The original pilot used a 64 MiB audit allowance. The current audit reads the completed trace directly. The thresholds use recorded prefix sizes, which can vary slightly on rerun because payloads include timings. This audit excludes SQLite page overhead and insertion-only fault locations. [BugsInPy revision](https://github.com/soarsmu/BugsInPy/tree/11c5f1eea954a42132cfd06bf257766a7963e0fd) · [Patch-based fault-location methodology](https://link.springer.com/article/10.1007/s10664-024-10475-3)
 
 A separate check of the newer Hypothesis regression #4532 reproduced the failure and the fix using pytest 8.4.2. Its patched line was retained at 2,422 bytes in a trace of 19 completed calls and 11,992 bytes. It is outside the cohort used to calculate the pilot thresholds. [Upstream fix](https://github.com/HypothesisWorks/hypothesis/commit/717d957195568256a5bd4ac0d60a49c93b77fe0f)
 
@@ -111,7 +111,7 @@ To rerun the cohort, place the BugsInPy checkout and clones of PySnooper, cookie
 
 ```bash
 # Set PYTEST_PLUGINS=pytest_mock in the environment.
-python evaluation/audit_line_budget.py /path/to/audit-checkouts --deps /path/to/compat-deps --capacity 67108864 --timeout 30
+python evaluation/audit_line_budget.py /path/to/audit-checkouts --deps /path/to/compat-deps --timeout 30
 ```
 
 ## Scaled rich fixture, lookup cost and repeated walks

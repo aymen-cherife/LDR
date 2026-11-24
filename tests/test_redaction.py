@@ -128,9 +128,9 @@ def test_shape_scan_runs_on_the_text_after_environment_replacement():
         redact.load_environment()
 
 
-def test_exception_text_is_redacted_capped_and_never_raises():
+def test_exception_text_is_redacted_complete_and_never_raises():
     """Python's traceback and pytest call str(exc) anyway, so LDR keeps calling
-    it, but guards it: no failure, bounded length, secrets removed."""
+    it, but guards it: no failure, complete message, secrets removed."""
     from ldr.node import capture_error
 
     token = SHAPES["github-token"]
@@ -144,7 +144,7 @@ def test_exception_text_is_redacted_capped_and_never_raises():
     assert capture_error(BrokenStr()) == "BrokenStr: <message unavailable>"
 
     huge = capture_error(RuntimeError(token + " " + "x" * 5_000_000 + " " + token))
-    assert len(huge) < 800
+    assert 'x' * 5_000_000 in huge
     assert token not in huge and token[:12] not in huge
 
     redact.load_environment({"MY_API_TOKEN": "env-secret-value-555"})

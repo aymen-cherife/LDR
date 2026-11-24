@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from ldr.fingerprint import fingerprint
-from ldr.sqlite_store import storage_settings
 from ldr.value_capture import capture_value
 from ldr import processes
 
@@ -58,22 +57,6 @@ def test_console_encoding_preserves_run_result_and_utf8_report(tmp_path, monkeyp
     assert "\u2603" in (tmp_path / ".ldr" / "last.txt").read_text(encoding="utf-8")
 
 
-def test_line_capture_requires_an_explicit_budget(tmp_path):
-    (tmp_path / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\ncapture_lines = true\n"
-    )
-    with pytest.raises(ValueError, match="explicit max_trace_bytes"):
-        storage_settings(tmp_path)
-
-
-def test_deep_capture_requires_budget_before_running_target(tmp_path):
-    (tmp_path / "app.py").write_text("raise AssertionError('target ran')\n")
-    result = invoke(tmp_path, "run", "app.py", "--deep=target")
-    assert result.returncode == 2
-    assert "requires explicit" in result.stderr
-    assert "target ran" not in result.stderr
-
-
 def test_exit_fingerprints_respect_mutation_rebinding_and_redaction_refresh(tmp_path):
     (tmp_path / "app.py").write_text(
         "from ldr.redact import load_environment\n"
@@ -114,9 +97,6 @@ def test_exit_fingerprints_respect_mutation_rebinding_and_redaction_refresh(tmp_
 def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, monkeypatch):
     secret = "fixture-local-env-secret"
     monkeypatch.setenv("DEEP_TEST_SECRET", secret)
-    (tmp_path / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_deep_bytes = 10000\n"
-    )
     (tmp_path / "app.py").write_text(
         "import os, sys\n"
         "def leaf():\n"
@@ -164,9 +144,6 @@ def test_deep_capture_reads_saved_loop_locals_without_running_target(tmp_path, m
 
 
 def test_deep_capture_marks_yield_continuation_and_unwind(tmp_path):
-    (tmp_path / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_deep_bytes = 10000\n"
-    )
     (tmp_path / "app.py").write_text(
         "def gen():\n"
         "    received = yield 1\n"
@@ -185,11 +162,10 @@ def test_deep_capture_marks_yield_continuation_and_unwind(tmp_path):
     assert dict(steps[1]["locals"])["received"]["value"] == 3
 
 
-def test_deep_budget_is_shared_across_workers(tmp_path):
+def test_deep_capture_keeps_all_snapshots_across_workers(tmp_path):
     pytest.importorskip("xdist")
     (tmp_path / "pyproject.toml").write_text(
         "[tool.ldr.storage]\nbatch_size = 1\n"
-        "max_trace_bytes = 100000\nmax_deep_bytes = 170\n"
     )
     (tmp_path / "calc.py").write_text(
         "def target(n):\n    value = 'x' * 1000; return n\n"
@@ -205,21 +181,17 @@ def test_deep_budget_is_shared_across_workers(tmp_path):
     status = report["status"]["deep_capture"]
     assert status["matched"] == status["frames"] == 2
     assert status["observed"] == 2
-    assert status["retained"] == 1
-    assert 0 < status["bytes"] <= 170
+    assert status["retained"] == 2
     with sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3") as connection:
         assert connection.execute(
             "SELECT count(DISTINCT worker) FROM stream_deep_frames"
         ).fetchone() == (2,)
-        data, = connection.execute("SELECT payload FROM stream_deep_steps").fetchone()
-    assert len(data) == status["bytes"]
-    assert dict(json.loads(data)["locals"])["value"] == {"status": "partial"}
+        snapshots = [data for (data,) in connection.execute("SELECT payload FROM stream_deep_steps")]
+    assert sum(map(len, snapshots)) == status["bytes"]
+    assert all(dict(json.loads(data)["locals"])["value"]["value"] == "x" * 1000 for data in snapshots)
 
 
 def test_structural_values_explain_a_change_outside_the_preview(tmp_path):
-    (tmp_path / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_value_bytes = 10000\n"
-    )
     program = tmp_path / "app.py"
     template = (
         "def update(items, api_token):\n"
@@ -248,29 +220,11 @@ def test_structural_values_explain_a_change_outside_the_preview(tmp_path):
     )
 
 
-def test_value_budget_keeps_fingerprint_shape_and_preview(tmp_path):
-    (tmp_path / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_value_bytes = 8\n"
-    )
-    (tmp_path / "app.py").write_text(
-        "def f(value):\n    return value\nf(list(range(50)))\n"
-    )
-    assert invoke(tmp_path, "run", "app.py").returncode == 0
-    assert invoke(tmp_path, "inspect", "--frame-id", "1").returncode == 0
-    result = json.loads((tmp_path / ".ldr/last.json").read_text())
-    value = result["inspection"]["frames"][0]["captured_values"]["entry"]["value"]
-    assert value["status"] == "partial"
-    assert value["shape"] == {"type": "list", "length": 50}
-    assert value["fingerprint"] == fingerprint(list(range(50)))
-    assert value["preview"].startswith("[0, 1,")
-    assert "value" not in value
-
-
 def test_complete_value_preserves_types_order_and_cycles():
     value = {1: (b"abc", {2, 1})}
     cycle = [value]
     cycle.append(cycle)
-    _, encoded = capture_value(cycle, fingerprint(cycle), 1000)
+    _, encoded = capture_value(cycle, fingerprint(cycle))
     assert json.loads(encoded) == [
         {
             "type": "dict",
@@ -295,8 +249,8 @@ def test_complete_value_rechecks_nested_secrets_before_serializing():
     value = {"ordinary": "value"}
     prior = fingerprint(value)
     value["api_key"] = "fixture-nested-secret"
-    assert capture_value(value, prior, 1000)[1] is None
-    assert capture_value(value, fingerprint(value), 1000) == (
+    assert capture_value(value, prior)[1] is None
+    assert capture_value(value, fingerprint(value)) == (
         {"status": "redacted"},
         None,
     )
@@ -307,7 +261,7 @@ def test_line_capture_keeps_late_branch_and_compacts_loop_repetitions(
     tmp_path, enabled
 ):
     (tmp_path / "pyproject.toml").write_text(
-        f"[tool.ldr.storage]\ncapture_lines = {str(enabled).lower()}\nmax_trace_bytes = 100000\n"
+        f"[tool.ldr.storage]\ncapture_lines = {str(enabled).lower()}\n"
     )
     (tmp_path / "app.py").write_text(
         "def run():\n"
@@ -335,8 +289,6 @@ def test_pytest_xdist_records_both_workers_and_preserves_failure(tmp_path):
         "filterwarnings = ['error']\n"
         "[tool.ldr.storage]\nbatch_size = 1\n"
         "capture_lines = true\n"
-        "max_trace_bytes = 100000\n"
-        "max_value_bytes = 7\n"
     )
     (tmp_path / "calc.py").write_text("def total(a):\n    return a + 1\n")
     (tmp_path / "test_calc.py").write_text(
@@ -365,8 +317,9 @@ def test_pytest_xdist_records_both_workers_and_preserves_failure(tmp_path):
             "SELECT payload FROM stream_calls WHERE run_id = ?",
             (payload["status"]["run_id"],),
         ).fetchall()
+        value_bytes, = connection.execute("SELECT SUM(length(payload)) FROM stream_values").fetchone()
     assert streamed_workers == [("gw0",), ("gw1",)]
-    assert 0 < payload["status"]["call_stream"]["value_bytes"] <= 7
+    assert payload["status"]["call_stream"]["value_bytes"] == value_bytes > 7
     assert all(json.loads(row[0])["timing"]["complete"] for row in stream_payloads)
     assert all(json.loads(row[0])["executed_lines"] for row in stream_payloads)
     totals = {worker: (parent, frame_id) for worker, parent, frame_id in rows}
@@ -394,12 +347,9 @@ def test_crashed_pytest_worker_is_reported_as_a_missing_trace(tmp_path):
     assert report["status"]["missing_trace_workers"] == ["gw0"]
 
 
-@pytest.mark.parametrize("max_trace_bytes", [1000, 100_000])
-def test_late_unsampled_change_is_detected_at_and_below_storage_budget(
-    tmp_path, max_trace_bytes
-):
+def test_late_change_is_detected_after_all_calls_are_stored(tmp_path):
     (tmp_path / "pyproject.toml").write_text(
-        f"[tool.ldr.storage]\nbatch_size = 3\nmax_trace_bytes = {max_trace_bytes}\nfirst_calls = 100\n"
+        "[tool.ldr.storage]\nbatch_size = 3\nfirst_calls = 100\n"
     )
     program = tmp_path / "app.py"
     template = "def leaf(n):\n    return n + ({delta} if n == 37 else 0)\nfor i in range(50):\n    leaf(i)\n"
@@ -413,15 +363,4 @@ def test_late_unsampled_change_is_detected_at_and_below_storage_budget(
     assert report["behavior"]["stream_changed_functions"] == ["app.py:leaf"]
     assert report["status"]["call_stream"]["started"] == 50
     stored = report["status"]["call_stream"]["stored"]
-    assert stored == 50 if max_trace_bytes == 100_000 else 0 < stored < 50
-    with sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3") as connection:
-        (used,) = connection.execute(
-            "SELECT used_bytes FROM stream_budget WHERE run_id = ?",
-            (report["status"]["run_id"],),
-        ).fetchone()
-        # Keep rules (the first call, a new shape) may pass the normal budget, up to the hard cap.
-        assert used <= 4 * max_trace_bytes
-        assert connection.execute(
-            "SELECT count(*) FROM stream_calls WHERE run_id = ?",
-            (report["status"]["run_id"],),
-        ).fetchone() == (stored,)
+    assert stored == 50

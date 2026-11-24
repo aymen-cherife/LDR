@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ldr.diff import diff_tree  # noqa: E402
+from ldr.fingerprint import is_digest  # noqa: E402
 from ldr.render import render_diff  # noqa: E402
 from ldr.tracer import Recorder  # noqa: E402
 from ldr import processes
@@ -188,7 +189,6 @@ def test_budgets_make_oversized_values_unknown_not_slow_and_not_equal():
     assert is_digest(fingerprint(list(range(2_000_000))))
     assert fingerprint(list(range(100)), Budget(max_nodes=10)) == "unknown"
     assert is_digest(fingerprint(list(range(5)), Budget(max_nodes=10)))
-    assert fingerprint([[[[1]]]], Budget(max_depth=2)) == "unknown"
     assert not hasattr(Budget(), "max_seconds")  # no time budget: see the next test
 
     deep = 1
@@ -216,12 +216,12 @@ def test_a_fingerprint_never_depends_on_machine_load(monkeypatch):
     assert fingerprint(value) == expected
 
 
-def test_unknown_values_are_reported_as_unknown_never_unchanged():
+def test_nested_values_are_compared_past_the_old_depth_cutoff():
     import fixtures.values as v
 
     def nested(leaf):
         value = [leaf]
-        for _ in range(40):  # deeper than the guard
+        for _ in range(40):
             value = [value]
         return value
 
@@ -229,13 +229,8 @@ def test_unknown_values_are_reported_as_unknown_never_unchanged():
     deep_b = nested(2)
     old = record(lambda: v.consume(deep_a))
     new = record(lambda: v.consume(deep_b))
-    assert old.roots[0].in_fp["items"] == "unknown"
-
-    changes = diff_tree(old.roots[0], new.roots[0])
-
-    assert [c.kind for c in changes] == ["unknown"]
-    text = render_diff(changes)
-    assert "cannot be compared" in text and "items" in text
+    assert is_digest(old.roots[0].in_fp["items"])
+    assert old.roots[0].in_fp["items"] != new.roots[0].in_fp["items"]
 
 
 def test_capturing_a_huge_list_does_not_walk_it():

@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from ldr import processes
 
@@ -107,3 +108,71 @@ def test_a_hung_child_that_is_killed_loses_at_most_the_last_tenth_of_a_second(tm
     count, status = stored(tmp_path)
     assert count == 3000
     assert status["died_at"] == "app.py:f#3000"
+
+
+def test_a_failed_batch_preserves_and_reports_the_last_committed_call(tmp_path, monkeypatch):
+    import errno
+    from ldr.sink import Sink, _Run
+    from ldr.sqlite_store import TraceStore
+
+    store = TraceStore.start(tmp_path, {}, 10, 2)
+    run = _Run(store, str(tmp_path))
+    sink = object.__new__(Sink)
+    row = (1, "app.py:work#1", None, "work", None, [], None, b"sig")
+    sink._apply(run, "append", ("append", "main", [], [row], []))
+
+    def disk_full(*args):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    monkeypatch.setattr(store, "append_stream", disk_full)
+    sink._apply(run, "append", ("append", "main", [], [row], []))
+    failure = run.recording_failure
+    assert "disk full" in failure["error"]
+    assert failure["calls_recorded"] == 1
+    assert failure["last_address"] == "app.py:work#1"
+    assert failure["free_disk_bytes"] >= 0
+    assert failure["next_command"] == "ldr check_machine"
+    with closing(sqlite3.connect(store.path)) as db:
+        assert db.execute("SELECT frame_id FROM call_records_stage").fetchall() == [("app.py:work#1",)]
+
+    message = sink._finish_incomplete(run, 0)
+    assert all(text in message for text in ("disk full", "1 call(s)", "work#1", "bytes free", "ldr check_machine"))
+    result = json.loads((tmp_path / "last.json").read_text())
+    assert result["status"]["incomplete"] == failure
+    assert result["status"]["exit_code"] == 0
+    assert message in (tmp_path / "last.txt").read_text()
+
+
+def test_detached_run_reports_a_recording_failure_without_changing_target_exit(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.ldr.storage]\nbatch_size = 1\n")
+    (tmp_path / "app.py").write_text(
+        "def work(value):\n    return value\n\nfor i in range(4):\n    work(i)\nraise SystemExit(7)\n"
+    )
+    (tmp_path / "sitecustomize.py").write_text(
+        "import errno, sys\n"
+        "if 'ldr.supervisor' in sys.orig_argv and '--run' in sys.orig_argv:\n"
+        "    from ldr.sqlite_store import TraceStore\n"
+        "    append = TraceStore.append_stream\n"
+        "    count = 0\n"
+        "    def fail_second_batch(self, *args):\n"
+        "        global count\n"
+        "        count += 1\n"
+        "        if count >= 2:\n"
+        "            raise OSError(errno.ENOSPC, 'fixture disk full')\n"
+        "        return append(self, *args)\n"
+        "    TraceStore.append_stream = fail_second_batch\n"
+    )
+    env = environment()
+    env["PYTHONPATH"] = os.pathsep.join(map(str, (tmp_path, REPO)))
+    result = processes.run(
+        [sys.executable, "-m", "ldr", "run", "app.py"],
+        cwd=tmp_path, env=env, capture_output=True, text=True,
+    )
+
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert "RECORDING INCOMPLETE" in result.stdout + result.stderr
+    assert "fixture disk full" in result.stdout + result.stderr
+    status = json.loads((tmp_path / ".ldr/last.json").read_text())["status"]
+    assert status["incomplete"]["calls_recorded"] == 1
+    assert status["incomplete"]["last_address"] == "app.py:work#1"
+    assert status["exit_code"] == 7

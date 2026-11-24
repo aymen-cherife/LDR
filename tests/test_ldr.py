@@ -137,34 +137,8 @@ def test_threads_do_not_interleave_into_one_tree():
         assert [c.name for c in o.children] == ["double", "add_six"]
 
 
-def test_recursion_is_capped_not_explosive():
-    import fixtures.basic as b
-
-    rec = Recorder(scope=[FIX], max_nodes=200)
-    rec.start()
-    try:
-        b.fib(18)  # ~8000 calls unbounded
-    finally:
-        rec.stop()
-    assert rec.n_nodes <= 200
-    assert rec.truncated is True
 
 
-def test_depth_is_capped():
-    import fixtures.basic as b
-
-    rec = Recorder(scope=[FIX], max_depth=10, max_nodes=100000)
-    rec.start()
-    try:
-        b.deep(40)
-    finally:
-        rec.stop()
-    depth = 0
-    n = rec.roots[0]
-    while n.children:
-        depth += 1
-        n = n.children[0]
-    assert depth <= 10
 
 
 def test_huge_values_are_truncated():
@@ -329,7 +303,7 @@ def test_repeated_siblings_collapse():
     rec = record(lambda: [b.double(2) for _ in range(30)])
     out = render_run(rec.roots, full=False)
     assert out.count("double") <= 3, out
-    assert "x9" in out
+    assert "x30" in out
 
 
 def test_uninformative_leaves_are_pruned():

@@ -21,7 +21,7 @@ sys.path.insert(0, REPO)
 from ldr import tracer  # noqa: E402
 
 COUNTS: Counter = Counter()
-NAMES = ["_on_start", "_on_return", "_on_yield", "_on_resume", "_on_unwind", "_on_raise", "_on_throw", "_on_line"]
+NAMES = ["_on_start", "_on_return", "_on_yield", "_on_resume", "_on_unwind", "_on_throw", "_on_line"]
 
 
 def wrap(name):

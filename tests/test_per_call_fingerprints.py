@@ -89,15 +89,3 @@ def test_first_calls_is_a_setting(tmp_path):
         "SELECT COUNT(*) FROM stream_calls WHERE run_id = ? AND frame_id LIKE 'app.py:f#%'", (run_id,)
     ).fetchone()[0]
     assert detailed == 2
-
-
-def test_an_exhausted_detail_budget_never_stops_the_fingerprints(tmp_path):
-    connection, run_id = run(tmp_path, "max_trace_bytes = 1500\nfirst_calls = 100\n")
-    fingerprinted = connection.execute(
-        "SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run_id,)
-    ).fetchone()[0]
-    detailed = connection.execute(
-        "SELECT COUNT(*) FROM stream_calls WHERE run_id = ?", (run_id,)
-    ).fetchone()[0]
-    assert fingerprinted == 22  # make, use and 20 calls of f
-    assert 0 < detailed < 22

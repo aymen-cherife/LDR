@@ -28,12 +28,11 @@ def test_a_large_value_has_a_fingerprint_not_unknown():
     assert fingerprint(list(range(100_000))) != fingerprint(list(range(100_000))[:-1] + [-1])
 
 
-def test_the_depth_guard_still_makes_a_value_unknown():
+def test_the_comparison_walk_has_no_separate_depth_cutoff():
     deep = 1
     for _ in range(30):
         deep = [deep]
-    assert fingerprint(deep) == "unknown"
-    assert fingerprint([[[[1]]]], Budget(max_depth=2)) == "unknown"
+    assert is_digest(fingerprint(deep))
     assert fingerprint(list(range(100)), Budget(max_nodes=10)) == "unknown"  # an explicit budget
 
 

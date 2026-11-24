@@ -68,7 +68,7 @@ def measure(directory, gold):
     stream = result["status"]["call_stream"]
     completed = stream["started"] - stream["unfinished"]
     if stream["stored"] != completed or stream["write_failed"]:
-        raise ValueError("capture incomplete at the audit ceiling")
+        raise ValueError("capture incomplete")
     with closing(sqlite3.connect(directory / ".ldr/traces.sqlite3")) as connection:
         rows = list(
             connection.execute(
@@ -77,10 +77,6 @@ def measure(directory, gold):
                 (result["status"]["run_id"],),
             )
         )
-        (total,) = connection.execute(
-            "SELECT used_bytes FROM stream_budget WHERE run_id = ?",
-            (result["status"]["run_id"],),
-        ).fetchone()
     used = 0
     hits = {}
     for frame, raw in rows:
@@ -90,8 +86,8 @@ def measure(directory, gold):
             json.loads(raw)["executed_lines"]
         ):
             hits.setdefault((path, line), used)
-    if used != total or len(rows) != stream["stored"]:
-        raise ValueError("stream rows and byte accounting disagree")
+    if len(rows) != stream["stored"]:
+        raise ValueError("stream row counts disagree")
     return {
         "calls": len(rows),
         "unfinished_calls": stream["unfinished"],
@@ -148,7 +144,7 @@ def audit_case(root, subject, case, args, env):
                 shutil.copyfile(after / test_path, before / test_path)
         with (before / "pyproject.toml").open("a", encoding="utf-8") as file:
             file.write(
-                f"\n[tool.ldr.storage]\ncapture_lines = true\nmax_trace_bytes = {args.capacity}\n"
+                "\n[tool.ldr.storage]\ncapture_lines = true\n"
             )
         pytest_options = ["-o", "addopts="]
         fixed_run = run(
@@ -196,9 +192,6 @@ def main():
     )
     parser.add_argument(
         "--deps", type=Path, help="optional dependency directory added to PYTHONPATH"
-    )
-    parser.add_argument(
-        "--capacity", type=int, required=True, help="audit ceiling in serialized bytes"
     )
     parser.add_argument(
         "--timeout", type=int, default=60, help="seconds allowed per test command"
@@ -249,7 +242,6 @@ def main():
                 "first_hit_p90_bytes": hits[p90 - 1]
                 if p90 and len(hits) >= p90
                 else None,
-                "ceiling_bytes": args.capacity,
             }
         )
     )

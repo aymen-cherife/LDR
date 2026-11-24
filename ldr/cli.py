@@ -35,7 +35,7 @@ from .store import (
 )
 from .suggest import rank_inspections
 from .call_stream import CallStream
-from .sqlite_store import TraceStore, storage_settings
+from .sqlite_store import TraceStore, recording_failure, recording_failure_text, storage_settings
 from . import fingerprint as fingerprint_module, previous, sqlreport
 from .summary import summarize
 from .tracer import Recorder, python_version_message
@@ -99,7 +99,7 @@ def _record(
         except BaseException as exc:
             recorder.crashed = True
             recorder.exit_code = 1
-            # Guarded, capped and secret-redacted: a raising __str__ must not
+            # Guarded and secret-redacted: a raising __str__ must not
             # crash LDR, and the message must not carry a credential to the model.
             recorder.crash_summary = capture_error(exc)
             recorder.escaped_exception = exc
@@ -1108,8 +1108,6 @@ def main(argv=None) -> int:
         "--full", action="append", default=[], metavar="TEST",
         help="full capture: every call keeps detail, for the named pytest test; bare --full means everything",
     )
-    parser.add_argument("--max-nodes", type=int, default=5000)
-    parser.add_argument("--max-calls-per-function", type=int, default=8)
     parser.add_argument("--max-lines", type=int, default=200)
     parser.add_argument(
         "--frame",
@@ -1120,7 +1118,6 @@ def main(argv=None) -> int:
         type=int,
         help="short frame id from the latest result; restores and reruns its invocation",
     )
-    parser.add_argument("--max-state-steps", type=int, default=200)
     parser.add_argument(
         "--deep", action="append", default=[], metavar="FUNCTION",
         help="save locals for a selected function, as --deep=FUNCTION (repeatable); bare --deep means every function",
@@ -1143,12 +1140,6 @@ def main(argv=None) -> int:
     args.rest = list(args.rest) + unknown + passthrough
     if args.max_lines < 20:
         parser.error("--max-lines must be at least 20")
-    if args.max_nodes < 1:
-        parser.error("--max-nodes must be at least 1")
-    if args.max_calls_per_function < 1:
-        parser.error("--max-calls-per-function must be at least 1")
-    if args.max_state_steps < 1:
-        parser.error("--max-state-steps must be at least 1")
     if not math.isfinite(args.timeout) or args.timeout < 0:
         parser.error("--timeout must be a finite non-negative number")
 
@@ -1254,6 +1245,7 @@ def main(argv=None) -> int:
         rerun_plan = rerun_detail.load_plan(os.environ)
     store = None
     storage_warning = None
+    startup_failure = None
     try:
         settings = storage_settings(
             project_root, deep=bool(args.deep), boundary=bool(args.boundary)
@@ -1279,23 +1271,24 @@ def main(argv=None) -> int:
             store.full_tests = (*store.full_tests, rerun_plan["prefix"] or "*")
     except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
         storage_warning = capture_error(exc)
-        if args.deep or args.boundary:
+        if isinstance(exc, (OSError, sqlite3.Error)):
+            startup_failure = getattr(exc, "failure", None) or recording_failure(
+                os.path.join(ldr_dir, "traces.sqlite3"), exc, 0, None
+            )
+        elif args.deep or args.boundary:
             parser.error(f"Could not start optional capture ({storage_warning})")
 
     recorder_options = {
-        "scope": scope,
-        "max_nodes": args.max_nodes,
+        "scope": [] if startup_failure else scope,
         "project_root": project_root,
         "display_root": initial_cwd,
         "focus_frame": args.frame if requested_mode == "inspect" else None,
-        "max_state_steps": args.max_state_steps,
-        "max_calls_per_function": args.max_calls_per_function,
-        "deep_functions": args.deep,
-        "boundary_modules": args.boundary,
+        "deep_functions": None if startup_failure else args.deep,
+        "boundary_modules": None if startup_failure else args.boundary,
         "uncapped": args.uncap,
     }
     # A default run builds no tree: its calls are in SQLite and the report reads them there.
-    # Snapshots, comparisons and inspect still use the capped tree (until Phase 3's store).
+    # Focused inspect still uses the tree.
     report_from_sql = (
         store is not None
         and requested_mode in {"run", "pytest", "module"}
@@ -1428,15 +1421,9 @@ def main(argv=None) -> int:
                 key: sum(summary[key] for summary in stream_summaries)
                 for key in ("started", "stored", "fingerprinted", "unfinished", "uncomparable", "write_failed")
             }
-            dropped: dict[str, int] = {}
-            for summary in stream_summaries:
-                for reason, number in summary.get("dropped", {}).items():
-                    dropped[reason] = dropped.get(reason, 0) + number
-            status["call_stream"]["dropped"] = dropped
-            incomplete = next((s["incomplete"] for s in stream_summaries if s.get("incomplete")), None)
-            if incomplete:
-                status["incomplete"] = incomplete
-                scope_warnings.append(f"INCOMPLETE: {incomplete}.")
+            failure = next((summary["incomplete"] for summary in stream_summaries if summary.get("incomplete")), None)
+            if failure:
+                status["incomplete"] = failure
             status["call_stream"]["first_calls"] = store.first_calls
             status["call_stream"]["last_calls"] = store.last_calls
             status["fingerprint"] = _fingerprint_status(stream_summaries)
@@ -1487,9 +1474,7 @@ def main(argv=None) -> int:
             status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1
             status["call_stream"]["summaries"] = len(stream_summaries)
             status["call_stream"]["capture_lines"] = store.capture_lines
-            if store.max_value_bytes:
-                status["call_stream"]["value_bytes"] = store.value_bytes_used()
-                status["call_stream"]["max_value_bytes"] = store.max_value_bytes
+            status["call_stream"]["value_bytes"] = store.value_bytes_used()
             if args.deep:
                 totals = store.deep_totals()
                 totals.update(
@@ -1498,13 +1483,11 @@ def main(argv=None) -> int:
                 )
                 status["deep_capture"] = {
                     "functions": args.deep,
-                    "max_bytes": store.max_deep_bytes,
                     **totals,
                 }
             if args.boundary:
                 status["boundary_capture"] = {
                     "modules": [redact(module)[0] for module in args.boundary],
-                    "max_bytes": store.max_boundary_bytes,
                     "bytes": store.boundary_bytes_used(),
                     **{
                         key: sum(summary["boundaries"][key] for summary in stream_summaries)
@@ -1518,6 +1501,8 @@ def main(argv=None) -> int:
                 status.pop(internal, None)
         except (OSError, sqlite3.Error) as exc:
             storage_warning = capture_error(exc)
+    if startup_failure:
+        status["incomplete"] = startup_failure
     if storage_warning:
         status["storage_warning"] = storage_warning
         scope_warnings.append(f"SQLite trace storage: {storage_warning}")
@@ -1540,6 +1525,8 @@ def main(argv=None) -> int:
         f"{project_calls} project call(s) recorded\n"
         + _redaction_note(status["redacted_values"])
     )
+    if status.get("incomplete"):
+        redaction_note += recording_failure_text(status["incomplete"]) + "\n"
     stream_status = status.get("call_stream")
     if stream_status:
         redaction_note += (
@@ -1547,14 +1534,6 @@ def main(argv=None) -> int:
             f"{stream_status['stored']} with detail (the first {stream_status['first_calls']} calls of each function), "
             f"{stream_status['unfinished']} unfinished, {stream_status['uncomparable']} with incomparable values.\n"
         )
-        if stream_status["dropped"]:
-            lost = ", ".join(f"{number} {reason}" for reason, number in sorted(stream_status["dropped"].items()))
-            redaction_note += (
-                f"DETAIL DROPPED: {lost} call(s) lost their detail because the detail budget "
-                "(max_trace_bytes, up to hard_cap_bytes) was reached. Their fingerprints are kept.\n"
-            )
-        if status.get("incomplete"):
-            redaction_note += f"INCOMPLETE: {status['incomplete']}.\n"
         if reference_status := status.get("reference"):
             redaction_note += _previous_run_note(reference_status)
         elif rerun_plan is None and requested_mode in {"run", "pytest", "module"}:
@@ -1629,7 +1608,7 @@ def main(argv=None) -> int:
         frame_index_payload = _frame_index(recorder.roots)
         display_scope = _display_scope(scope, initial_cwd)
         inspected_frames = [node.to_dict() for node in inspected]
-        if store is not None and store.max_value_bytes:
+        if store is not None:
             try:
                 for frame in inspected_frames:
                     frame["captured_values"] = store.frame_values(store.run_id, frame["frame_id"])
@@ -1733,7 +1712,6 @@ def main(argv=None) -> int:
             command_target=args.target,
             scope=display_scope,
             status=status,
-            max_nodes=args.max_nodes,
             total_calls=total_calls,
         )
         if compared and not compared.get("error") and rerun_plan is None:
@@ -1770,11 +1748,6 @@ def main(argv=None) -> int:
     else:
         note = "RUN STATUS: PASSED\n\n"
     note += redaction_note
-    if recorder.sampled_nodes:
-        note += (
-            f"DIAGNOSTIC SAMPLE: calls beyond the first {args.max_calls_per_function} "
-            "per function are not compared individually unless sampled.\n"
-        )
     if timeout_requested and not hasattr(signal, "SIGALRM"):
         # Windows has no SIGALRM, so the in-process timeout cannot fire.
         note += (

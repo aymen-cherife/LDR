@@ -13,8 +13,8 @@ from .boundary import BoundaryStream
 from .deep import Timeline
 from .fingerprint import PARTIAL_MARK, REDACTED, SKETCH_MARK, SKETCH_TYPES, STATS, is_digest
 from . import previous as previous_runs
-from .sqlite_store import DETAIL_RANK
 from .node import capture
+from .sqlite_store import recording_failure
 from .value_capture import capture_value
 
 
@@ -63,26 +63,19 @@ class CallStream:
         # The size of every value walked, per call (see fingerprint.STATS): (address, phase,
         # role, name, type, nodes), sent with the fingerprints.
         self.sizes = []
-        self.pending_bytes = 0
         self.counts = {}
         self.fingerprinted = 0
         self.stored = 0
-        self.budget_exhausted = False
         self.write_failed = False
         self.finished = False
-        self.value_bytes_in_flight = 0
-        self.committed_value_bytes = 0
         self.cost = {}
         self.shapes = {}
-        self.dropped = {}
-        self.started_calls = 0
         self.incomplete = None
+        self.last_address = None
         self.deep = {}
         self.deep_started = 0
         self.deep_observed = 0
-        self.deep_bytes_in_flight = 0
-        self.committed_deep_bytes = 0
-        self.boundaries = BoundaryStream(store, worker) if store.max_boundary_bytes else None
+        self.boundaries = BoundaryStream(store, worker) if store.capture_boundaries else None
         self.previous = None  # the previous run's signatures by address (previous.Previous)
         self.previous_error = None
         self.previous_load_s = None
@@ -123,7 +116,7 @@ class CallStream:
 
     @property
     def keeping_details(self):
-        return not self.write_failed
+        return not (self.write_failed or (self.boundaries and self.boundaries.write_failed))
 
     def add_sizes(self, frame_id, rows):
         """The sizes of the values one call walked. The flusher thread sends and clears the list."""
@@ -140,14 +133,7 @@ class CallStream:
         The first call of a function, a selected (deep) function and the first N
         calls keep detail. Past the ceiling the run stops: ``incomplete`` is set.
         """
-        self.started_calls += 1
-        if self.started_calls > self.store.max_recorded_calls and self.incomplete is None:
-            limit = self.store.max_recorded_calls
-            self.incomplete = (
-                f"recording stopped after {limit} calls: the fingerprint ceiling "
-                f"(max_recorded_calls = {limit}) was reached, so later calls are not recorded"
-            )
-        if self.incomplete or self.write_failed:
+        if not self.keeping_details:
             return None
         count = self.counts[function] = self.counts.get(function, 0) + 1
         if self.full_tests and address is not None and any(
@@ -158,7 +144,7 @@ class CallStream:
             return "first call"
         if deep:
             return "deep"
-        if count <= self.store.first_calls and not self.budget_exhausted:
+        if count <= self.store.first_calls:
             return "first N"
         return None
 
@@ -184,7 +170,7 @@ class CallStream:
                 parent = self.active.get(id(caller))
                 caller = caller.f_back
             evidence = None
-            if self.store.max_value_bytes and detail:
+            if detail:
                 evidence = self._argument_values(frame, inputs, "entry", preview or {})
             self.active[id(frame)] = (
                 self.next_ordinal,
@@ -199,19 +185,13 @@ class CallStream:
             )
 
     def _value(self, data, phase, name, value, fingerprint, preview=None):
-        limit = (
-            self.store.max_value_bytes
-            - self.committed_value_bytes
-            - self.value_bytes_in_flight
-        )
-        metadata, encoded = capture_value(value, fingerprint, max(0, limit))
+        metadata, encoded = capture_value(value, fingerprint)
         if metadata["status"] != REDACTED:
             if is_digest(fingerprint):
                 metadata["fingerprint"] = fingerprint
             metadata["preview"] = capture(value, name) if preview is None else preview
         if encoded is not None:
             data.append((phase, name, encoded))
-            self.value_bytes_in_flight += len(encoded)
         return metadata
 
     def _argument_values(self, frame, fingerprints, phase, previews):
@@ -226,9 +206,6 @@ class CallStream:
         }
         return metadata, data
 
-    def _release_values(self, data):
-        self.value_bytes_in_flight -= sum(len(value) for _, _, value in data)
-
     def record_line(self, fid, line):
         entry = self.active.get(fid)
         if entry is not None and entry[-1] is not None and self.keeping_details:
@@ -239,21 +216,14 @@ class CallStream:
             timeline = self.deep.get(id(frame))
             if timeline is None:
                 return
-            limit = 0
             if self.keeping_details:
-                limit = self.store.max_deep_bytes - (
-                    self.committed_deep_bytes + self.deep_bytes_in_flight
-                )
-            self.deep_bytes_in_flight += timeline.advance(frame, next_line, event, limit)
+                timeline.advance(frame, next_line, event)
 
     def resume_deep(self, frame):
         with self.lock:
             timeline = self.deep.get(id(frame))
             if timeline is not None:
                 timeline.line = frame.f_lineno
-
-    def _release_deep(self, steps):
-        self.deep_bytes_in_flight -= sum(map(len, steps))
 
     def close(
         self,
@@ -322,7 +292,6 @@ class CallStream:
                 reasons.append("differs from reference")
             if error is not None:
                 reasons.append("exception")
-            primary = max([*reasons, detail] if detail else reasons, key=lambda r: DETAIL_RANK[r], default=None)
             late = False
             if not detail and reasons and self.keeping_details:
                 # Detail that was not captured at entry is built now. An argument that
@@ -333,20 +302,16 @@ class CallStream:
                     preview = self.preview_of(frame, mutated)
                 if output_preview is None and error is None:
                     output_preview = capture(return_value)
-                if self.store.max_value_bytes:
-                    unchanged = {n: t for n, t in inputs.items() if n not in mutated}
-                    evidence = self._argument_values(frame, unchanged, "entry", preview or {})
-                    evidence[0].update(
-                        {n: {"status": "mutated in call", "fingerprint": inputs[n]} for n in mutated}
-                    )
+                unchanged = {n: t for n, t in inputs.items() if n not in mutated}
+                evidence = self._argument_values(frame, unchanged, "entry", preview or {})
+                evidence[0].update(
+                    {n: {"status": "mutated in call", "fingerprint": inputs[n]} for n in mutated}
+                )
             entry_metadata, data = evidence or ({}, [])
             timeline = self.deep.pop(id(frame), None)
-            steps = timeline.steps if timeline is not None else []
             if timeline is not None:
                 self.deep_observed += timeline.observed
             if not (detail and self.keeping_details):
-                self._release_values(data)
-                self._release_deep(steps)
                 if len(self.pending_fp) >= self.store.batch_size:
                     self.flush()
                 return
@@ -389,15 +354,7 @@ class CallStream:
                         ),
                     }
             payload = _encode(fields)
-            size = len(payload) + len(frame_id.encode("utf-8", "surrogatepass"))
-            if self.pending_bytes + size > self.store.max_trace_bytes:
-                self.flush()
-            if self.write_failed:
-                self._release_values(data)
-                self._release_deep(steps)
-                return
-            self.pending.append((ordinal, frame_id, parent, payload, data, timeline, primary))
-            self.pending_bytes += size
+            self.pending.append((ordinal, frame_id, parent, payload, data, timeline))
             if len(self.pending) >= self.store.batch_size or len(self.pending_fp) >= self.store.batch_size:
                 self.flush()
 
@@ -431,29 +388,25 @@ class CallStream:
         return "same" if comparable else "not_compared"
 
     def flush(self):
-        if self.pending or self.pending_fp:
+        if self.keeping_details and (self.pending or self.pending_fp):
             try:
-                (
-                    written,
-                    self.committed_value_bytes,
-                    self.committed_deep_bytes,
-                    dropped,
-                ) = self.store.append_stream(self.worker, self.pending, self.pending_fp, self.sizes)
-                self.stored += written
+                self.stored += self.store.append_stream(self.worker, self.pending, self.pending_fp, self.sizes)
                 self.fingerprinted += len(self.pending_fp)
-                for reason, number in dropped.items():
-                    self.dropped[reason] = self.dropped.get(reason, 0) + number
-                self.budget_exhausted |= "first N" in dropped
-            except (OSError, EOFError, sqlite3.Error):
+            except (OSError, EOFError, sqlite3.Error) as exc:
                 self.write_failed = True
-            for _, _, _, _, data, timeline, _ in self.pending:
-                self._release_values(data)
-                if timeline is not None:
-                    self._release_deep(timeline.steps)
+                self.incomplete = getattr(exc, "failure", None) or recording_failure(
+                    self.store.path, exc, self.fingerprinted, self.last_address
+                )
+            else:
+                if self.pending_fp:
+                    self.last_address = self.pending_fp[-1][1]
             self.pending.clear()
             self.pending_fp.clear()
             self.sizes.clear()
-            self.pending_bytes = 0
+        elif not self.keeping_details:
+            self.pending.clear()
+            self.pending_fp.clear()
+            self.sizes.clear()
 
     def finish(self):
         with self.lock:
@@ -463,7 +416,6 @@ class CallStream:
                 "started": self.next_ordinal,
                 "stored": self.stored,
                 "fingerprinted": self.fingerprinted,
-                "dropped": dict(self.dropped),
                 "incomplete": self.incomplete,
                 "first_calls": self.store.first_calls,
                 "last_calls": self.store.last_calls,
@@ -484,7 +436,7 @@ class CallStream:
                     "cost": dict(self.cost),
                 },
             }
-            if self.store.max_deep_bytes:
+            if self.store.capture_deep:
                 summary["deep"] = {
                     "matched": self.deep_started,
                     "unfinished": len(self.deep),
@@ -500,6 +452,11 @@ class CallStream:
                 summary["previous_error"] = self.previous_error
             if self.boundaries is not None:
                 summary["boundaries"] = self.boundaries.finish()
+                if self.boundaries.failure is not None and not summary["incomplete"]:
+                    exc = self.boundaries.failure
+                    summary["incomplete"] = getattr(exc, "failure", None) or recording_failure(
+                        self.store.path, exc, self.fingerprinted, self.last_address
+                    )
             self.active.clear()
             self.deep.clear()
         try:

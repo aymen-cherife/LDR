@@ -39,12 +39,6 @@ def ldr(project, *args, expected=None):
     return result
 
 
-def deep_allowed(project):
-    (project / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\nmax_trace_bytes = 1000000\nmax_deep_bytes = 200000\n", encoding="utf-8"
-    )
-
-
 def made(tmp_path):
     (tmp_path / "app.py").write_text(APP, encoding="utf-8")
     (tmp_path / "test_app.py").write_text(TESTS, encoding="utf-8")
@@ -95,7 +89,6 @@ def test_full_must_name_a_test(tmp_path):
 
 def test_a_bare_deep_means_every_function_and_does_not_swallow_the_target(tmp_path):
     made(tmp_path)
-    deep_allowed(tmp_path)
     (tmp_path / "script.py").write_text(APP + "f(1)\nf(2)\n", encoding="utf-8")
     ldr(tmp_path, "run", "--deep", "script.py", expected=0)
     result = status(tmp_path)
@@ -105,7 +98,6 @@ def test_a_bare_deep_means_every_function_and_does_not_swallow_the_target(tmp_pa
 
 def test_deep_with_a_name_selects_that_function(tmp_path):
     made(tmp_path)
-    deep_allowed(tmp_path)
     (tmp_path / "script.py").write_text(APP + "def g(x):\n    return x\ng(1)\nf(2)\n", encoding="utf-8")
     ldr(tmp_path, "run", "script.py", "--deep=g", expected=0)
     assert status(tmp_path)["deep_capture"]["matched"] == 1
@@ -118,7 +110,6 @@ def test_the_old_pruning_switch_is_now_no_prune(tmp_path):
 
 
 def test_a_run_in_another_mode_compares_fingerprints_and_says_the_modes_differ(tmp_path):
-    deep_allowed(tmp_path)
     (tmp_path / "script.py").write_text(APP + "for index in range(20):\n    f(index)\n", encoding="utf-8")
     ldr(tmp_path, "run", "script.py", expected=0)
     result = ldr(tmp_path, "run", "script.py", "--deep=f", expected=0)

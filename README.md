@@ -24,7 +24,7 @@ Start with one failing test:
 ldr pytest tests/test_orders.py::test_refund
 ```
 
-Pytest collection is excluded from the trace, so imports do not consume the runtime budget. LDR detects common `src/` and flat-package layouts, ranks up to three observed frames for follow-up, and prints a short command for each. Inspect the strongest candidate with:
+Pytest collection is excluded from the trace, so imports do not enter the runtime trace. LDR detects common `src/` and flat-package layouts, ranks up to three observed frames for follow-up, and prints a short command for each. Inspect the strongest candidate with:
 
 ```bash
 ldr inspect --frame-id 37
@@ -45,9 +45,8 @@ LDR preserves the test runner's exit status and writes:
 - `.ldr/traces.sqlite3` — recorded call history keyed by `status.run_id` in the JSON result
 
 LDR follows pytest's configured worker count. With local `pytest-xdist` workers,
-each worker records the tests it executes and saves its bounded trace when it
-finishes. The result names workers whose traces are missing. The existing
-`--max-nodes` limit applies per worker.
+each worker records the tests it executes and saves its trace when it finishes.
+The result names workers whose traces are missing.
 
 You can tune SQLite writes in the project's `pyproject.toml`.
 
@@ -55,40 +54,28 @@ You can tune SQLite writes in the project's `pyproject.toml`.
 [tool.ldr.storage]
 batch_size = 1000
 busy_timeout = 30 # seconds
-max_trace_bytes = 16777216 # per run, shared by local workers
 ```
 
 `batch_size` is the number of captured calls per transaction. `busy_timeout`
 is how long a writer can wait for a lock. The database uses WAL on SQLite
 releases with the WAL-reset fix and rollback journaling on earlier releases.
 
-LDR streams completed in-scope calls into SQLite. The byte budget covers the
-serialized call records and their frame IDs. SQLite pages, indexes, the
-diagnostic tree, and function summaries use additional space. When the detail
-budget is exhausted, every call still keeps its fingerprints, and each run is
-compared with the previous run of the same target through them.
+LDR streams completed in-scope calls into SQLite. It keeps fingerprints for
+each call and stores detail according to the keep rules. An actual write
+failure marks the recording incomplete and reports the committed call count,
+last recorded address, available disk space, and the next command.
 
-Set `capture_lines = true` in the same table and set `max_trace_bytes`
-explicitly for the workload. Each retained SQLite call then has an
-`executed_lines` list in first-visit order. A line appears once per call even
-if a loop runs it thousands of times. The list shares the byte budget with the
-rest of the call record. See the [line budget audit](evaluation/README.md#line-budget-audit)
-for the workload and byte measurements.
-
-Set a positive `max_value_bytes` under `[tool.ldr.storage]` to capture full
-values. It is a shared per-run allowance for serialized value bodies within
-an explicit `max_trace_bytes`. The default is `0` (off).
+Set `capture_lines = true` in the same table to store an `executed_lines` list
+in first-visit order for retained calls. A line appears once per call.
+See the [line capture audit](evaluation/README.md#line-budget-audit) for
+the workload and byte measurements.
 
 LDR stores supported built-in scalars and containers at function entry and
-exit and on return. Larger or unsupported values keep available fingerprints,
-shape, and previews. Redacted values carry a redaction status. Run `ldr
-inspect --frame-id N` and open `captured_values` in `.ldr/last.json` to read
-the values.
+exit and on return when the call keeps detail. Redacted and unsupported
+values carry an explicit status. Run `ldr inspect --frame-id N` and open
+`captured_values` in `.ldr/last.json` to read the values.
 
-To see how locals evolve inside a function, set an explicit
-`max_trace_bytes` and a positive `max_deep_bytes` in `[tool.ldr.storage]`.
-`max_deep_bytes` defaults to off and is a shared allowance for serialized
-snapshots within the trace budget. Choose both limits for your workload.
+Use `--deep=FUNCTION` to see how locals evolve inside a function.
 
 ```sh
 ldr run app.py --deep=calculate_total
@@ -114,10 +101,8 @@ that moves the function. Use `file:qualname#*` to select every call of a functio
 run. Copy a frame address from its listing and use `--run-id` to pin a run,
 `--offset` and `--limit` to page, and `--json` for structured output.
 
-To save direct calls from project code into selected Python library modules,
-set `max_boundary_bytes` and `max_trace_bytes` explicitly in
-`[tool.ldr.storage]`. The boundary allowance is shared across workers and
-counts toward the trace budget. Use `--boundary` once per module or package.
+Use `--boundary` once per module or package to save direct calls from
+project code into selected Python libraries.
 
 ```sh
 ldr run app.py --boundary urllib.parse --boundary json
@@ -180,16 +165,13 @@ Every run is recorded, and each run is compared with the previous run of the sam
 ```text
 --runner pytest|run|module   Select the runner explicitly
 --timeout 300               Stop a hung in-process run
---max-nodes 5000            Bound the full trace
---max-calls-per-function 8  Sample repetitive hot calls after the first eight
 --max-lines 200             Bound the prose output
 --frame-id N                Restore and inspect a ranked frame from the latest result
 --frame FRAME_ID            Inspect one invocation or a function selector ending #*
---max-state-steps 200       Bound focused local-state history
 --fail-on-change            Exit with code 3 when behavior changes
 ```
 
-Values and output are bounded and result files are written atomically. On POSIX systems they are created with owner-only permissions (0600); on Windows LDR does not change file permissions.
+Printed output is compact, and result files are written atomically. On POSIX systems they are created with owner-only permissions (0600); on Windows LDR does not change file permissions.
 
 ## Secrets
 

@@ -7,10 +7,9 @@ batches of plain tuples. When the target's process dies without warning, the
 parent keeps everything it has received and marks the run with the last
 address it saw; at most one batch can be missing.
 
-``RemoteStore`` stands in for ``TraceStore`` in the sending processes. It plans
-budgets with the same function the writer uses, so its local answers match the
-stored result for a single process. Before any read it waits until the parent
-has applied everything it sent, then reads the database read-only.
+``RemoteStore`` stands in for ``TraceStore`` in the sending processes.
+The writer acknowledges committed batches or reports the first failure.
+Before any read the child waits for the writer, then opens SQLite read-only.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from contextlib import closing
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 
-from .sqlite_store import TraceStore, _call_rows
+from .sqlite_store import TraceStore, _call_rows, recording_failure, recording_failure_text
 
 ENV = "LDR_SINK"
 
@@ -37,15 +36,18 @@ class _Run:
         self.directory = directory
         self.finished = False
         self.last_address = None
+        self.recording_failure = None
+        self.status = None
+        self.write_lock = threading.Lock()
         self.invocation = None  # what the program was started with, from its start message
         self.tests = 0  # tests that have started (pytest runs)
         self.lock = threading.Lock()
-        self.counts = {}  # worker -> stored, dropped, fingerprinted, boundaries, write_failed
+        self.counts = {}  # worker -> stored, fingerprinted, boundaries, write_failed
 
     def count(self, worker):
         return self.counts.setdefault(
             worker,
-            {"stored": 0, "dropped": {}, "fingerprinted": 0, "boundaries": 0, "write_failed": False},
+            {"stored": 0, "fingerprinted": 0, "boundaries": 0, "write_failed": False},
         )
 
 
@@ -95,7 +97,12 @@ class Sink:
                 kind = message[0]
                 if kind == "start":
                     _, directory, invocation, settings = message
-                    store = TraceStore.start(directory, json.loads(invocation), *settings)
+                    try:
+                        store = TraceStore.start(directory, json.loads(invocation), *settings)
+                    except (OSError, sqlite3.Error) as exc:
+                        failure = recording_failure(Path(directory) / "traces.sqlite3", exc, 0, None)
+                        connection.send_bytes(marshal.dumps(("error", failure)))
+                        continue
                     with self.lock:
                         run = self.runs[store.run_id] = _Run(store, directory)
                         run.invocation = json.loads(invocation)
@@ -107,27 +114,31 @@ class Sink:
                 elif kind == "sync":
                     connection.send_bytes(marshal.dumps(("ok",)))
                 else:
-                    self._apply(run, kind, message)
+                    with run.write_lock:
+                        self._apply(run, kind, message)
+                        if kind in ("append", "boundaries"):
+                            reply = ("error", run.recording_failure) if run.recording_failure else ("ok",)
+                            connection.send_bytes(marshal.dumps(reply))
         finally:
             connection.close()
 
     def _apply(self, run, kind, message):
         store = run.store
+        if run.recording_failure and kind in ("append", "boundaries"):
+            return
         try:
             if kind == "append":
                 _, worker, rows, fingerprints, sizes = message
-                written, _, _, dropped = store.append_stream(worker, rows, fingerprints, sizes)
+                written = store.append_stream(worker, rows, fingerprints, sizes)
                 with run.lock:
                     counts = run.count(worker)
                     counts["stored"] += written
                     counts["fingerprinted"] += len(fingerprints)
-                    for reason, number in dropped.items():
-                        counts["dropped"][reason] = counts["dropped"].get(reason, 0) + number
                     if fingerprints:
                         run.last_address = fingerprints[-1][1]
             elif kind == "boundaries":
                 _, worker, rows = message
-                written = store.append_boundaries(worker, rows)[0]
+                written = store.append_boundaries(worker, rows)
                 with run.lock:
                     run.count(worker)["boundaries"] += written
             elif kind == "finish_stream":
@@ -137,7 +148,6 @@ class Sink:
                     # The parent decided what was stored; its counts are the record.
                     summary["stored"] = counts["stored"]
                     summary["fingerprinted"] = counts["fingerprinted"]
-                    summary["dropped"] = counts["dropped"]
                     summary["write_failed"] = summary.get("write_failed") or counts["write_failed"]
                     if "boundaries" in summary:
                         summary["boundaries"]["stored"] = counts["boundaries"]
@@ -157,12 +167,25 @@ class Sink:
                 store.save_worker_rows(worker, rows, summary)
             elif kind == "finish":
                 # The indexed tables are built once the child has ended (see close).
-                store.finish(message[1], build=False)
+                run.status = message[1]
+                if run.recording_failure:
+                    run.status["incomplete"] = run.recording_failure
+                store.finish(run.status, build=False)
                 run.finished = True
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error) as exc:
+            if kind in ("append", "boundaries", "finish_stream", "worker", "finish"):
+                self._record_failure(run, kind, exc)
+                if kind in ("append", "boundaries", "finish_stream"):
+                    run.count(message[1])["write_failed"] = True
+
+    @staticmethod
+    def _record_failure(run, operation, exc):
+        if run.recording_failure is None:
             with run.lock:
-                for worker in (message[1:2] if kind in ("append", "boundaries", "finish_stream") else ()):
-                    run.count(worker)["write_failed"] = True
+                calls = sum(count["fingerprinted"] for count in run.counts.values())
+                failure = recording_failure(run.store.path, exc, calls, run.last_address)
+                failure["operation"] = operation
+                run.recording_failure = failure
 
     def close(self, exit_code: int, timeout: float = 30.0) -> str | None:
         """Finish writing after the child ended. Returns a message when it died."""
@@ -176,10 +199,14 @@ class Sink:
         for each in self.runs.values():
             try:
                 each.store.build_lookup()
-            except (OSError, sqlite3.Error):
-                pass
+            except (OSError, sqlite3.Error) as exc:
+                self._record_failure(each, "build indexes", exc)
         run = self.runs.get(self.main_run) if self.main_run else None
-        if run is None or run.finished:
+        if run is None:
+            return None
+        if run.recording_failure:
+            return self._finish_incomplete(run, exit_code)
+        if run.finished:
             return None
         batch = run.store.batch_size
         where = run.last_address or "(no call was received)"
@@ -201,6 +228,50 @@ class Sink:
         except (OSError, sqlite3.Error):
             pass
         _write_died_result(run.directory, status, message)
+        return message
+
+    @staticmethod
+    def _finish_incomplete(run, exit_code):
+        from .store import atomic_json, atomic_text
+
+        failure = run.recording_failure
+        message = recording_failure_text(failure)
+        status = {
+            **(run.status or {}),
+            "ok": exit_code == 0,
+            "exit_code": exit_code,
+            "run_id": run.store.run_id,
+            "incomplete": failure,
+        }
+        try:
+            run.store.finish(status, build=False)
+        except (OSError, sqlite3.Error):
+            pass
+        # Keep the report if the child already published it. The supervisor has
+        # the committed call count even when the child could not finish its report.
+        name = "rerun" if status.get("rerun") else "last"
+        json_path = Path(run.directory) / f"{name}.json"
+        text_path = json_path.with_suffix(".txt")
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        original = payload.get("status", {})
+        if original.get("run_id") != run.store.run_id:
+            payload = {"status": status, "findings": [], "failures": []}
+            report = ""
+        else:
+            original.update(status)
+            try:
+                report = text_path.read_text(encoding="utf-8")
+            except OSError:
+                report = ""
+        try:
+            atomic_json(str(json_path), payload)
+            if message not in report:
+                atomic_text(str(text_path), message + "\n" + report)
+        except OSError:
+            pass
         return message
 
 
@@ -232,6 +303,12 @@ class _Client:
             return marshal.loads(self.connection.recv_bytes())
 
 
+class RecordingWriteError(OSError):
+    def __init__(self, failure):
+        super().__init__(failure["error"])
+        self.failure = failure
+
+
 class RemoteStore(TraceStore):
     """A ``TraceStore`` that sends its writes to the parent and reads read-only."""
 
@@ -241,23 +318,33 @@ class RemoteStore(TraceStore):
         super().__init__(*args, **kwargs)
         self.sink = sink
         self._client = None
-        self._used = self._value_used = self._deep_used = self._boundary_used = 0
+        self._connect_lock = threading.Lock()
 
     @classmethod
     def start_remote(cls, sink, directory, invocation, *settings):
         client = _Client(sink)
         reply = client.request(("start", str(directory), json.dumps(invocation), list(settings)))
+        if reply[0] == "error":
+            raise RecordingWriteError(reply[1])
         store = cls(**reply[1], sink=sink)
         store._client = client
         return store
 
-    def _send(self, message):
+    def _send(self, message, *, acknowledge=False):
         if self._client is None:
-            self._client = _Client(self.sink)
-            settings = self.settings()
-            settings.pop("sink", None)
-            self._client.send(("attach", settings))
-        self._client.send(message)
+            with self._connect_lock:
+                if self._client is None:
+                    client = _Client(self.sink)
+                    settings = self.settings()
+                    settings.pop("sink", None)
+                    client.send(("attach", settings))
+                    self._client = client
+        if acknowledge:
+            reply = self._client.request(message)
+            if reply[0] == "error":
+                raise RecordingWriteError(reply[1])
+        else:
+            self._client.send(message)
 
     def sync(self):
         if self._client is not None:
@@ -273,23 +360,17 @@ class RemoteStore(TraceStore):
     # --- writes: planned locally, sent to the parent
 
     def append_stream(self, worker, rows, fingerprints=(), sizes=()):
-        kept, dropped, _, _, self._used, self._value_used, self._deep_used = self.plan_detail(
-            rows, self._used, self._value_used, self._deep_used
-        )
         packed = [
             (ordinal, frame_id, parent, payload, data,
-             None if timeline is None else (timeline.observed, list(timeline.steps)), reason)
-            for ordinal, frame_id, parent, payload, data, timeline, reason in rows
+             None if timeline is None else (timeline.observed, list(timeline.steps)))
+            for ordinal, frame_id, parent, payload, data, timeline in rows
         ]
-        self._send(("append", worker, packed, list(fingerprints), list(sizes)))
-        return len(kept), self._value_used, self._deep_used, dropped
+        self._send(("append", worker, packed, list(fingerprints), list(sizes)), acknowledge=True)
+        return len(rows)
 
     def append_boundaries(self, worker, rows):
-        admitted, added = self.plan_boundaries(rows, self._used, self._boundary_used)
-        self._used += added
-        self._boundary_used += added
-        self._send(("boundaries", worker, list(rows)))
-        return len(admitted), self._boundary_used, self.max_trace_bytes - self._used
+        self._send(("boundaries", worker, list(rows)), acknowledge=True)
+        return len(rows)
 
     def finish_stream(self, worker, summary):
         self._send(("finish_stream", worker, summary))

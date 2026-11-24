@@ -43,13 +43,10 @@ class Budget:
 
     Deliberately no time budget: a wall-clock limit would make the same value
     ``complete`` in one run and ``unknown`` in the next, depending on machine
-    load, and fake a difference. There is no node cap by default (Phase 2 rule
-    5): a large value is walked, and the cost is reported per function. The
-    depth limit stays as a guard. ``max_nodes`` remains for callers that set one.
+    load, and fake a difference. Only the comparison walk can use a node ceiling.
     """
 
     max_nodes: int | None = None
-    max_depth: int = 24
 
 
 DEFAULT_BUDGET = Budget()
@@ -234,9 +231,7 @@ class _Walk:
     def encode(self, value: Any, out: hashlib.blake2b, depth: int = 0) -> None:
         self.visited += 1
         budget = self.budget
-        if depth > budget.max_depth or (
-            budget.max_nodes is not None and self.visited > budget.max_nodes
-        ):
+        if budget.max_nodes is not None and self.visited > budget.max_nodes:
             raise _Stop(UNKNOWN)
         kind = type(value)
         if value is None:
@@ -367,8 +362,6 @@ class _Walk:
             body = b"".join(pieces)
         else:
             return False
-        if depth + 1 > self.budget.max_depth:
-            raise _Stop(UNKNOWN)
         self.visited += len(value)
         if self.budget.max_nodes is not None and self.visited > self.budget.max_nodes:
             raise _Stop(UNKNOWN)

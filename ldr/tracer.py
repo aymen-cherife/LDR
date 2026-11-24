@@ -1,8 +1,7 @@
 """Low-overhead function-boundary recording built on ``sys.monitoring``.
 
-The normal tree has a hard budget. After that budget is exhausted LDR keeps
-only lightweight live frames, so a late exception can still be promoted into
-an actionable call chain instead of disappearing behind the cap.
+The streaming recorder keeps lightweight live frames and writes completed calls
+in batches. Focused inspection can also build a tree.
 """
 
 from __future__ import annotations
@@ -89,35 +88,21 @@ class Recorder:
     def __init__(
         self,
         scope: list[str],
-        max_nodes: int = 5000,
-        max_depth: int = 60,
         lines_for: set[str] | None = None,
         project_root: str | None = None,
         display_root: str | None = None,
         focus_frame: str | None = None,
-        max_state_steps: int = 200,
-        max_calls_per_function: int = 8,
         deep_functions: list[str] | None = None,
         boundary_modules: list[str] | None = None,
         build_tree: bool = True,
         uncapped: list[str] | None = None,
     ):
-        if max_nodes < 1:
-            raise ValueError("max_nodes must be at least 1")
-        if max_depth < 1:
-            raise ValueError("max_depth must be at least 1")
-        if max_state_steps < 1:
-            raise ValueError("max_state_steps must be at least 1")
-        if max_calls_per_function < 1:
-            raise ValueError("max_calls_per_function must be at least 1")
         self.scope = [os.path.realpath(p) for p in scope]
         self.project_root = os.path.realpath(project_root or os.getcwd())
         self.display_root = os.path.realpath(display_root or os.getcwd())
-        self.max_nodes = max_nodes
         # False: no node is built per call. The calls are in SQLite, and the report reads
         # them from there. Light entries keep addresses and failures working.
         self.build_tree = build_tree
-        self.max_depth = max_depth
         self.lines_for = lines_for or set()
         self.focus_frame = focus_frame
         self.frame_prefix = ""
@@ -138,8 +123,6 @@ class Recorder:
         self._deep_codes: set[object] = set()
         self._global_lines = False
         self._timings: dict[int, CallTiming] = {}
-        self.max_state_steps = max_state_steps
-        self.max_calls_per_function = max_calls_per_function
         self.inspection_matches = 0
         self.roots: list[Node] = []
         self.suspended: dict[int, Node | _Shadow] = {}
@@ -153,10 +136,6 @@ class Recorder:
         self._display_cache: dict[str, str] = {}
         self._source_cache: dict[str, str] = {}
         self._code_cache: dict[object, tuple[int, str, str]] = {}
-        self._suppressed_codes: set[object] = set()
-        self._synthetic_exceptions: dict[int, list[Node]] = {}
-        self._synthetic_objects: dict[int, BaseException] = {}
-        self._synthetic_order: list[int] = []
         self._invocation_counts: dict[str, int] = {}
         # Address state: calls with no recorded caller count under the current
         # test root (or the run, outside pytest).
@@ -354,9 +333,7 @@ class Recorder:
     def _caller_receiver(self, frame):
         """The receiver of the nearest recorded call that is running this one, or None."""
         caller = frame.f_back
-        for _ in range(64):
-            if caller is None:
-                return None
+        while caller is not None:
             known = self._receivers.get(id(caller))
             if known is not None and known[0] is caller:
                 return known[1]
@@ -497,10 +474,6 @@ class Recorder:
             return base, segment, ordinal
         return (f"{base}/{segment}" if base else segment), segment, ordinal
 
-    def _sample_repeated_call(self, ordinal: int) -> bool:
-        """Keep early calls and exponentially spaced samples from hot functions."""
-        return ordinal > self.max_calls_per_function and ordinal & (ordinal - 1) != 0
-
     def _new_node(self, code, frame, frame_id: str, *, detailed: bool = False) -> Node:
         source_id, module, line, file, callsite = self._metadata(code, frame)
         try:
@@ -605,9 +578,6 @@ class Recorder:
             evidence = self._mutable_argument_evidence(code, frame)
             if evidence:
                 self._mutable_evidence[id(frame)] = evidence
-        if self.call_stream.incomplete:
-            self._halt()
-            return
         preview = None
         if detail:
             preview = node.in_ if node is not None else self._arguments(code, frame)
@@ -632,6 +602,9 @@ class Recorder:
             node.ms = timing["elapsed_ms"]
 
     def _on_start(self, code, offset):
+        if self.call_stream is not None and not self.call_stream.keeping_details:
+            self._halt()
+            return
         if get_ident() == self._quiet_thread:
             return  # LDR's own sending thread is never recorded
         mon = sys.monitoring
@@ -651,74 +624,21 @@ class Recorder:
         at = perf_counter_ns()
         stack = _stack.get()
         parent = stack[-1] if stack else None
-        frame_id, segment, ordinal = self._next_frame_id(code, parent)
+        frame_id, segment, _ = self._next_frame_id(code, parent)
         if not self.build_tree:
             entry = self._new_shadow(code, frame, frame_id)
             entry.segment = segment
             self._start_capture(code, frame, frame_id, at)
             _stack.set(stack + (entry,))
             return
-        if code in self._suppressed_codes:
-            self._start_capture(code, frame, frame_id, at)
-            return
         focused = self._focus_matches(frame_id, segment)
-        direct_focus = bool(
-            self.focus_frame
-            and parent is not None
-            and self._focus_matches(self._entry_frame_id(parent), self._entry_segment(parent))
-        )
-        sampled_repeat = self._sample_repeated_call(ordinal) and not (focused or direct_focus)
-        if sampled_repeat:
-            # Preserve budget without disabling the code object: later
-            # power-of-two samples can still expose an anomalous invocation.
-            self.sampled_nodes += 1
-            self.truncated = True
-            entry = self._new_shadow(code, frame, frame_id, preserve_children=True)
-            entry.segment = segment
-        elif (
-            (self.n_nodes < self.max_nodes and len(stack) < self.max_depth)
-            or focused
-            or direct_focus
-        ):
-            entry: Node | _Shadow = self._new_node(
-                code,
-                frame,
-                frame_id,
-                detailed=focused,
-            )
-            entry.__dict__["_segment"] = segment
-            self._attach(entry, stack)
-            self.n_nodes += 1
-            if focused:
-                self.inspection_matches += 1
-        else:
-            self.dropped_nodes += 1
-            self.truncated = True
-            active_same_code = any(
-                isinstance(item, _Shadow) and item.code is code
-                or isinstance(item, Node) and item.__dict__.get("_code") is code
-                for item in stack
-            )
-            async_or_generator = bool(
-                code.co_flags
-                & (inspect.CO_COROUTINE | inspect.CO_GENERATOR | inspect.CO_ASYNC_GENERATOR)
-            )
-            if (
-                self.n_nodes >= self.max_nodes
-                and not active_same_code
-                and not async_or_generator
-            ):
-                # Disable start/return callbacks for this hot code object.
-                # The global RAISE event remains active and reconstructs the
-                # scoped Python frame chain if a later invocation fails.
-                self._suppressed_codes.add(code)
-                if self.call_stream is not None:
-                    self._start_capture(code, frame, frame_id, at)
-                    return
-                return mon.DISABLE
-            entry = self._new_shadow(code, frame, frame_id)
-            entry.segment = segment
-        self._start_capture(code, frame, frame_id, at, entry if isinstance(entry, Node) else None)
+        entry = self._new_node(code, frame, frame_id, detailed=focused)
+        entry.__dict__["_segment"] = segment
+        self._attach(entry, stack)
+        self.n_nodes += 1
+        if focused:
+            self.inspection_matches += 1
+        self._start_capture(code, frame, frame_id, at, entry)
         _stack.set(stack + (entry,))
 
     def _boundary_wanted(self, code) -> bool:
@@ -760,7 +680,7 @@ class Recorder:
     @staticmethod
     def _state_locals(frame) -> dict[str, str]:
         captured: dict[str, str] = {}
-        for name, value in list(frame.f_locals.items())[:64]:
+        for name, value in frame.f_locals.items():
             if name in ("self", "cls") or name.startswith("__"):
                 continue
             captured[name] = capture_state(value, name)
@@ -784,9 +704,6 @@ class Recorder:
         before: dict[str, str],
         after: dict[str, str],
     ) -> None:
-        if len(entry.state_steps) >= self.max_state_steps:
-            entry.state_truncated = True
-            return
         statement = redact_source_line(linecache.getline(code.co_filename, line).strip())
         entry.state_steps.append(
             {
@@ -828,67 +745,6 @@ class Recorder:
             self.call_stream.record_deep(frame, line_number, "line")
         if self.focus_frame:
             self._capture_state_transition(code, frame, line_number)
-
-    def _promote_suppressed(self, frame, exc: BaseException) -> None:
-        exception_id = id(exc)
-        if exception_id in self._synthetic_exceptions:
-            return
-
-        scoped_frames = []
-        current = frame
-        while current is not None and len(scoped_frames) < self.max_depth:
-            code = current.f_code
-            if self._in_scope(code.co_filename) and not self._skip(code):
-                scoped_frames.append(current)
-            current = current.f_back
-        if not scoped_frames:
-            return
-
-        stack = _stack.get()
-        active = {self._entry_fid(entry): entry for entry in stack}
-        parent: Node | _Shadow | None = None
-        build_frames = scoped_frames
-        for index, candidate in enumerate(scoped_frames):
-            matched = active.get(id(candidate))
-            if matched is not None:
-                parent = matched
-                build_frames = scoped_frames[:index]
-                break
-
-        error = capture_error(exc)
-        created: list[Node] = []
-        for candidate in reversed(build_frames):
-            code = candidate.f_code
-            try:
-                arguments = self._arguments(code, candidate)
-            except Exception:
-                arguments = {}
-            source_id, module, line, file, callsite = self._metadata(code, candidate)
-            node = Node(
-                name=code.co_qualname,
-                in_=arguments,
-                error=error,
-                handled=True,
-                module=module,
-                file=file,
-                source_id=source_id,
-                line=line,
-                callsite=callsite,
-                frame_id="",
-            )
-            node.__dict__["_exc_id"] = exception_id
-            if parent is None:
-                self.roots.append(node)
-            else:
-                parent.children.append(node)
-            parent = node
-            created.append(node)
-        if created:
-            self._synthetic_exceptions[exception_id] = created
-            # Retain the object so CPython cannot reuse its id for a later,
-            # unrelated exception before final status classification.
-            self._synthetic_objects[exception_id] = exc
-            self._synthetic_order.append(exception_id)
 
     def _matching_stack(self, frame) -> tuple[tuple[Node | _Shadow, ...], Node | _Shadow] | None:
         stack = _stack.get()
@@ -1003,18 +859,6 @@ class Recorder:
         timing = self._finish_timing(frame, perf_counter_ns())
         if code in self._deep_codes:
             self.call_stream.record_deep(frame, None, "return")
-        if code in self._suppressed_codes:
-            if self.call_stream is not None:
-                preview = capture(retval) if self.call_stream.detail_for(frame) else None
-                exit_fps = self._argument_fingerprints(code, frame)
-                mark = STATS.walks
-                out_fp = fp_value(retval)
-                if STATS.walks != mark:
-                    self._note_walk(frame, "exit", None)
-                self._send_sizes(frame, self.call_stream.frame_address(frame) or "")
-                self.call_stream.close(frame, exit_fps, out_fp, None, preview, timing, retval)
-                return
-            return sys.monitoring.DISABLE
         self._close(code, frame, timing, return_value=retval)
 
     def _on_yield(self, code, offset, retval):
@@ -1069,23 +913,7 @@ class Recorder:
         timing = self._finish_timing(frame, perf_counter_ns())
         if code in self._deep_codes:
             self.call_stream.record_deep(frame, None, "unwind")
-        if code in self._suppressed_codes:
-            self._promote_suppressed(frame, exc)
-            if self.call_stream is not None:
-                exit_fps = self._argument_fingerprints(code, frame)
-                self._send_sizes(frame, self.call_stream.frame_address(frame) or "")
-                self.call_stream.close(frame, exit_fps, None, capture_error(exc), None, timing)
-            return
         self._close(code, frame, timing, error=capture_error(exc))
-
-    def _on_raise(self, code, offset, exc):
-        if code not in self._suppressed_codes:
-            return
-        try:
-            frame = sys._getframe(1)
-        except Exception:
-            return
-        self._promote_suppressed(frame, exc)
 
     def _claim_tool_id(self) -> int:
         mon = sys.monitoring
@@ -1128,7 +956,6 @@ class Recorder:
             events.PY_RESUME: self._on_resume,
             events.PY_THROW: self._on_throw,
             events.PY_UNWIND: self._on_unwind,
-            events.RAISE: self._on_raise,
         }
         self._global_lines = bool(
             self.focus_frame
@@ -1175,30 +1002,6 @@ class Recorder:
             for root in self.roots:
                 _mark_handled(root)
             return
-        exception_id = id(escaped_exception) if escaped_exception is not None else None
-        if exception_id in self._synthetic_exceptions:
-            # Pytest catches the test exception and reports failure via its
-            # exit status. Bind the final trace to that exact report object so
-            # expected module probes and other isolated AttributeErrors cannot
-            # outrank a late failure promoted after the node budget.
-            for root in self.roots:
-                _mark_handled(root)
-            for node in self._synthetic_exceptions[exception_id]:
-                node.handled = False
-            return
-        has_regular_unhandled = any(
-            node.error is not None and not node.handled
-            for root in self.roots
-            for node in root.walk()
-        )
-        if (
-            exception_id not in self._synthetic_exceptions
-            and self._synthetic_order
-            and not has_regular_unhandled
-        ):
-            exception_id = self._synthetic_order[-1]
-        for node in self._synthetic_exceptions.get(exception_id, []):
-            node.handled = False
 
     def stop(self) -> None:
         if not self._active or self._tool_id is None:
@@ -1216,7 +1019,6 @@ class Recorder:
         self._active = False
         self._tool_id = None
         self._registered_events.clear()
-        self._suppressed_codes.clear()
         _stack.set(())
         stopped = perf_counter_ns()
         for fid, entry in self.suspended.items():

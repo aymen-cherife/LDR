@@ -24,8 +24,8 @@ def project(tmp_path):
         shutil.copyfile(FIXTURE / file, tmp_path / file)
     (tmp_path / "pyproject.toml").write_text(
         "[tool.ldr.storage]\n"
-        "max_trace_bytes = 100000\nmax_value_bytes = 10000\n"
-        "max_deep_bytes = 10000\ncapture_lines = true\n",
+        ""
+        "capture_lines = true\n",
         encoding="utf-8",
     )
     return tmp_path
@@ -116,34 +116,10 @@ def test_cli_preserves_output_and_saves_readable_evidence(project):
     assert json.loads(last_json.read_bytes())["behavior"]["changed"] is True
 
 
-def test_budget_limits_saved_evidence_and_preserves_output(project):
-    (project / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\nmax_trace_bytes = 2000\nmax_deep_bytes = 250\n",
-        encoding="utf-8",
-    )
-    plain = export(launch(project, "app.py"), project)
-    traced = launch(project, "-m", "ldr", "run", "app.py", "--deep=make_export")
-    assert export(traced, project) == plain
-
-    trace_dir = project / ".ldr"
-    status = json.loads((trace_dir / "last.json").read_bytes())["status"]
-    deep = status["deep_capture"]
-    assert deep["matched"] == 1
-    assert deep["retained"] < deep["observed"]
-    assert deep["bytes"] <= 250
-    stream = status["call_stream"]
-    assert 0 < stream["stored"] < stream["started"]
-    with sqlite3.connect(trace_dir / "traces.sqlite3") as conn:
-        used, = conn.execute(
-            "SELECT used_bytes FROM stream_budget WHERE run_id = ?", (status["run_id"],)
-        ).fetchone()
-    assert 0 < used <= 4 * 2000  # keep rules may pass the normal budget, up to the hard cap
-
-
 def test_boundary_capture_records_python_library_calls_without_their_internals(project):
     config = project / "pyproject.toml"
     with config.open("a", encoding="utf-8") as handle:
-        handle.write("max_boundary_bytes = 10000\n")
+        handle.write("")
     plain = export(launch(project, "app.py"), project)
     traced = launch(
         project, "-m", "ldr", "run", "app.py",
@@ -183,24 +159,7 @@ def test_boundary_capture_records_python_library_calls_without_their_internals(p
     ] == []
 
 
-def test_boundary_capture_requires_a_configured_budget(project):
-    (project / "app.py").write_text("print('APP RAN')\n", encoding="utf-8")
-    result = processes.run(
-        [sys.executable, "-m", "ldr", "run", "app.py", "--boundary", "json"],
-        cwd=project,
-        env=dict(os.environ, PYTHONPATH=str(REPO)),
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 2
-    assert "--boundary requires explicit" in result.stderr
-    assert "APP RAN" not in result.stdout
-
-
 def test_boundary_capture_reports_handled_library_exception_without_its_message(project):
-    with (project / "pyproject.toml").open("a", encoding="utf-8") as handle:
-        handle.write("max_boundary_bytes = 10000\n")
     (project / "app.py").write_text(
         "import json, os\n"
         "def accepts_json():\n"
@@ -221,10 +180,10 @@ def test_boundary_capture_reports_handled_library_exception_without_its_message(
     assert EXPORT_KEY.encode() not in (project / ".ldr/traces.sqlite3").read_bytes()
 
 
-def test_boundary_budget_is_shared_across_pytest_workers(project):
+def test_boundary_capture_keeps_calls_across_pytest_workers(project):
     pytest.importorskip("xdist")
     (project / "pyproject.toml").write_text(
-        "[tool.ldr.storage]\nmax_trace_bytes = 100000\nmax_boundary_bytes = 850\n",
+        "[tool.ldr.storage]\n",
         encoding="utf-8",
     )
     (project / "test_calls.py").write_text(
@@ -243,7 +202,7 @@ def test_boundary_budget_is_shared_across_pytest_workers(project):
     status = report["status"]["boundary_capture"]
     assert report["status"]["trace_workers"] == ["gw0", "gw1"]
     assert status["started"] == 2
-    assert status["stored"] == 1
+    assert status["stored"] == 2
     with sqlite3.connect(project / ".ldr/traces.sqlite3") as conn:
         size, = conn.execute("SELECT sum(length(payload)) FROM stream_boundaries").fetchone()
-    assert size == status["bytes"] <= 850
+    assert size == status["bytes"]
