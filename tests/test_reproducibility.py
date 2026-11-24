@@ -22,7 +22,7 @@ def ldr(project, *args, env=None, expected=0):
     environment = dict(os.environ, PYTHONPATH=str(REPO))
     environment.pop("PYTHONHASHSEED", None)
     environment.update(env or {})
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project, env=environment,
         capture_output=True, text=True, timeout=180,
     )
@@ -48,6 +48,7 @@ def test_the_users_hash_seed_is_kept_and_anything_else_is_chosen():
 
 APP_SEED = """\
 import os
+from ldr import processes
 print("SEED", os.environ.get("PYTHONHASHSEED"), os.environ.get("LDR_HASH_SEED_SOURCE"))
 print("ORDER", list({"alpha", "beta", "gamma", "delta", "epsilon"}))
 """

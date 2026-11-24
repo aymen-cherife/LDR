@@ -9,13 +9,14 @@ from __future__ import annotations
 import os
 import subprocess
 from typing import Any
+from . import processes
 
 _TIMEOUT_SECONDS = 5
 
 
 def _git(root: str, *args: str) -> subprocess.CompletedProcess | None:
     try:
-        return subprocess.run(
+        return processes.run(
             ["git", "-C", root, *args],
             capture_output=True,
             text=True,

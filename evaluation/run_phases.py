@@ -32,10 +32,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import overhead  # noqa: E402
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from ldr import processes  # noqa: E402
 
 
 def check_machine(checkout: Path, root: Path, env: dict) -> str:
-    result = subprocess.run([sys.executable, "-m", "ldr", "check_machine"], cwd=root, env=env, capture_output=True, text=True)
+    result = processes.run([sys.executable, "-m", "ldr", "check_machine"], cwd=root, env=env, capture_output=True, text=True)
     return result.stdout.strip()
 
 
@@ -53,7 +58,7 @@ def wait_for_a_clean_machine(checkout: Path, root: Path, env: dict, seconds: int
 def one(root: Path, command: list[str], env: dict) -> dict:
     overhead_started = time.time()
     started = time.perf_counter()
-    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
+    result = processes.run(command, cwd=root, env=env, capture_output=True, text=True)
     wall = time.perf_counter() - started
     returned = time.time()
     if result.returncode != 0:

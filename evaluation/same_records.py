@@ -21,6 +21,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import overhead  # noqa: E402
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from ldr import processes  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
@@ -31,7 +36,7 @@ def run_and_dump(name, fixture, checkout, drop):
     env["PYTHONHASHSEED"] = "0"
     overhead.clean(root)
     overhead.timed(traced, root, env)
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, str(HERE / "dump_run.py"), str(root)],
         capture_output=True, text=True, check=True, env=dict(os.environ, DUMP_DROP=drop),
     )

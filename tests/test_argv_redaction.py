@@ -11,6 +11,7 @@ ENV = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
 sys.path.insert(0, os.path.dirname(HERE))
 
 from ldr.redact import redact_argv  # noqa: E402
+from ldr import processes
 
 
 def test_secret_flags_and_values_are_redacted():
@@ -61,7 +62,7 @@ def stored_text(tmp_path, result):
 def test_credentials_after_dashdash_are_hidden_but_the_program_still_gets_them(tmp_path):
     (tmp_path / "app.py").write_text(APP)
 
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr.cli", "run", "app.py", "--",
          "--password=hunter22pass", "--token", "abc123def456", "keep-me"],
         cwd=tmp_path, env=ENV, capture_output=True, text=True,
@@ -82,7 +83,7 @@ def test_credentials_are_hidden_even_when_argparse_separates_a_flag_from_its_val
     learned from the raw command line, so the value is still found."""
     (tmp_path / "app.py").write_text(APP)
 
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr.cli", "run", "app.py",
          "--password=hunter22pass", "--token", "abc123def456", "keep-me"],
         cwd=tmp_path, env=ENV, capture_output=True, text=True,
@@ -102,7 +103,7 @@ def test_inspect_refuses_to_rerun_with_redacted_arguments(tmp_path):
                   "arguments": ["--token", "<secret: by name, 12 chars>"]},
     }))
 
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr.cli", "inspect", "--frame-id", "1"],
         cwd=tmp_path, env=ENV, capture_output=True, text=True,
     )

@@ -12,6 +12,7 @@ import pytest
 
 from ldr import fingerprint as fp
 from ldr.fingerprint import Budget, SKETCH_MARK, fingerprint, is_digest, is_sketch
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -151,7 +152,7 @@ total(big)
 
 
 def ldr(project, *args, expected=0):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

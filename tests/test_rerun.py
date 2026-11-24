@@ -45,6 +45,7 @@ def mark(value):
 TESTS = """\
 import os
 import app
+from ldr import processes
 
 
 def test_steady():
@@ -83,7 +84,7 @@ def test_flaky():
 def ldr(project, *args, expected=None):
     environment = dict(os.environ, PYTHONPATH=str(REPO))
     environment.pop("PYTHONHASHSEED", None)
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project, env=environment,
         capture_output=True, text=True, timeout=300,
     )

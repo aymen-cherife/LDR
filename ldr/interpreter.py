@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from . import processes
 
 CHILD_MARKER = "LDR_RUN_CHILD"
 SELECTED_BY = "LDR_INTERPRETER"
@@ -65,7 +66,7 @@ def importable(python: str, environ) -> bool:
     if _same(python, sys.executable):
         return True
     try:
-        probe = subprocess.run(
+        probe = processes.run(
             [python, "-c", "import ldr"], env=environ, capture_output=True, timeout=60
         )
     except (OSError, subprocess.SubprocessError):
@@ -108,7 +109,7 @@ def run_in_child(
     environ["PYTHONHASHSEED"], environ[reproduce.SEED_SOURCE_ENV] = reproduce.choose_hash_seed(environ, hash_seed)
     environ[SINK_ENV] = sink.token
     try:
-        process = subprocess.Popen([python, "-m", "ldr.cli", *argv], env=environ, **(popen_kwargs or {}))
+        process = processes.Popen([python, "-m", "ldr.cli", *argv], env=environ, **(popen_kwargs or {}))
     except OSError as exc:
         say(f"LDR could not start {python}: {exc}")
         sink.close(2)

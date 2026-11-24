@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 import pytest
+from ldr import processes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
@@ -13,7 +14,7 @@ ENV = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
 def test_timeout_without_sigalrm_warns_instead_of_silently_doing_nothing(tmp_path):
     (tmp_path / "ok.py").write_text("def f():\n    return 1\nf()\n")
 
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr.cli", "run", "ok.py", "--timeout", "5"],
         cwd=tmp_path, env=ENV, capture_output=True, text=True,
     )

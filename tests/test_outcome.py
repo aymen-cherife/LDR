@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import pytest
+from ldr import processes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
@@ -15,14 +16,14 @@ needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not inst
 
 
 def ldr(cwd, *args):
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr.cli", *args],
         cwd=cwd, env=ENV, capture_output=True, text=True,
     )
 
 
 def git(cwd, *args):
-    return subprocess.run(
+    return processes.run(
         ["git", *args], cwd=cwd, capture_output=True, text=True, check=True,
         env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                  GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"),

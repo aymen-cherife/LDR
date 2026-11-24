@@ -40,6 +40,11 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from ldr import processes  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -80,8 +85,8 @@ def bench_python(work: Path) -> str:
     venv = work / "benchenv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if not python.exists():
-        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
-        subprocess.run(
+        processes.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        processes.run(
             [str(python), "-m", "pip", "install", "-q", "-r", str(REPO / "evaluation" / "bench-requirements.txt")],
             check=True,
         )
@@ -96,9 +101,9 @@ def unpack(work: Path, python: str, name: str, version: str, github: str | None 
     download.mkdir(parents=True, exist_ok=True)
     if github:
         archive = download / f"{name.lower()}-v{version}.tar.gz"
-        subprocess.run(["curl", "-sL", "-o", str(archive), github], check=True)
+        processes.run(["curl", "-sL", "-o", str(archive), github], check=True)
     else:
-        subprocess.run(
+        processes.run(
             [python, "-m", "pip", "download", f"{name}=={version}", "--no-binary", ":all:",
              "--no-deps", "-q", "-d", str(download)],
             check=True,
@@ -156,7 +161,7 @@ def build(work: Path, name: str):
 
 def timed(command: list[str], cwd: Path, env: dict[str, str]) -> float:
     started = time.perf_counter()
-    result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
+    result = processes.run(command, cwd=cwd, env=env, capture_output=True, text=True)
     elapsed = time.perf_counter() - started
     if result.returncode != 0:
         raise SystemExit(f"{' '.join(command)} failed in {cwd}:\n{result.stdout[-1500:]}\n{result.stderr[-1500:]}")
@@ -238,7 +243,7 @@ def noise(name, fixture, env):
     for _ in range(2):
         clean(root)
         timed(traced, root, env)
-        result = subprocess.run(
+        result = processes.run(
             [sys.executable, str(REPO / "evaluation" / "dump_run.py"), str(root)],
             capture_output=True, text=True, check=True,
         )

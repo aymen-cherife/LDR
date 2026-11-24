@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 from ldr import previous
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -29,7 +30,7 @@ for index in range(1500):
 
 
 def ldr(project, *args):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

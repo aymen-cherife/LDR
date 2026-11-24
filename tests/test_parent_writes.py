@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 KILL = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -48,7 +49,7 @@ def test_only_the_parent_opens_the_database_for_writing(tmp_path):
     (project / "app.py").write_text("def f(n):\n    return n\n\nfor n in range(50):\n    f(n)\n", encoding="utf-8")
     env = environment()
     env["PYTHONPATH"] = os.pathsep.join([str(hooks), str(REPO)])
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"],
         cwd=project, env=env, capture_output=True, text=True, timeout=120,
     )
@@ -69,7 +70,7 @@ def test_a_killed_child_keeps_everything_received_and_the_run_says_where_it_died
         f"os.kill(os.getpid(), {int(KILL)})\n",
         encoding="utf-8",
     )
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"],
         cwd=tmp_path, env=environment(), capture_output=True, text=True, timeout=120,
     )
@@ -90,7 +91,7 @@ def test_a_hung_child_that_is_killed_loses_at_most_the_last_tenth_of_a_second(tm
         "time.sleep(120)\n",
         encoding="utf-8",
     )
-    parent = subprocess.Popen(
+    parent = processes.Popen(
         [sys.executable, "-m", "ldr", "run", "app.py"],
         cwd=tmp_path, env=environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )

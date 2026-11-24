@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 from ldr import fingerprint
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -32,7 +33,7 @@ print(box.size(), total(list(range(50))))
 
 
 def ldr(project, *args):
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

@@ -7,13 +7,14 @@ import sys
 from pathlib import Path
 
 from ldr.cli import _detect_production_roots
+from ldr import processes
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def invoke(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ, PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE="1")
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr.cli", *args],
         cwd=cwd,
         env=env,

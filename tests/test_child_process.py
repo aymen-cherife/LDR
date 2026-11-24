@@ -8,6 +8,7 @@ import venv
 from pathlib import Path
 
 import pytest
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -21,7 +22,7 @@ def environment(**extra):
 
 
 def start(project, *args, env=None):
-    return subprocess.Popen(
+    return processes.Popen(
         [sys.executable, "-m", "ldr", *args],
         cwd=project,
         env=env or environment(),
@@ -127,7 +128,7 @@ def test_it_refuses_when_ldr_cannot_be_imported_in_the_project_interpreter(proje
     )
     env = environment()
     env.pop("PYTHONPATH")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True, timeout=120
     )
     assert result.returncode == 2, result.stdout + result.stderr

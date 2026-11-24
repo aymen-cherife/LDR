@@ -19,6 +19,7 @@ from ldr.diff import (  # noqa: E402
 from ldr.node import Node, capture  # noqa: E402
 from ldr.render import render_diff, render_run, tree  # noqa: E402
 from ldr.tracer import Recorder  # noqa: E402
+from ldr import processes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, "fixtures")
@@ -375,7 +376,7 @@ def test_serialization_round_trip():
 
 def test_cli_run_writes_output_file(tmp_path):
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
-    r = subprocess.run(
+    r = processes.run(
         [sys.executable, "-m", "ldr.cli", "run", os.path.join(FIX, "script.py"),
          "--only", FIX],
         cwd=tmp_path, env=env, capture_output=True, text=True,
@@ -391,7 +392,7 @@ def test_cli_pytest_mode_traces_the_code_under_test(tmp_path):
     (tmp_path / "test_lib.py").write_text(
         "from lib import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
     )
-    r = subprocess.run(
+    r = processes.run(
         [sys.executable, "-m", "ldr.cli", "pytest", str(tmp_path / "test_lib.py"),
          "--only", str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
@@ -523,7 +524,7 @@ def test_run_mode_survives_a_real_crash(tmp_path):
         "outer()\n"
     )
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
-    r = subprocess.run(
+    r = processes.run(
         [sys.executable, "-m", "ldr.cli", "run", str(src), "--only", str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
     )
@@ -550,7 +551,7 @@ def test_entry_file_failure_is_never_hidden_by_only(tmp_path):
         "    assert double(3) == 999  # deliberately wrong\n" % tmp_path
     )
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
-    r = subprocess.run(
+    r = processes.run(
         [sys.executable, "-m", "ldr.cli", "pytest", str(test_file),
          "--only", str(lib)],  # scope excludes the test file on purpose
         cwd=tmp_path, env=env, capture_output=True, text=True,
@@ -579,7 +580,7 @@ def test_collection_failure_gets_an_honest_note_not_a_silent_pass(tmp_path):
         "def test_something():\n    assert True\n"
     )
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
-    r = subprocess.run(
+    r = processes.run(
         [sys.executable, "-m", "ldr.cli", "pytest", str(test_file),
          "--only", str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
@@ -596,7 +597,7 @@ def test_a_changed_function_is_named_in_the_comparison_with_the_previous_run(tmp
         "def top(x):\n    return inner(x) + 1\n"
         "if __name__ == '__main__':\n    print(top(5))\n"
     )
-    run = lambda: subprocess.run(  # noqa: E731
+    run = lambda: processes.run(  # noqa: E731
         [sys.executable, "-m", "ldr.cli", "run", str(src), "--only", str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
     )
@@ -620,7 +621,7 @@ def test_a_failing_pytest_run_after_an_edit_names_the_changed_function(tmp_path)
         "import sys; sys.path.insert(0, r'%s')\n"
         "from m import top\n\ndef test_top():\n    assert top(5) == 11\n" % tmp_path
     )
-    run = lambda: subprocess.run(  # noqa: E731
+    run = lambda: processes.run(  # noqa: E731
         [sys.executable, "-m", "ldr.cli", "pytest", str(tmp_path / "t.py"), "--only", str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
     )

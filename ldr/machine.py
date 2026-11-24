@@ -25,6 +25,7 @@ import threading
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
+from . import processes
 
 MIN_FREE_BYTES = 2 * 2**30
 MIN_FREE_FRACTION = 0.03
@@ -425,7 +426,7 @@ def _antivirus(ldr_dir: str, report: Report) -> None:
 
 def _python_start(report: Report) -> None:
     started = time.perf_counter()
-    subprocess.run([sys.executable, "-c", "pass"], capture_output=True, check=False, timeout=60)
+    processes.run([sys.executable, "-c", "pass"], capture_output=True, check=False, timeout=60)
     seconds = round(time.perf_counter() - started, 2)
     report.facts["python_start_s"] = seconds
     if seconds > PYTHON_START_SECONDS:

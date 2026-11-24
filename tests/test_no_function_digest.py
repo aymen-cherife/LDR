@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from ldr import call_stream
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -23,7 +24,7 @@ for index in range(20):
 
 def test_the_stream_summary_has_counts_but_no_per_function_digest(tmp_path):
     (tmp_path / "app.py").write_text(APP, encoding="utf-8")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"],
         cwd=tmp_path, env=dict(os.environ, PYTHONPATH=str(REPO)),
         capture_output=True, text=True, timeout=120,

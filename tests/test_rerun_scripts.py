@@ -30,6 +30,7 @@ print("lucky", lucky(), "total", total)
 
 CLOCK = """\
 import time
+from ldr import processes
 
 
 def work(n):
@@ -47,7 +48,7 @@ mark(time.time_ns())
 
 
 def ldr(project, *args):
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

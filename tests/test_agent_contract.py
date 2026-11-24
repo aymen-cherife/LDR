@@ -8,6 +8,7 @@ import sys
 from ldr.diff import diff_tree, mark_unstable
 from ldr.node import Node, capture, capture_state
 from ldr.tracer import Recorder
+from ldr import processes
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -15,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 
 def invoke(tmp_path, *arguments):
     environment = dict(os.environ, PYTHONPATH=ROOT, PYTHONDONTWRITEBYTECODE="1")
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr.cli", *arguments],
         cwd=tmp_path,
         env=environment,

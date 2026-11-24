@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import importlib
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -14,7 +15,7 @@ SCRIPT = "import sys\n\n\ndef work(n):\n    return n * 2\n\n\nprint('argv', sys.
 
 
 def ldr(project, *args):
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

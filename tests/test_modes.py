@@ -15,6 +15,7 @@ def f(n):
 """
 TESTS = """\
 import app
+from ldr import processes
 
 
 def test_one():
@@ -29,7 +30,7 @@ def test_two():
 
 
 def ldr(project, *args, expected=None):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

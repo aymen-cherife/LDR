@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ldr import redact  # noqa: E402
 from ldr.fingerprint import fingerprint  # noqa: E402
 from ldr.node import capture  # noqa: E402
+from ldr import processes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -161,7 +162,7 @@ def test_a_crash_summary_never_carries_a_secret(tmp_path):
         "charge()\n"
     )
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr.cli", "run", str(tmp_path / "app.py"), "--only", str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
     )
@@ -188,7 +189,7 @@ def test_nothing_secret_reaches_the_output_files(tmp_path):
         "raise SystemExit(0)\n"
     )
     env = dict(os.environ, PYTHONPATH=os.path.dirname(HERE), MY_SERVICE_TOKEN=secret_env)
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr.cli", "run", str(tmp_path / "app.py"), "--only", str(tmp_path)],
         cwd=tmp_path, env=env, capture_output=True, text=True,
     )

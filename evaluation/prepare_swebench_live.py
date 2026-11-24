@@ -8,6 +8,11 @@ import subprocess
 import urllib.parse
 import urllib.request
 from pathlib import Path
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from ldr import processes  # noqa: E402
 
 
 DATASET = "SWE-bench-Live/SWE-bench-Live"
@@ -37,7 +42,7 @@ def fetch_instance(instance_id: str, split: str = "full") -> dict:
 
 
 def run(command: list[str], cwd: Path | None = None, stdin: str | None = None) -> None:
-    subprocess.run(command, cwd=cwd, input=stdin, text=True, check=True)
+    processes.run(command, cwd=cwd, input=stdin, text=True, check=True)
 
 
 def main() -> int:

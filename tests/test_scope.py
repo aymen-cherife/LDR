@@ -4,13 +4,14 @@ import json
 import os
 import subprocess
 import sys
+from ldr import processes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = dict(os.environ, PYTHONPATH=os.path.dirname(HERE))
 
 
 def ldr(cwd, *args):
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr.cli", *args],
         cwd=cwd, env=ENV, capture_output=True, text=True,
     )

@@ -14,12 +14,13 @@ import pytest
 
 from ldr import machine
 from ldr.sqlite_store import SCHEMA
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
 
 def ldr(project, *args, expected=None):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )
@@ -29,7 +30,7 @@ def ldr(project, *args, expected=None):
 
 
 def dead_pid():
-    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process = processes.Popen([sys.executable, "-c", "pass"])
     process.wait()
     return process.pid
 
@@ -193,7 +194,7 @@ def test_runs_beyond_keep_runs_are_deleted_when_alone_and_only_named_during_a_ru
 def test_a_locked_database_names_the_process_that_holds_it(ldr_dir):
     database(ldr_dir).close()
     path = str(ldr_dir / "traces.sqlite3")
-    holder = subprocess.Popen(
+    holder = processes.Popen(
         [sys.executable, "-c",
          "import sqlite3,sys,time\n"
          "c=sqlite3.connect(sys.argv[1]); c.isolation_level=None; c.execute('BEGIN EXCLUSIVE')\n"
@@ -216,7 +217,7 @@ def test_a_locked_database_names_the_process_that_holds_it(ldr_dir):
 
 
 def test_a_busy_process_that_is_not_ldrs_is_named_with_its_number_and_never_stopped(ldr_dir, monkeypatch):
-    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    stranger = processes.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         monkeypatch.setattr(machine, "sample_cpu", lambda seconds=1: {"percent": 70.0, "cpus": 8, "processes": {stranger.pid: 95.0, os.getpid(): 90.0}})
         report = quick(ldr_dir, sample=True)
@@ -324,7 +325,7 @@ def test_a_check_that_fails_does_not_fail_the_run(tmp_path):
     (tmp_path / "sitecustomize.py").write_text(
         "import ldr.machine as m\n\n\ndef boom(*a, **k):\n    raise RuntimeError('check broke')\n\n\nm.check = boom\n", encoding="utf-8"
     )
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"], cwd=tmp_path, capture_output=True, text=True, timeout=300,
         env=dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO), str(tmp_path)])),
     )

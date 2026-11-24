@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 TEMPLATE = """\
 import os
+from ldr import processes
 
 
 def f(n):
@@ -35,7 +36,7 @@ for index in range(30):
 
 
 def ldr(project, *args, expected=0):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

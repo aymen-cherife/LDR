@@ -14,13 +14,18 @@ import tarfile
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from ldr import processes  # noqa: E402
 
 LDR_ROOT = Path(__file__).resolve().parents[1]
 SUBJECTS = {"PySnooper": "pysnooper", "cookiecutter": "cookiecutter", "tqdm": "tqdm"}
 
 
 def git(repo, *args):
-    return subprocess.check_output(["git", "-C", str(repo), *args])
+    return processes.check_output(["git", "-C", str(repo), *args])
 
 
 def unpack(repo, commit, directory):
@@ -46,7 +51,7 @@ def patched_lines(repo, buggy, fixed, package):
 
 
 def run(cwd, arguments, env, timeout):
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", *arguments],
         cwd=cwd,
         env=env,

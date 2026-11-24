@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 import ldr
+from ldr import processes
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -18,7 +19,7 @@ def read(name):
 def test_version_is_0_6_0_and_consistent():
     pyproject = re.search(r'^version = "([^"]+)"', read("pyproject.toml"), re.M).group(1)
     assert pyproject == ldr.__version__ == "0.6.0"
-    shown = subprocess.run(
+    shown = processes.run(
         [sys.executable, "-m", "ldr", "--version"],
         env=dict(os.environ, PYTHONPATH=ROOT), capture_output=True, text=True,
     ).stdout.strip()

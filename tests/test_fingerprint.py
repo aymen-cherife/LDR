@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ldr.diff import diff_tree  # noqa: E402
 from ldr.render import render_diff  # noqa: E402
 from ldr.tracer import Recorder  # noqa: E402
+from ldr import processes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, "fixtures")
@@ -320,7 +321,7 @@ def test_set_fingerprints_do_not_depend_on_hash_randomization():
     root = os.path.dirname(HERE)
 
     def run(seed):
-        return subprocess.run(
+        return processes.run(
             [sys.executable, "-c", probe, root],
             env=dict(os.environ, PYTHONHASHSEED=seed),
             capture_output=True, text=True, check=True,
@@ -379,7 +380,7 @@ def test_cli_does_not_report_no_change_for_partially_readable_receivers(tmp_path
     )
 
     def run(*extra):
-        return subprocess.run(
+        return processes.run(
             [sys.executable, "-m", "ldr.cli", "run", "app.py", *extra],
             cwd=tmp_path, env=env, capture_output=True, text=True,
         )

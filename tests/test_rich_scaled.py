@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO / "evaluation"))
 import rich_scaled  # noqa: E402
 
 from ldr import fingerprint  # noqa: E402
+from ldr import processes
 
 SPEC = rich_scaled.load()
 
@@ -80,7 +81,7 @@ def test_the_spec_has_a_hundredth_of_the_calls():
 
 def test_the_recorded_run_has_the_calls_sizes_and_roles_of_the_spec(tmp_path):
     root = rich_scaled.generate(tmp_path / "fixture").parent
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"], cwd=root, capture_output=True, text=True, timeout=900,
         env=dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO), str(REPO / "evaluation")])),
     )

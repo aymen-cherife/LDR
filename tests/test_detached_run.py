@@ -12,13 +12,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 ENV = dict(os.environ, PYTHONPATH=str(REPO), PYTHONUNBUFFERED="1")
 
 
 def ldr(project, *args, stdin=None, expected=None):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project, env=ENV,
         input=stdin, capture_output=True, text=True, timeout=300,
     )
@@ -80,7 +81,7 @@ print("finished", flush=True)
 
 def test_killing_the_waiting_command_does_not_stop_the_run(tmp_path):
     (tmp_path / "app.py").write_text(SLOW, encoding="utf-8")
-    waiter = subprocess.Popen(
+    waiter = processes.Popen(
         [sys.executable, "-m", "ldr", "run", "app.py"], cwd=tmp_path, env=ENV,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
     )
@@ -105,7 +106,7 @@ def test_killing_the_waiting_command_does_not_stop_the_run(tmp_path):
 
 def test_status_shows_progress_then_the_result_the_exit_code_and_the_end_of_the_output(tmp_path):
     (tmp_path / "app.py").write_text(SLOW, encoding="utf-8")
-    waiter = subprocess.Popen(
+    waiter = processes.Popen(
         [sys.executable, "-m", "ldr", "run", "app.py"], cwd=tmp_path, env=ENV,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
     )

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from . import processes
 
 RUNS = "runs"
 KEEP_RUNS = 50
@@ -96,7 +97,7 @@ def spawn_detached(rundir: str, spec: dict) -> None:
     ``spec`` (what to run) travels through the launcher's stdin to the supervisor's stdin.
     """
     command = [sys.executable, "-m", "ldr.supervisor", "--detach", rundir]
-    subprocess.run(
+    processes.run(
         command, input=json.dumps(spec).encode("utf-8"),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
     )
@@ -106,13 +107,14 @@ def _start_real(rundir: str, spec: bytes) -> None:
     command = [sys.executable, "-m", "ldr.supervisor", "--run", rundir]
     options = {"stdin": subprocess.PIPE, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
-        detached, group, breakaway = 0x00000008, 0x00000200, 0x01000000
+        # CREATE_NO_WINDOW (added by the helper) replaces DETACHED_PROCESS: the two cannot be combined.
+        group, breakaway = 0x00000200, 0x01000000
         try:
-            process = subprocess.Popen(command, creationflags=detached | group | breakaway, **options)
+            process = processes.Popen(command, creationflags=group | breakaway, **options)
         except OSError:  # the job this runs in does not allow breaking away
-            process = subprocess.Popen(command, creationflags=detached | group, **options)
+            process = processes.Popen(command, creationflags=group, **options)
     else:
-        process = subprocess.Popen(command, start_new_session=True, **options)
+        process = processes.Popen(command, start_new_session=True, **options)
     process.stdin.write(spec)
     process.stdin.close()
 

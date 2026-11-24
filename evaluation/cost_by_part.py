@@ -15,6 +15,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from ldr import processes  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -28,7 +33,7 @@ def main():
         os.remove(out)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([os.path.join(HERE, "cost_hook"), REPO]), LDR_COST_OUT=out)
     started = time.perf_counter()
-    subprocess.run([sys.executable, "-m", "ldr", *arguments], cwd=directory, env=env,
+    processes.run([sys.executable, "-m", "ldr", *arguments], cwd=directory, env=env,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wall = time.perf_counter() - started
     with open(out, encoding="utf-8") as handle:

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from ldr import tracer
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -43,7 +44,7 @@ explode(1)
 
 
 def ldr(project, *args, expected=0):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args], cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=300,
     )

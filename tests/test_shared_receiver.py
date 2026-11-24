@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -34,7 +35,7 @@ first.merge(second)
 
 def run(project):
     (project / "app.py").write_text(APP, encoding="utf-8")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"],
         cwd=project, env=dict(os.environ, PYTHONPATH=str(REPO)),
         capture_output=True, text=True, timeout=120,
@@ -114,7 +115,7 @@ print("FREED")
 
 def test_recording_a_call_does_not_keep_its_objects_alive(tmp_path):
     (tmp_path / "app.py").write_text(FREED, encoding="utf-8")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"], cwd=tmp_path,
         env=dict(os.environ, PYTHONPATH=str(REPO)), capture_output=True, text=True, timeout=120,
     )

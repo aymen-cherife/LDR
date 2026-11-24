@@ -11,6 +11,7 @@ import zlib
 from pathlib import Path
 
 import pytest
+from ldr import processes
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "order_workflow"
 REPO = FIXTURE.parents[2]
@@ -31,7 +32,7 @@ def project(tmp_path):
 
 
 def launch(project, *args, rate=100, expected_exit=0):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, *args],
         cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO), EXPORT_RATE=str(rate), EXPORT_API_KEY=EXPORT_KEY),
@@ -184,7 +185,7 @@ def test_boundary_capture_records_python_library_calls_without_their_internals(p
 
 def test_boundary_capture_requires_a_configured_budget(project):
     (project / "app.py").write_text("print('APP RAN')\n", encoding="utf-8")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py", "--boundary", "json"],
         cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)),

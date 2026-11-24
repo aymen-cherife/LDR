@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -27,7 +28,7 @@ apply([1, 2])
 
 def run(tmp_path, source=APP):
     (tmp_path / "app.py").write_text(source, encoding="utf-8")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"],
         cwd=tmp_path,
         env=dict(os.environ, PYTHONPATH=str(REPO)),

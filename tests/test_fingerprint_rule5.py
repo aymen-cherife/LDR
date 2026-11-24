@@ -13,6 +13,7 @@ import pytest
 
 from ldr import fingerprint as fp
 from ldr.fingerprint import Budget, fingerprint, is_digest
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -103,7 +104,7 @@ def test_walked_nodes_are_counted_as_the_fingerprint_cost():
 
 def run_script(tmp_path, source):
     (tmp_path / "big.py").write_text(source, encoding="utf-8")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "run", "big.py"],
         cwd=tmp_path,
         env=dict(os.environ, PYTHONPATH=str(REPO)),

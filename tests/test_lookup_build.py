@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 APP = "def make(n):\n    return list(range(n))\n\n\ndef use(items):\n    return len(items)\n\n\nuse(make(3))\n"
@@ -15,7 +16,7 @@ def run(tmp_path, source):
     (tmp_path / "app.py").write_text(source, encoding="utf-8")
     env = dict(os.environ, PYTHONPATH=str(REPO))
     env.pop("VIRTUAL_ENV", None)
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr", "run", "app.py"],
         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120,
     )

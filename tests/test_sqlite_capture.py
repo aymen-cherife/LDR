@@ -12,12 +12,13 @@ import pytest
 from ldr.fingerprint import fingerprint
 from ldr.sqlite_store import storage_settings
 from ldr.value_capture import capture_value
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
 
 def invoke(project, *args):
-    return subprocess.run(
+    return processes.run(
         [sys.executable, "-m", "ldr", *args],
         cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)),
@@ -32,8 +33,8 @@ def test_concurrent_runs_keep_separate_sqlite_traces(tmp_path):
     command = [sys.executable, "-m", "ldr", "run", "app.py"]
     options = {"cwd": tmp_path, "env": dict(os.environ, PYTHONPATH=str(REPO))}
     with (
-        subprocess.Popen(command, **options) as left,
-        subprocess.Popen(command, **options) as right,
+        processes.Popen(command, **options) as left,
+        processes.Popen(command, **options) as right,
     ):
         assert left.wait() == right.wait() == 0
 

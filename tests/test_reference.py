@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -24,7 +25,7 @@ for index in range({count}):
 
 
 def ldr(project, *args, expected=0):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args],
         cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)),

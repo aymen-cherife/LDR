@@ -11,6 +11,11 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from ldr import processes  # noqa: E402
 
 
 HERE = Path(__file__).resolve().parent
@@ -68,7 +73,7 @@ def main() -> int:
     problem = task.get("problem_statement") or task.get("title") or task["instance_id"]
     prompt = f"{problem.strip()}\n\nEvaluation instructions:\n{condition_text}\n"
 
-    before = subprocess.run(
+    before = processes.run(
         ["git", "status", "--porcelain"], cwd=workspace, text=True, capture_output=True, check=True
     ).stdout
     if before.strip():
@@ -80,7 +85,7 @@ def main() -> int:
     started = time.monotonic()
     timed_out = False
     try:
-        result = subprocess.run(
+        result = processes.run(
             shlex.split(args.command),
             cwd=workspace,
             input=prompt,
@@ -99,10 +104,10 @@ def main() -> int:
         stderr = exc.stderr or ""
     duration = time.monotonic() - started
 
-    diff = subprocess.run(
+    diff = processes.run(
         ["git", "diff", "--binary"], cwd=workspace, text=True, capture_output=True, check=True
     ).stdout
-    status = subprocess.run(
+    status = processes.run(
         ["git", "status", "--porcelain"], cwd=workspace, text=True, capture_output=True, check=True
     ).stdout
     input_tokens, output_tokens = _parse_usage(stdout)

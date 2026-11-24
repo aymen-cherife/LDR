@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from ldr import environment
+from ldr import processes
 
 REPO = Path(__file__).resolve().parents[1]
 SENTINEL_NAME = "LDR_TEST_SENTINEL_NAME"
@@ -108,7 +109,7 @@ def project(tmp_path):
 
 
 def launch(project, *args, extra_env=None, expected_exit=0):
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", *args],
         cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO), **(extra_env or {})),
@@ -146,7 +147,7 @@ def test_show_environment_names_a_run_that_has_no_record(project):
     launch(project, "run", "app.py")
     with sqlite3.connect(project / ".ldr" / "traces.sqlite3") as connection:
         connection.execute("DELETE FROM run_environment")
-    result = subprocess.run(
+    result = processes.run(
         [sys.executable, "-m", "ldr", "show", "--environment"],
         cwd=project,
         env=dict(os.environ, PYTHONPATH=str(REPO)),
