@@ -63,7 +63,7 @@ def test_the_helper_adds_no_window_on_windows_and_changes_nothing_elsewhere(monk
     if os.name == "nt":
         assert seen[0]["creationflags"] == 0x200 | 0x08000000 and seen[1]["creationflags"] == 0x08000000
     else:
-        assert "creationflags" not in seen[0] and "creationflags" not in seen[1]
+        assert seen == [{"creationflags": 0x200}, {}]
 
 
 def test_the_helper_runs_a_process_and_returns_its_output():
