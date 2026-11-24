@@ -11,6 +11,7 @@ into this repository):
     rich     rich 15.0.0 (MIT, GitHub tag; the sdist has no tests), 9 test files   object-heavy
     toolz    toolz 1.0.0 (BSD-3), its own tests                extreme: many tiny calls
     orders   tests/fixtures/order_workflow with 20,000 orders  extreme: worst case
+    rich-scaled  the rich run at 1/100 of the calls, same types, sizes and roles  (rich_scaled.py)
 
 The libraries' dependencies go into a virtual environment in the work directory from
 evaluation/bench-requirements.txt. The library under test is not installed there; its
@@ -41,9 +42,10 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 ORDERS = 20_000
 RICH_TAG = "https://github.com/Textualize/rich/archive/refs/tags/v15.0.0.tar.gz"
-NAMES = ["attrs", "flask", "rich", "toolz", "orders"]
+NAMES = ["attrs", "flask", "rich", "toolz", "orders", "rich-scaled"]
 
 ATTRS_TESTS = [
     "test_validators.py", "test_converters.py", "test_dunders.py", "test_next_gen.py",
@@ -131,6 +133,14 @@ def build(work: Path, name: str):
         return pytest_fixture(work, "rich", "15.0.0", paths, [], github=RICH_TAG)
     if name == "toolz":
         return pytest_fixture(work, "toolz", "1.0.0", ["toolz/tests"], [])
+    if name == "rich-scaled":
+        import rich_scaled
+
+        # LDR_RICH_SCALED_SPEC: another spec (made with `rich_scaled.py extract --divisor N --spec FILE`).
+        other = os.environ.get("LDR_RICH_SCALED_SPEC")
+        root = work / ("rich-scaled-" + Path(other).stem if other else "rich-scaled")
+        rich_scaled.generate(root, Path(other) if other else None)
+        return root, [sys.executable, "app.py"], [sys.executable, "-m", "ldr", "run", "app.py"]
     root = work / "orders"
     if not (root / "orders.csv").exists():
         root.mkdir(parents=True, exist_ok=True)
@@ -154,8 +164,18 @@ def timed(command: list[str], cwd: Path, env: dict[str, str]) -> float:
 
 
 def clean(root: Path) -> None:
+    """Remove the files of the previous run. The recorder's last process can still hold the database
+    for a moment after `ldr` returns, and a database left behind would make the next run a second run
+    (compared with the previous one), so wait until it is gone."""
     for leftover in (".ldr", ".hypothesis"):
-        shutil.rmtree(root / leftover, ignore_errors=True)
+        deadline = time.monotonic() + 60
+        while True:
+            shutil.rmtree(root / leftover, ignore_errors=True)
+            if not (root / leftover).exists():
+                break
+            if time.monotonic() > deadline:
+                raise SystemExit(f"cannot remove {root / leftover}")
+            time.sleep(0.5)
 
 
 def measure(name, fixture, rounds, env):
