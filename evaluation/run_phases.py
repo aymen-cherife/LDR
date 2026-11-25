@@ -1,21 +1,7 @@
-"""A run from the command's start to its return, split by phase, for two or more checkouts of LDR.
+"""Measure one first run and one successive run per checkout and fixture.
 
-    python evaluation/run_phases.py --checkout LABEL=PATH --checkout LABEL=PATH [--repeats 3]
-                                    [--only orders toolz rich] [--work DIR] [--json]
-
-For each fixture, repeat and checkout: remove .ldr, run (the first run), run again (the second run,
-compared with the first), and record both. `rich` records both runs; the others only the second.
-Before each series `ldr check_machine` runs and its output goes into the results. The harness never
-waits for it and never refuses to run: whoever reads the numbers reads the machine's facts beside them.
-
-Phases (seconds), from the clock times the run leaves in .ldr/runs/<id>/state.json and last.json:
-  python    the command's start to the waiting command's own start (interpreter, imports)
-  start     that to the first recorded call
-  program   the first call to the end of the program
-  compare   the comparison with the previous run (after the program, in the program's process)
-  writing   the rest of the work after the program: the result and what it stores
-  pruning   deleting old runs, cleaning, announcing the end (the supervisor)
-  return    the supervisor's last write to the command's return
+The normal run starts its own machine check beside the launcher. Read its
+facts from the result after the command has returned.
 """
 
 from __future__ import annotations
@@ -23,81 +9,86 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
-import subprocess
+import platform
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import overhead  # noqa: E402
-import sys as _sys
-from pathlib import Path as _Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import overhead
+from ldr import processes
 
-_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
-from ldr import processes  # noqa: E402
-
-
-def check_machine(checkout: Path, root: Path, env: dict) -> str:
-    result = processes.run([sys.executable, "-m", "ldr", "check_machine"], cwd=root, env=env, capture_output=True, text=True)
-    return result.stdout.strip()
+HERE = Path(__file__).resolve().parent
+STEPS = (
+    "call_records_move_with_indexes", "fingerprint_lookup_move_with_index",
+    "report_ordered_scan", "report_grouped_counts",
+    "result_serialization_and_write", "output_drain",
+)
 
 
 def one(root: Path, command: list[str], env: dict) -> dict:
-    overhead_started = time.time()
-    started = time.perf_counter()
-    result = processes.run(command, cwd=root, env=env, capture_output=True, text=True)
-    wall = time.perf_counter() - started
-    returned = time.time()
-    if result.returncode != 0:
-        raise SystemExit(f"failed: {command}\n{result.stdout[-1500:]}\n{result.stderr[-1500:]}")
-    states = sorted((root / ".ldr" / "runs").glob("*/state.json"), key=lambda path: path.stat().st_mtime)
-    state = json.loads(states[-1].read_text(encoding="utf-8"))
-    timing = json.loads((root / ".ldr" / "last.json").read_text(encoding="utf-8"))["status"]["timing"]
+    with tempfile.TemporaryDirectory(prefix="ldr-phases-") as scratch:
+        instrumented = dict(env, LDR_PHASE_OUTPUT=scratch)
+        instrumented["PYTHONPATH"] += os.pathsep + str(HERE / "phase_probe")
+        overhead_started = time.time()
+        started = time.perf_counter()
+        result = processes.run(command, cwd=root, env=instrumented, capture_output=True, text=True)
+        wall = time.perf_counter() - started
+        returned = time.time()
+        if result.returncode:
+            raise RuntimeError(f"recording exited {result.returncode}\\n{result.stdout[-1500:]}\\n{result.stderr[-1500:]}")
+        path = Path(scratch)
+        program, = [json.loads(item.read_text(encoding="utf-8")) for item in path.glob("program-*.json")]
+        supervisor, = [json.loads(item.read_text(encoding="utf-8")) for item in path.glob("supervisor-*.json")]
+
+    ldr = root / ".ldr"
+    status = json.loads((ldr / "last.json").read_text(encoding="utf-8"))["status"]
+    states = [json.loads(path.read_text(encoding="utf-8")) for path in (ldr / "runs").glob("*/state.json")]
+    state, = [row for row in states if row.get("store_run_id") == status["run_id"]]
+    timing = status["timing"]
+    program_end = timing["execution_finished_at"]
     first = state["started_at"] + state["first_call_s"]
-    program_ended = timing["execution_finished_at"]
-    phases = {
-        "python": state["started_at"] - overhead_started,
-        "start": state["first_call_s"],
-        "program": program_ended - first,
-        "compare": timing.get("comparison_seconds", 0.0),
-        "writing": state["child_ended_at"] - program_ended - timing.get("comparison_seconds", 0.0),
-        "pruning": state["pruned_at"] - state["child_ended_at"],
-        "return": returned - state["pruned_at"],
+    measured = program["seconds"] | supervisor["seconds"]
+    post_run = {step: measured[step] for step in STEPS}
+    post_run["comparison_temp_index"] = measured.get("comparison_temp_index", 0.0)
+    post_run["comparison"] = timing.get("comparison_seconds", 0.0) - post_run["comparison_temp_index"]
+    post_run["untimed"] = state["child_ended_at"] - program_end - sum(post_run.values())
+    return {
+        "wall": round(wall, 3),
+        "python_start": round(state["started_at"] - overhead_started, 3),
+        "to_first_committed_batch": state["first_call_s"],
+        "program_after_first_batch": round(program_end - first, 3),
+        "post_run_seconds": {key: round(value, 3) for key, value in post_run.items()},
+        "pruning": round(state["pruned_at"] - state["child_ended_at"], 3),
+        "return": round(returned - state["pruned_at"], 3),
+        "peak_rss_bytes": program["peak_rss_bytes"],
+        "python_version": program["python"],
+        "machine": status["machine"]["summary"],
     }
-    return {"wall": round(wall, 3), **{key: round(value, 3) for key, value in phases.items()}}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkout", action="append", required=True, metavar="LABEL=PATH")
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--only", nargs="+", default=["orders", "toolz", "rich"])
+    parser.add_argument("--only", nargs="+", choices=overhead.NAMES, default=["rich"])
     parser.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "ldr-overhead"))
     args = parser.parse_args()
-    checkouts = dict(item.split("=", 1) for item in args.checkout)
     work = Path(args.work)
     for name in args.only:
         root, _, traced = overhead.build(work, name)
-        results = {label: {"first": [], "second": []} for label in checkouts}
-        for repeat in range(args.repeats):
-            for label, checkout in checkouts.items():
-                env = overhead.environment(Path(checkout), root)
-                summary = check_machine(Path(checkout), root, env)
-                overhead.clean(root)
-                first = one(root, traced, env)
-                second = one(root, traced, env)
-                results[label]["first"].append(first)
-                results[label]["second"].append(second)
-                print(json.dumps({"fixture": name, "repeat": repeat, "checkout": label, "check": summary.splitlines(),
-                                  "first": first, "second": second}), flush=True)
-        medians = {
-            label: {run: {key: round(statistics.median(item[key] for item in rows), 3) for key in rows[0]}
-                    for run, rows in runs.items()}
-            for label, runs in results.items()
-        }
-        print(json.dumps({"fixture": name, "medians": medians}), flush=True)
+        for checkout in args.checkout:
+            label, path = checkout.split("=", 1)
+            path = Path(path).resolve()
+            commit = processes.check_output(["git", "rev-parse", "HEAD"], cwd=path, text=True).strip()
+            env = overhead.environment(path, root)
+            overhead.clean(root)
+            for run in ("first", "second"):
+                row = one(root, traced, env)
+                print(json.dumps({
+                    "checkout": label, "commit": commit, "fixture": name, "run": run,
+                    "platform": platform.platform(), "mode": "default", **row,
+                }), flush=True)
     return 0
 
 
