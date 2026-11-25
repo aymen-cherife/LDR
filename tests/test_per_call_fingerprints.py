@@ -89,3 +89,44 @@ def test_first_calls_is_a_setting(tmp_path):
         "SELECT COUNT(*) FROM stream_calls WHERE run_id = ? AND frame_id LIKE 'app.py:f#%'", (run_id,)
     ).fetchone()[0]
     assert detailed == 2
+
+
+def test_streamed_addresses_use_integers_but_store_the_same_paths(tmp_path, monkeypatch):
+    from contextlib import closing
+
+    import fixtures.gens as gen
+    from ldr.call_stream import CallStream
+    from ldr.sqlite_store import TraceStore
+    from ldr.tracer import Recorder
+
+    recorded_ids = []
+    start = CallStream.start
+
+    def observe(stream, frame, address, *args, **kwargs):
+        recorded_ids.append(address)
+        return start(stream, frame, address, *args, **kwargs)
+
+    monkeypatch.setattr(CallStream, "start", observe)
+    root = Path(gen.__file__).parent
+    recorder = Recorder([root], project_root=root, build_tree=False)
+    store = TraceStore.start(tmp_path, {"runner": "pytest", "target": "test_gen.py"}, 1, 30)
+    recorder.call_stream = CallStream(store, "main")
+    test_id = "test_gen.py::test_case"
+    recorder.begin_test(test_id, code=gen.consume.__code__)
+    recorder.start()
+    try:
+        gen.consume()
+    finally:
+        recorder.stop()
+    recorder.call_stream.finish()
+    store.finish({})
+    with closing(sqlite3.connect(store.path)) as connection:
+        addresses = connection.execute(
+            "SELECT ordinal, frame_id, parent FROM call_records ORDER BY ordinal"
+        ).fetchall()
+    assert addresses == [
+        (1, test_id, None),
+        (2, f"{test_id}/gens.py:gen#1", 1),
+        (3, f"{test_id}/gens.py:after#1", 1),
+    ]
+    assert recorded_ids == [1, 2, 3]

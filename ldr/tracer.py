@@ -13,6 +13,7 @@ import os
 import sys
 from _thread import get_ident
 from dataclasses import dataclass, field
+from itertools import count
 from time import perf_counter_ns
 
 from contextlib import nullcontext
@@ -52,9 +53,8 @@ def fp_value(value, name: str | None = None) -> str:
 class _Shadow:
     code: object
     fid: int
-    frame_id: str = ""
-    segment: str = ""
-    seen: dict[str, int] | None = None
+    address: int
+    seen: dict[int, int] | None = None
     children: list[Node] = field(default_factory=list)
     preserve_children: bool = False
 
@@ -136,12 +136,16 @@ class Recorder:
         self._display_cache: dict[str, str] = {}
         self._source_cache: dict[str, str] = {}
         self._code_cache: dict[object, tuple[int, str, str]] = {}
-        self._invocation_counts: dict[str, int] = {}
+        self._function_ids: dict[str, int] = {}
+        self._address_keys: dict[int, tuple[object, tuple[int, str]]] = {}
+        self._function_sequence = count()
+        self._address_sequence = count(1)
+        self._addresses: dict[int, str] = {}
         # Address state: calls with no recorded caller count under the current
         # test root (or the run, outside pytest).
         self._halted = False
         self._quiet_thread = None
-        self._root_counts: dict[str, int] = {}
+        self._root_counts: dict[int, int] = {}
         self._test_root = ""
         self._test_code = None
         self._registered_events: list[int] = []
@@ -442,20 +446,20 @@ class Recorder:
 
     @staticmethod
     def _entry_segment(entry: Node | _Shadow | None) -> str:
-        if entry is None:
-            return ""
-        return entry.segment if isinstance(entry, _Shadow) else entry.__dict__.get("_segment", "")
+        return entry.__dict__.get("_segment", "") if isinstance(entry, Node) else ""
 
-    def _next_frame_id(self, code, parent: Node | _Shadow | None) -> tuple[str, str, int]:
-        """Address ``file:qualname#n`` along the call path, without the definition line.
+    def _address_key(self, code) -> tuple[int, str]:
+        entry = self._address_keys.get(id(code))
+        if entry is not None:
+            return entry[1]
+        name = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
+        key = (self._function_ids.setdefault(name, next(self._function_sequence)), name)
+        # Code equality ignores the source path. Keep the object to prevent ID reuse.
+        self._address_keys[id(code)] = (code, key)
+        return key
 
-        ``n`` is the nth call of that function under the same parent. The
-        second value is the call's own path segment; the third counts the
-        function's calls across the whole run, for sampling.
-        """
-        key = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
-        ordinal = self._invocation_counts.get(key, 0) + 1
-        self._invocation_counts[key] = ordinal
+    def _next_address(self, code, parent, key, name):
+        """Number siblings by function ID and preserve the external call path."""
         if parent is None:
             seen = self._root_counts
             base = self._test_root
@@ -466,13 +470,20 @@ class Recorder:
                 seen = parent.seen
             else:
                 seen = parent.__dict__.setdefault("_seen", {})
-            base = parent.frame_id
+            base = self._entry_frame_id(parent)
         number = seen.get(key, 0) + 1
         seen[key] = number
-        segment = f"{key}#{number}"
-        if parent is None and code is self._test_code and number == 1 and base:
-            return base, segment, ordinal
-        return (f"{base}/{segment}" if base else segment), segment, ordinal
+        root_test = parent is None and code is self._test_code and number == 1 and base
+        if not self.build_tree:
+            address = next(self._address_sequence)
+            if root_test:
+                text = base
+            else:
+                text = f"{base}/{name}#{number}" if base else f"{name}#{number}"
+            self._addresses[address] = text
+            return address, ""
+        segment = f"{name}#{number}"
+        return (base if root_test else f"{base}/{segment}" if base else segment), segment
 
     def _new_node(self, code, frame, frame_id: str, *, detailed: bool = False) -> Node:
         source_id, module, line, file, callsite = self._metadata(code, frame)
@@ -507,14 +518,14 @@ class Recorder:
         self,
         code,
         frame,
-        frame_id: str,
+        address: int,
         *,
         preserve_children: bool = False,
     ) -> _Shadow:
         return _Shadow(
             code=code,
             fid=id(frame),
-            frame_id=frame_id,
+            address=address,
             preserve_children=preserve_children,
         )
 
@@ -522,9 +533,8 @@ class Recorder:
     def _entry_fid(entry: Node | _Shadow) -> int:
         return entry.fid if isinstance(entry, _Shadow) else entry.__dict__.get("_fid", -1)
 
-    @staticmethod
-    def _entry_frame_id(entry: Node | _Shadow) -> str:
-        return entry.frame_id
+    def _entry_frame_id(self, entry: Node | _Shadow) -> str:
+        return self._addresses[entry.address] if isinstance(entry, _Shadow) else entry.frame_id
 
     def _attach(self, node: Node, stack: tuple[Node | _Shadow, ...]) -> None:
         if not stack:
@@ -548,7 +558,7 @@ class Recorder:
             caller = caller.f_back
         return None
 
-    def _start_capture(self, code, frame, frame_id, at, node=None):
+    def _start_capture(self, code, frame, frame_id, identity, at, node=None):
         timing = CallTiming(at)
         timing.resume(at, self._timing_parent(frame))
         self._timings[id(frame)] = timing
@@ -560,7 +570,6 @@ class Recorder:
                 if node is not None
                 else self._argument_fingerprints(code, frame, entering=True)
             )
-        identity = f"{self._source_id(code.co_filename)}:{code.co_qualname}"
         function = f"{self.frame_prefix}{identity}"
         if function not in self.call_stream.locations:
             self.call_stream.locations[function] = (
@@ -573,7 +582,10 @@ class Recorder:
             or identity in self.deep_functions
         )
         # Only the first N calls of a function keep detail; the rest keep fingerprints.
-        detail = self.call_stream.note_call(function, deep, frame_id)
+        detail_address = frame_id
+        if self.call_stream.full_tests and type(frame_id) is int:
+            detail_address = self._addresses[frame_id]
+        detail = self.call_stream.note_call(function, deep, detail_address)
         if detail and not self.build_tree and node is None:
             evidence = self._mutable_argument_evidence(code, frame)
             if evidence:
@@ -624,11 +636,11 @@ class Recorder:
         at = perf_counter_ns()
         stack = _stack.get()
         parent = stack[-1] if stack else None
-        frame_id, segment, _ = self._next_frame_id(code, parent)
+        key, identity = self._address_key(code)
+        frame_id, segment = self._next_address(code, parent, key, identity)
         if not self.build_tree:
             entry = self._new_shadow(code, frame, frame_id)
-            entry.segment = segment
-            self._start_capture(code, frame, frame_id, at)
+            self._start_capture(code, frame, frame_id, identity, at)
             _stack.set(stack + (entry,))
             return
         focused = self._focus_matches(frame_id, segment)
@@ -638,7 +650,7 @@ class Recorder:
         self.n_nodes += 1
         if focused:
             self.inspection_matches += 1
-        self._start_capture(code, frame, frame_id, at, entry)
+        self._start_capture(code, frame, frame_id, identity, at, entry)
         _stack.set(stack + (entry,))
 
     def _boundary_wanted(self, code) -> bool:
@@ -665,6 +677,8 @@ class Recorder:
             return
         module = frame.f_globals.get("__name__")  # already known to be a wanted module
         address = self.call_stream.frame_address(caller)
+        if type(address) is int:
+            address = self._addresses[address]
         source = self._display_path(caller.f_code.co_filename)
         site = {
             "file": redact(source)[0],
@@ -769,6 +783,7 @@ class Recorder:
             return
         parent_stack, entry = matched
         node_retained = isinstance(entry, Node)
+        frame_id = entry.frame_id if node_retained else self._addresses[entry.address]
         stream = self.call_stream
         out = out_fp = None
         if error is None:
@@ -798,9 +813,10 @@ class Recorder:
         if self.call_stream is not None:
             with self._no_ceiling(code):
                 exit_fps = self._argument_fingerprints(code, frame)
-            self._send_sizes(frame, entry.frame_id)
+            self._send_sizes(frame, frame_id)
             self.call_stream.close(
                 frame,
+                frame_id,
                 exit_fps,
                 out_fp,
                 error,
@@ -812,6 +828,7 @@ class Recorder:
             )
 
         if isinstance(entry, _Shadow):
+            del self._addresses[entry.address]
             if error is None:
                 for child in entry.children:
                     _mark_handled(child)
@@ -833,7 +850,7 @@ class Recorder:
                 line=line,
                 callsite=callsite,
                 children=entry.children,
-                frame_id=entry.frame_id,
+                frame_id=frame_id,
             )
             self._set_node_timing(promoted, timing)
             self._attach(promoted, parent_stack)
@@ -1028,6 +1045,7 @@ class Recorder:
                 if timing is not None:
                     self._set_node_timing(entry, timing.snapshot(stopped, complete=False))
         self.suspended.clear()
+        self._addresses.clear()
         self._timings.clear()
         self._immutable_inputs.clear()
         self._receivers.clear()

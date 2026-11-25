@@ -218,6 +218,7 @@ class CallStream:
     def close(
         self,
         frame,
+        frame_id,
         exit_inputs,
         output,
         error,
@@ -231,7 +232,7 @@ class CallStream:
             entry = self.active.pop(id(frame), None)
             if entry is None:
                 return
-            ordinal, parent, frame_id, function, inputs, preview, evidence, detail, lines = (
+            ordinal, parent, _, function, inputs, preview, evidence, detail, lines = (
                 entry
             )
             self.completed += 1
@@ -249,7 +250,7 @@ class CallStream:
                     self.sketched_functions[function] = self.sketched_functions.get(function, 0) + 1
                     if len(self.sketched_examples) < 20:
                         self.sketched_examples.append(
-                            [entry[2], name, SKETCH_TYPES.get(token, "?"), token]
+                            [frame_id, name, SKETCH_TYPES.get(token, "?"), token]
                         )
             self.redacted += sum(token == "redacted" for token in inputs.values()) + (output == "redacted")
 
