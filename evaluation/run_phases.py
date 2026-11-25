@@ -37,7 +37,7 @@ def one(root: Path, command: list[str], env: dict) -> dict:
         wall = time.perf_counter() - started
         returned = time.time()
         if result.returncode:
-            raise RuntimeError(f"recording exited {result.returncode}\\n{result.stdout[-1500:]}\\n{result.stderr[-1500:]}")
+            raise RuntimeError(f"recording exited {result.returncode}\n{result.stdout}\n{result.stderr}")
         path = Path(scratch)
         program, = [json.loads(item.read_text(encoding="utf-8")) for item in path.glob("program-*.json")]
         supervisor, = [json.loads(item.read_text(encoding="utf-8")) for item in path.glob("supervisor-*.json")]
@@ -63,6 +63,7 @@ def one(root: Path, command: list[str], env: dict) -> dict:
         "pruning": round(state["pruned_at"] - state["child_ended_at"], 3),
         "return": round(returned - state["pruned_at"], 3),
         "peak_rss_bytes": program["peak_rss_bytes"],
+        "supervisor_peak_rss_bytes": supervisor["peak_rss_bytes"],
         "python_version": program["python"],
         "machine": status["machine"]["summary"],
     }

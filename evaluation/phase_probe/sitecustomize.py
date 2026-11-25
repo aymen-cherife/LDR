@@ -66,9 +66,7 @@ def peak_rss_bytes():
 
 def save():
     role = "program" if program else "supervisor"
-    row = {"seconds": timings, "python": sys.version.split()[0]}
-    if program:
-        row["peak_rss_bytes"] = peak_rss_bytes()
+    row = {"seconds": timings, "python": sys.version.split()[0], "peak_rss_bytes": peak_rss_bytes()}
     Path(output, f"{role}-{os.getpid()}.json").write_text(json.dumps(row), encoding="utf-8")
 
 
