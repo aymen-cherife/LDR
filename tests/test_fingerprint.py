@@ -178,6 +178,78 @@ def test_objects_with_different_state_are_different_and_equal_state_is_equal():
     assert diff_tree(old.roots[0], other.roots[0])
 
 
+def _layout_samples():
+    class Base:
+        __slots__ = ("inherited",)
+
+    class Slots(Base):
+        __slots__ = ["__hidden", "unset", "__dict__"]
+
+    class Other(Slots):
+        __slots__ = ()
+
+    value = Slots()
+    value.inherited = 3
+    value._Slots__hidden = 5
+    value.extra = 7
+    yield "mixed", value
+    yield "reuse", value
+    Slots.__slots__.remove("__hidden")
+    yield "edited_slots", value
+    Slots.__slots__.insert(0, "__hidden")
+    yield "restored_slots", value
+    Slots._Slots__hidden = property(lambda obj: (_ for _ in ()).throw(AssertionError("property executed")))
+    yield "replaced_descriptor", value
+    value.__class__ = Other
+    yield "reassigned_class", value
+
+
+def _layout_evidence(value):
+    from ldr.call_stream import CallStream
+    from ldr.fingerprint import fingerprint
+
+    token = fingerprint(value)
+    data = []
+    stored = CallStream._value(None, data, "entry", "value", value, token)
+    assert not data  # Object previews, shapes and fingerprints are the stored evidence.
+    return stored
+
+
+def test_structural_readers_reuse_and_refresh_the_layout(monkeypatch):
+    from ldr import structure
+
+    original = structure._discover
+    discoveries = []
+
+    def discover(cls, *args):
+        if cls.__qualname__.startswith("_layout_samples."):
+            discoveries.append(cls)
+        return original(cls, *args)
+
+    monkeypatch.setattr(structure, "_discover", discover)
+    mixed = ("b708e14f5d46396e4070956471460969", "Slots(inherited=3, __hidden=5, extra=7)")
+    edited = ("98415b3f7b3f5873fc5b3038e8d3e213", "Slots(inherited=3, extra=7)")
+    expected = dict(mixed=mixed, reuse=mixed, edited_slots=edited, restored_slots=mixed,
+                    replaced_descriptor=edited,
+                    reassigned_class=("c25803a64a7778ab901d33e191a87df7", "Other(inherited=3, extra=7)"))
+    samples = _layout_samples()
+    # Keep the recorder active when the fixture edits its class.
+    import fixtures.values as v
+
+    results = {}
+
+    def collect():
+        for name, value in samples:
+            v.accept(value)
+            results[name] = _layout_evidence(value)
+
+    record(collect)
+    assert results == {name: {"status": "partial", "shape": {"type": "object"},
+                              "fingerprint": fingerprint, "preview": preview}
+                       for name, (fingerprint, preview) in expected.items()}
+    assert len(discoveries) == 5
+
+
 def test_only_the_node_budget_cuts_off_the_walk():
     """Large values keep an exact signature when no comparison budget applies."""
     from hashlib import blake2b
