@@ -25,6 +25,7 @@ from contextlib import closing
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 
+from .node import capture_error
 from .sqlite_store import TraceStore, _call_rows, recording_failure, recording_failure_text
 
 ENV = "LDR_SINK"
@@ -113,6 +114,18 @@ class Sink:
                     run = self._run_for(message[1])
                 elif kind == "sync":
                     connection.send_bytes(marshal.dumps(("ok",)))
+                elif kind in ("reference", "comparison"):
+                    try:
+                        with run.write_lock:
+                            if kind == "reference":
+                                result = run.store.comparison_snapshot(*message[1:])
+                            else:
+                                result = run.store.comparison_result(
+                                    message[1], "write failed" if run.recording_failure else message[2]
+                                )
+                        connection.send_bytes(marshal.dumps(("ok", result)))
+                    except (OSError, sqlite3.Error) as exc:
+                        connection.send_bytes(marshal.dumps(("read_error", capture_error(exc))))
                 else:
                     with run.write_lock:
                         self._apply(run, kind, message)
@@ -223,12 +236,26 @@ class Sink:
             f"then is stored in run {run.store.run_id}; at most one batch ({batch} calls) "
             "may be missing after that address."
         )
+        message += self._stopped_comparison(run, status, "died")
         try:
             run.store.finish(status, build=False)
         except (OSError, sqlite3.Error):
             pass
         _write_died_result(run.directory, status, message)
         return message
+
+    @staticmethod
+    def _stopped_comparison(run, status, reason):
+        try:
+            reference = run.store.comparison_result(status.get("files"), reason)
+        except (OSError, sqlite3.Error):
+            reference = None
+        if reference is None:
+            return ""
+        from .cli import _previous_run_note
+
+        status["reference"] = reference
+        return "\n" + _previous_run_note(reference).rstrip()
 
     @staticmethod
     def _finish_incomplete(run, exit_code):
@@ -243,6 +270,7 @@ class Sink:
             "run_id": run.store.run_id,
             "incomplete": failure,
         }
+        message += Sink._stopped_comparison(run, status, "write failed")
         try:
             run.store.finish(status, build=False)
         except (OSError, sqlite3.Error):
@@ -343,6 +371,9 @@ class RemoteStore(TraceStore):
             reply = self._client.request(message)
             if reply[0] == "error":
                 raise RecordingWriteError(reply[1])
+            if reply[0] == "read_error":
+                raise sqlite3.OperationalError(reply[1])
+            return reply[1] if len(reply) > 1 else None
         else:
             self._client.send(message)
 
@@ -356,6 +387,12 @@ class RemoteStore(TraceStore):
         return sqlite3.connect(
             Path(self.path).as_uri() + "?mode=ro", uri=True, timeout=self.busy_timeout
         )
+
+    def comparison_snapshot(self, run_id=None, roots=None, node_ids=None, replicated=False):
+        return self._send(("reference", run_id, roots, node_ids, replicated), acknowledge=True)
+
+    def comparison_result(self, files, stopped=None):
+        return self._send(("comparison", files, stopped), acknowledge=True)
 
     # --- writes: planned locally, sent to the parent
 

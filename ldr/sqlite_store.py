@@ -13,6 +13,7 @@ from pathlib import Path
 from time import monotonic, sleep, time_ns
 from uuid import uuid4
 
+from . import previous
 from .fingerprint import DEFAULT_WALK_CEILING, is_digest
 from .node import Node, capture_error
 
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS stream_calls (
 CREATE TABLE IF NOT EXISTS call_records (
     run_id TEXT NOT NULL, worker TEXT NOT NULL, ordinal INTEGER NOT NULL,
     frame_id TEXT NOT NULL, parent INTEGER, function TEXT NOT NULL, error TEXT,
-    reference TEXT, signature BLOB NOT NULL, parts BLOB NOT NULL,
+    reference TEXT, signature BLOB NOT NULL, parts BLOB NOT NULL, verdict TEXT,
     PRIMARY KEY (run_id, worker, ordinal)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS call_lookup (
@@ -59,7 +60,7 @@ CREATE TABLE IF NOT EXISTS call_lookup (
     role TEXT NOT NULL, name TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS call_lookup_fp ON call_lookup(run_id, fp);
--- The comparison with the previous run looks calls up by address.
+-- Readers look up individual calls by address.
 CREATE INDEX IF NOT EXISTS call_records_frame ON call_records(run_id, frame_id);
 -- Records arrive here without indexes and move to the tables above once per run.
 -- The size of every value the fingerprint walk read: its type, its role in the call
@@ -71,7 +72,7 @@ CREATE TABLE IF NOT EXISTS value_sizes (
 );
 CREATE TABLE IF NOT EXISTS call_records_stage (
     run_id TEXT, worker TEXT, ordinal INTEGER, frame_id TEXT, parent INTEGER,
-    function TEXT, error TEXT, reference TEXT, signature BLOB, parts BLOB
+    function TEXT, error TEXT, reference TEXT, signature BLOB, parts BLOB, verdict TEXT
 );
 CREATE TABLE IF NOT EXISTS call_lookup_stage (
     run_id TEXT, fp TEXT, worker TEXT, ordinal INTEGER, role TEXT, name TEXT
@@ -250,6 +251,8 @@ class TraceStore:
         reference_roots=None,
     ):
         self.path = path
+        self._comparison = None
+        self._reference_selected = False
         self.run_id = run_id
         self.batch_size = batch_size
         self.busy_timeout = busy_timeout
@@ -327,6 +330,11 @@ class TraceStore:
                     sleep(0.01)
             connection.executescript(SCHEMA)
             with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for table in ("call_records", "call_records_stage"):
+                    columns = connection.execute(f"PRAGMA table_info({table})")
+                    if not any(column[1] == "verdict" for column in columns):
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN verdict TEXT")
                 connection.execute(
                     "INSERT INTO runs VALUES (?, ?, ?, NULL)",
                     (store.run_id, time_ns(), _json(invocation)),
@@ -365,7 +373,41 @@ class TraceStore:
                     "INSERT INTO stream_deep_steps VALUES (?, ?, ?, ?, ?)",
                     [(*key, index, data) for index, data in enumerate(steps, 1)],
                 )
+        if self._comparison is not None:
+            self._comparison.record(fingerprints)
         return len(rows)
+
+    def comparison_snapshot(self, run_id=None, roots=None, node_ids=None, replicated=False):
+        """The writer fixes the reference and serves the same snapshot to every worker."""
+        if not self._reference_selected:
+            with closing(self._connect()) as connection:
+                if node_ids is not None:
+                    run_id, roots = previous.run_for_tests(
+                        connection, self.run_id, node_ids, replicated=replicated
+                    )
+                if run_id is not None:
+                    reference = previous.load(connection, run_id, roots)
+                    row = connection.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+                    files = json.loads(row[0]).get("files") or {} if row and row[0] else {}
+                    tests = previous.tests_of(connection, run_id) if node_ids is not None else None
+                    self._comparison = previous.Comparison(reference, files, tests)
+            self._reference_selected = True
+        if self._comparison is None:
+            return None
+        reference = self._comparison.previous
+        return reference.run_id, reference.table, reference.roots
+
+    def comparison_result(self, files, stopped=None):
+        if self._comparison is None:
+            return None
+        tests = set()
+        if self._comparison.tests is not None:
+            with closing(self._connect()) as connection:
+                tests = previous.tests_of(connection, self.run_id)
+        result, missing = self._comparison.result(files, tests, stopped)
+        if not stopped:
+            self.save_section("missing_calls", _json({name: sorted(addresses) for name, addresses in missing.items()}))
+        return result
 
     def _append_fingerprints(self, connection, worker, fingerprints):
         """One packed record per call, and a lookup row per argument and return digest.
@@ -377,10 +419,10 @@ class TraceStore:
         records = []
         lookup = []
         run_id = self.run_id
-        for ordinal, frame_id, parent, function, error, parts, reference, signature in fingerprints:
+        for ordinal, frame_id, parent, function, error, parts, reference, signature, verdict in fingerprints:
             records.append(
                 (run_id, worker, ordinal, frame_id, parent, function, error, reference,
-                 signature, marshal.dumps(parts))
+                 signature, marshal.dumps(parts), verdict)
             )
             lookup.extend(
                 (run_id, fp, worker, ordinal, role, name)
@@ -388,7 +430,7 @@ class TraceStore:
                 if role != "out" and is_digest(fp) and not fp.endswith("~")  # a sketch is not a value
             )
         connection.executemany(
-            "INSERT INTO call_records_stage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records
+            "INSERT INTO call_records_stage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records
         )
         connection.executemany("INSERT INTO call_lookup_stage VALUES (?, ?, ?, ?, ?, ?)", lookup)
 

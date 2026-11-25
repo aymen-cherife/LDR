@@ -311,3 +311,112 @@ def test_no_edit_requires_the_same_executed_files():
     assert same_files({"app.py": "a"}, {"app.py": "a"})
     assert not same_files({"app.py": "a"}, {"app.py": "a", "other.py": "b"})
     assert not same_files({"app.py": "a", "other.py": "b"}, {"app.py": "a"})
+
+
+def test_comparison_records_five_verdicts_and_names_missing_calls(tmp_path):
+    def source(value, path):
+        return f"""
+def kept():
+    return 1
+
+def changed():
+    return {value}
+
+def {path}():
+    return 2
+
+def unreadable(api_key):
+    return None
+
+kept()
+changed()
+{path}()
+unreadable("fixture value")
+"""
+    write_path = tmp_path / "app.py"
+    write_path.write_text(source(3, "removed"), encoding="utf-8")
+    ldr(tmp_path, "run", "app.py")
+    write_path.write_text(source(4, "added"), encoding="utf-8")
+    ldr(tmp_path, "run", "app.py")
+    reference = report(tmp_path)["status"]["reference"]
+    assert (reference["same"], reference["different"], reference["new"],
+            reference["missing"], reference["not_compared"]) == (1, 1, 1, 1, 1)
+    assert reference["changed_detail"] == {
+        "app.py:added": [1, 0], "app.py:changed": [1, 0], "app.py:removed": [1, 0],
+    }
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        selected = runs(tmp_path)[-1]
+        verdicts = dict(connection.execute(
+            "SELECT function, verdict FROM call_records WHERE run_id = ?", (selected,)
+        ))
+        (missing,) = connection.execute(
+            "SELECT payload FROM run_sections WHERE run_id = ? AND name = 'missing_calls'", (selected,),
+        ).fetchone()
+    assert verdicts == {"app.py:kept": "same", "app.py:changed": "changed",
+                        "app.py:added": "new", "app.py:unreadable": "not compared"}
+    assert json.loads(missing) == {"app.py:removed": ["app.py:removed#1"]}
+
+
+def test_a_reference_snapshot_keeps_the_chosen_run(tmp_path):
+    invocation = {"runner": "run", "target": "app.py"}
+    first = TraceStore.start(tmp_path, invocation, 1, 30)
+    first.finish({"files": {}})
+    second = TraceStore.start(tmp_path, invocation, 1, 30)
+    second.finish({"files": {}})
+    current = TraceStore.start(tmp_path, invocation, 1, 30)
+    snapshot = current.comparison_snapshot(first.run_id)
+    assert snapshot[0] == first.run_id
+    assert current.comparison_snapshot(second.run_id)[0] == first.run_id
+    assert current.comparison_result({})["run_id"] == first.run_id
+
+
+def test_workers_merge_seen_addresses_before_reporting_missing_calls(tmp_path):
+    import pytest
+
+    pytest.importorskip("xdist")
+    path = tmp_path / "test_work.py"
+    path.write_text("""
+def kept(value):
+    return value
+
+def removed():
+    return 7
+
+def test_a():
+    assert kept(1) == 1
+    assert removed() == 7
+
+def test_b():
+    assert kept(2) == 2
+""", encoding="utf-8")
+    ldr(tmp_path, "pytest", "test_work.py", "--", "-n", "2")
+    text = path.read_text(encoding="utf-8").replace("    assert removed() == 7\n", "")
+    path.write_text(text, encoding="utf-8")
+    ldr(tmp_path, "pytest", "test_work.py", "--", "-n", "2")
+    status = report(tmp_path)["status"]
+    assert set(status["trace_workers"]) == {"gw0", "gw1"}
+    reference = status["reference"]
+    assert reference["tests"]["compared"] == 2
+    assert reference["same"] == 4
+    assert reference["missing"] == 1
+    assert reference["changed"] == ["test_work.py::test_a/test_work.py:removed"]
+    with closing(sqlite3.connect(tmp_path / ".ldr" / "traces.sqlite3")) as connection:
+        verdicts = connection.execute(
+            "SELECT worker, count(*) FROM call_records WHERE run_id = ? AND verdict = 'same' GROUP BY worker",
+            (status["run_id"],),
+        ).fetchall()
+    assert verdicts == [("gw0", 2), ("gw1", 2)]
+
+
+def test_a_dead_run_keeps_its_verdicts_and_does_not_count_unreached_calls(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.ldr.storage]\nbatch_size = 1\n")
+    app = tmp_path / "app.py"
+    template = "def work(value):\n    return value\n\nwork(1)\n{}\nwork(2)\n"
+    app.write_text(template.format(""), encoding="utf-8")
+    ldr(tmp_path, "run", "app.py")
+    app.write_text(template.format("import os\nos._exit(7)"), encoding="utf-8")
+    observed = ldr(tmp_path, "run", "app.py", expected=7)
+    reference = report(tmp_path)["status"]["reference"]
+    assert (reference["same"], reference["missing"]) == (1, 0)
+    assert reference["stopped"] == {"reason": "died", "address": "app.py:work#1"}
+    assert "comparison stops at died at app.py:work#1" in (observed.stdout + observed.stderr).lower()

@@ -81,11 +81,11 @@ class RuntimeCapture:
     def pytest_collection_finish(self, session):
         """The tests are known: the previous run is the latest one that shares a test with this one."""
         stream = getattr(self.recorder, "call_stream", None)
-        if stream is not None:
-            try:
-                stream.load_previous_for_tests([item.nodeid for item in session.items])
-            except Exception:  # secondary: the comparison after the run does not depend on it
-                pass
+        if stream is not None and session.items:
+            stream.load_previous_for_tests(
+                [item.nodeid for item in session.items],
+                replicated=bool(getattr(self, "prefix", "")),
+            )
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):

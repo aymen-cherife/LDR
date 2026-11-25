@@ -118,7 +118,7 @@ def test_a_failed_batch_preserves_and_reports_the_last_committed_call(tmp_path, 
     store = TraceStore.start(tmp_path, {}, 10, 2)
     run = _Run(store, str(tmp_path))
     sink = object.__new__(Sink)
-    row = (1, "app.py:work#1", None, "work", None, [], None, b"sig")
+    row = (1, "app.py:work#1", None, "work", None, [], None, b"sig", None)
     sink._apply(run, "append", ("append", "main", [], [row], []))
 
     def disk_full(*args):
@@ -148,6 +148,11 @@ def test_detached_run_reports_a_recording_failure_without_changing_target_exit(t
     (tmp_path / "app.py").write_text(
         "def work(value):\n    return value\n\nfor i in range(4):\n    work(i)\nraise SystemExit(7)\n"
     )
+    baseline = processes.run(
+        [sys.executable, "-m", "ldr", "run", "app.py"],
+        cwd=tmp_path, env=environment(), capture_output=True, text=True,
+    )
+    assert baseline.returncode == 7, baseline.stdout + baseline.stderr
     (tmp_path / "sitecustomize.py").write_text(
         "import errno, sys\n"
         "if 'ldr.supervisor' in sys.orig_argv and '--run' in sys.orig_argv:\n"
@@ -176,3 +181,8 @@ def test_detached_run_reports_a_recording_failure_without_changing_target_exit(t
     assert status["incomplete"]["calls_recorded"] == 1
     assert status["incomplete"]["last_address"] == "app.py:work#1"
     assert status["exit_code"] == 7
+
+    reference = status["reference"]
+    assert reference["same"] == 1 and reference["missing"] == 0
+    assert reference["stopped"] == {"reason": "write failed", "address": "app.py:work#1"}
+    assert "comparison stops at write failed after app.py:work#1" in (result.stdout + result.stderr).lower()

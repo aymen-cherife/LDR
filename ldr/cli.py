@@ -393,24 +393,10 @@ def _find_previous(store) -> None:
         store.reference_run = store.reference_roots = None
 
 
-def _compare_with_previous(store, plan, files: dict) -> dict | None:
-    """The comparison with the previous run (or, for a rerun, with the run it repeats), from SQLite."""
-    from contextlib import closing
-
+def _recorded_comparison(store, files: dict, stopped=None) -> dict | None:
     try:
-        if hasattr(store, "sync"):
-            store.sync()  # the parent has written everything that was sent
-        with closing(store._connect()) as connection:
-            if plan is not None:
-                other, prefix = plan["source_run"], plan["prefix"]
-            else:
-                other, prefix = previous.previous_run(connection, store.run_id), None
-            if other is None:
-                return None
-            row = connection.execute("SELECT status FROM runs WHERE id = ?", (other,)).fetchone()
-            before = (json.loads(row[0]).get("files") or {}) if row and row[0] else {}
-            return previous.compare(connection, store.run_id, other, prefix=prefix, files=(before, files))
-    except (OSError, sqlite3.Error, ValueError) as exc:
+        return store.comparison_result(files, stopped)
+    except (OSError, EOFError, sqlite3.Error) as exc:
         return {"run_id": None, "error": capture_error(exc)}
 
 
@@ -465,6 +451,10 @@ def _previous_run_note(reference: dict) -> str:
     if reference.get("not_compared"):
         text += f", {reference['not_compared']} not compared (a value was too large or incomplete)"
     text += ". Calls that differ keep full detail.\n"
+    if stopped := reference.get("stopped"):
+        address = stopped["address"] or "(no call recorded)"
+        reason = "died at" if stopped["reason"] == "died" else "write failed after"
+        text += f"Comparison stops at {reason} {address}.\n"
     tests = reference.get("tests")
     if tests:
         for key, label in (("only_in_this_run", "only in this run"), ("only_in_previous", "only in the previous run")):
@@ -1468,7 +1458,7 @@ def main(argv=None) -> int:
             status["hot_functions_of"] = status["call_stream"]["started"]
             if requested_mode in {"run", "pytest", "module"}:
                 compared_at = time.perf_counter()
-                if comparison := _compare_with_previous(store, rerun_plan, executed):
+                if comparison := _recorded_comparison(store, executed, "write failed" if failure else None):
                     status["reference"] = comparison
                 status["timing"]["comparison_seconds"] = round(time.perf_counter() - compared_at, 6)
             status["call_stream"]["expected_workers"] = len(pytest_capture.workers) if pytest_capture and pytest_capture.workers else 1

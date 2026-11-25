@@ -1,4 +1,4 @@
-"""The previous run of the same target, and the comparison with it, through SQLite.
+"""The previous run of the same target, and the comparison recorded during execution.
 
 Every run is compared with the previous run of the same target (n against n-1):
 
@@ -8,7 +8,6 @@ Every run is compared with the previous run of the same target (n against n-1):
   target, arguments and ``--only``; the scope LDR infers is not part of it).
 
 The recorder loads the previous run's signatures once and looks them up in memory.
-The final report compares the two runs' rows in SQLite.
 """
 
 from __future__ import annotations
@@ -64,30 +63,6 @@ def _candidates(connection, run_id: str):
     return invocation, earlier
 
 
-def previous_run(connection, run_id: str) -> str | None:
-    """The previous run of this run's target, or None. The run's own tests must be stored."""
-    invocation, earlier = _candidates(connection, run_id)
-    if invocation is None:
-        return None
-    key = invocation_key(invocation)
-    for other, text, status in earlier:
-        if _skipped(json.loads(status)):
-            continue
-        other_invocation = json.loads(text)
-        if invocation.get("runner") == "pytest":
-            if other_invocation.get("runner") != "pytest":
-                continue
-            shared = connection.execute(
-                "SELECT 1 FROM run_tests a JOIN run_tests b ON a.node_id = b.node_id "
-                "WHERE a.run_id = ? AND b.run_id = ? LIMIT 1", (run_id, other),
-            ).fetchone()
-            if shared:
-                return other
-        elif invocation_key(other_invocation) == key:
-            return other
-    return None
-
-
 def script_run(connection, run_id: str) -> str | None:
     """For a script (not pytest): the latest earlier run of exactly the same command. A pytest run
     chooses its previous run once it has collected its tests (``run_for_tests``)."""
@@ -108,9 +83,10 @@ class Previous:
     tests (or the one test of a rerun) that both runs have; a call outside them is not compared.
     """
 
-    def __init__(self, run_id: str, table: dict, roots=None):
+    def __init__(self, run_id: str, table: dict, roots=None, functions=()):
         self.run_id = run_id
         self.table = table
+        self.functions = functions
         self.roots = frozenset(roots) if roots is not None else None
 
     def covers(self, frame_id: str) -> bool:
@@ -118,7 +94,8 @@ class Previous:
         return self.roots is None or root_of(frame_id) in self.roots
 
     def signature(self, frame_id: str):
-        return self.table.get(frame_id)
+        entry = self.table.get(frame_id)
+        return entry[0] if entry is not None else None
 
     def addresses(self):
         return self.table.keys()
@@ -130,17 +107,18 @@ class Previous:
 def load(connection, run_id: str, roots=None) -> Previous:
     """Read the previous run's (address, signature) rows with one query."""
     wanted = frozenset(roots) if roots is not None else None
+    names = {}
+    table = {}
     rows = connection.execute(
-        "SELECT frame_id, signature FROM call_records WHERE run_id = ?", (run_id,)
+        "SELECT frame_id, signature, function FROM call_records WHERE run_id = ?", (run_id,)
     )
-    if wanted is None:
-        table = {address: bytes(signature) for address, signature in rows}
-    else:
-        table = {address: bytes(signature) for address, signature in rows if root_of(address) in wanted}
-    return Previous(run_id, table, wanted)
+    for address, signature, function in rows:
+        if wanted is None or root_of(address) in wanted:
+            table[address] = (bytes(signature), names.setdefault(function, len(names)))
+    return Previous(run_id, table, wanted, tuple(names))
 
 
-def run_for_tests(connection, run_id: str, node_ids) -> tuple[str | None, list[str] | None]:
+def run_for_tests(connection, run_id: str, node_ids, *, replicated=False) -> tuple[str | None, list[str] | None]:
     """Once a pytest run has collected its tests: the latest earlier pytest run that shares a test
     with it, and the (encoded) ids of the tests they share."""
     invocation, earlier = _candidates(connection, run_id)
@@ -150,15 +128,17 @@ def run_for_tests(connection, run_id: str, node_ids) -> tuple[str | None, list[s
     for other, text, status in earlier:
         if _skipped(json.loads(status)) or json.loads(text).get("runner") != "pytest":
             continue
-        shared = tests_of(connection, other) & mine
+        theirs = tests_of(connection, other)
+        if replicated:
+            shared = {
+                node for node in theirs
+                if re.match(r"gw\d+/", node) and node.split("/", 1)[1] in mine
+            }
+        else:
+            shared = theirs & mine
         if shared:
             return other, [encode_node_id(node) for node in sorted(shared)]
     return None, None
-
-
-def _records(connection, run_id: str) -> str:
-    row = connection.execute("SELECT 1 FROM call_records_stage WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
-    return "call_records_stage" if row else "call_records"
 
 
 def tests_of(connection, run_id: str) -> set[str]:
@@ -170,75 +150,70 @@ def same_files(before: dict, after: dict) -> bool:
     return bool(before) and before == after
 
 
-def compare(
-    connection,
-    run_id: str,
-    previous: str,
-    *,
-    prefix: str | None = None,
-    files: tuple[dict, dict] | None = None,
-) -> dict:
-    """The run against ``previous``, by a join over their rows. The status block the report reads.
+class Comparison:
+    """Collect committed verdict counts and merge addresses across recording workers."""
 
-    For pytest the comparison covers the tests present in both runs (or only ``prefix``, a
-    rerun's one test); the others are counted as not compared. ``files`` are the two runs' file
-    hashes: when both runs executed the same unchanged files, a difference carries the note.
-    """
-    pytest = connection.execute("SELECT 1 FROM run_tests WHERE run_id = ? LIMIT 1", (run_id,)).fetchone() is not None
-    ours, theirs = _records(connection, run_id), _records(connection, previous)
-    result: dict = {"run_id": previous, "error": None}
-    covered = None
-    if prefix is not None:
-        covered = {prefix}
-    elif pytest:
-        now, before = tests_of(connection, run_id), tests_of(connection, previous)
-        covered = {encode_node_id(node) for node in now & before}
-        result["tests"] = {
-            "compared": len(now & before),
-            "only_in_this_run": sorted(now - before),
-            "only_in_previous": sorted(before - now),
-        }
-    connection.create_function("ldr_root", 1, root_of, deterministic=True)
-    connection.create_function(
-        "ldr_covered", 1, (lambda frame_id: 1) if covered is None else (lambda frame_id: int(root_of(frame_id) in covered)),
-        deterministic=True,
-    )
-    connection.execute("DROP TABLE IF EXISTS temp.now")
-    connection.execute(
-        "CREATE TEMP TABLE now AS SELECT frame_id, function, signature, reference FROM "
-        f"{ours} WHERE run_id = ? AND ldr_covered(frame_id)", (run_id,),
-    )
-    connection.execute("CREATE INDEX temp.now_frame ON now(frame_id)")
-    counts = {"compared": 0, "same": 0, "different": 0, "new": 0, "not_compared": 0}
-    changed: dict[str, int] = {}
-    for function, state, number in connection.execute(
-        "SELECT n.function, CASE WHEN p.frame_id IS NULL THEN 'new' "
-        "WHEN p.signature != n.signature THEN 'different' "
-        "WHEN n.reference IS NOT NULL THEN 'not_compared' ELSE 'same' END AS state, COUNT(*) "
-        f"FROM temp.now n LEFT JOIN {theirs} p ON p.run_id = ? AND p.frame_id = n.frame_id "
-        "GROUP BY n.function, state", (previous,),
-    ):
-        counts[state] += number
-        if state != "new":
-            counts["compared"] += number
-        if state in ("different", "new"):
-            changed[function] = changed.get(function, 0) + number
-    missing = 0
-    for function, number in connection.execute(
-        f"SELECT p.function, COUNT(*) FROM {theirs} p LEFT JOIN temp.now n ON n.frame_id = p.frame_id "
-        "WHERE p.run_id = ? AND ldr_covered(p.frame_id) AND n.frame_id IS NULL GROUP BY p.function",
-        (previous,),
-    ):
-        missing += number
-        changed[function] = changed.get(function, 0) + number
-    connection.execute("DROP TABLE temp.now")
-    varied = bool(files) and same_files(*files)
-    result.update(
-        counts, missing=missing, changed=sorted(changed),
-        changed_detail={function: [number, number if varied else 0] for function, number in sorted(changed.items())},
-        files_unchanged=varied if files else None,
-    )
-    return result
+    def __init__(self, previous, files, tests):
+        self.previous = previous
+        self.files = files
+        self.tests = tests
+        self.seen = set()
+        self.counts = {}
+        self.last_address = None
+
+    def record(self, fingerprints):
+        for _, address, _, function, _, _, _, _, verdict in fingerprints:
+            self.last_address = address
+            if verdict is None:
+                continue
+            if verdict != "new":
+                self.seen.add(address)
+            root = root_of(address) if self.tests is not None else None
+            by_function = self.counts.setdefault(root, {})
+            key = (function, verdict)
+            by_function[key] = by_function.get(key, 0) + 1
+
+    def result(self, files, tests, stopped=None):
+        counts = {"compared": 0, "same": 0, "different": 0, "new": 0, "not_compared": 0}
+        changed = {}
+        result = {"run_id": self.previous.run_id, "error": None}
+        if stopped and self.tests is not None:
+            # A process can die before pytest flushes the list of tests it started.
+            tests = tests | {node for node in self.tests if encode_node_id(node) in self.counts}
+        shared = tests & self.tests if self.tests is not None else None
+        roots = {encode_node_id(node) for node in shared} if shared is not None else None
+        if shared is not None:
+            result["tests"] = {
+                "compared": len(shared),
+                "only_in_this_run": sorted(tests - self.tests),
+                "only_in_previous": sorted(self.tests - tests),
+            }
+        for root, grouped in self.counts.items():
+            if roots is not None and root not in roots:
+                continue
+            for (function, verdict), number in grouped.items():
+                key = {"changed": "different", "not compared": "not_compared"}.get(verdict, verdict)
+                counts[key] += number
+                if verdict != "new":
+                    counts["compared"] += number
+                if verdict in ("changed", "new"):
+                    changed[function] = changed.get(function, 0) + number
+        missing = {}
+        if stopped:
+            result["stopped"] = {"reason": stopped, "address": self.last_address}
+        else:
+            for address in self.previous.addresses() - self.seen:
+                if roots is None or root_of(address) in roots:
+                    function = self.previous.functions[self.previous.table[address][1]]
+                    missing.setdefault(function, []).append(address)
+                    changed[function] = changed.get(function, 0) + 1
+        varied = files is not None and same_files(self.files, files)
+        result.update(
+            counts, missing=sum(map(len, missing.values())), changed=sorted(changed),
+            changed_detail={function: [number, number if varied else 0] for function, number in sorted(changed.items())},
+            files_unchanged=varied if files is not None else None,
+        )
+        return result, missing
 
 
 def keep_runs(project_root: str) -> int:

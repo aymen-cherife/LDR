@@ -4,7 +4,6 @@ import json
 import sqlite3
 import threading
 import time
-from contextlib import closing
 from hashlib import blake2b
 from time import perf_counter
 from threading import RLock
@@ -91,28 +90,20 @@ class CallStream:
             prefix = getattr(store, "reference_prefix", None)
             self._load_previous(store.reference_run, [prefix] if prefix else getattr(store, "reference_roots", None))
 
-    def _load_previous(self, run_id, roots) -> None:
-        """One query, once: after this a call is compared with a dict, never with SQLite."""
+    def _load_previous(self, run_id=None, roots=None, node_ids=None, replicated=False) -> None:
+        """Fetch the writer's fixed reference once and look signatures up locally."""
         started = perf_counter()
         try:
-            with closing(self.store._connect()) as connection:
-                self.previous = previous_runs.load(connection, run_id, roots)
-        except (OSError, sqlite3.Error) as exc:
+            snapshot = self.store.comparison_snapshot(run_id, roots, node_ids, replicated)
+            if snapshot is not None:
+                self.previous = previous_runs.Previous(*snapshot)
+        except (OSError, EOFError, sqlite3.Error) as exc:
             self.previous_error = type(exc).__name__
         self.previous_load_s = round(perf_counter() - started, 3)
 
-    def load_previous_for_tests(self, node_ids) -> None:
-        """A pytest run, once its tests are collected: the latest earlier run that shares a test."""
-        if self.previous is not None or self.store.reference_run:
-            return
-        try:
-            with closing(self.store._connect()) as connection:
-                run_id, roots = previous_runs.run_for_tests(connection, self.store.run_id, node_ids)
-        except (OSError, sqlite3.Error) as exc:
-            self.previous_error = type(exc).__name__
-            return
-        if run_id is not None:
-            self._load_previous(run_id, roots)
+    def load_previous_for_tests(self, node_ids, *, replicated=False) -> None:
+        if self.previous is None and not self.store.reference_run:
+            self._load_previous(node_ids=node_ids, replicated=replicated)
 
     @property
     def keeping_details(self):
@@ -276,7 +267,7 @@ class CallStream:
             state = self._compare(frame_id, signature, comparable)
             self.pending_fp.append(
                 (ordinal, frame_id, parent, function, error_type, parts,
-                 None if comparable else "uncomparable", signature)
+                 None if comparable else "uncomparable", signature, state)
             )
             mutated = [name for name, token in inputs.items() if exit_inputs.get(name) != token]
             reasons = []
@@ -288,7 +279,7 @@ class CallStream:
                     seen.add(shape)
                     if detail != "first call":
                         reasons.append("new shape")
-            if state in ("different", "new"):
+            if state in ("changed", "new"):
                 reasons.append("differs from reference")
             if error is not None:
                 reasons.append("exception")
@@ -374,8 +365,7 @@ class CallStream:
     def _compare(self, frame_id, signature, comparable):
         """Compare one finished call with the previous run's call at the same address.
 
-        The answer only decides which calls keep detail; the comparison that is reported is
-        made from the stored rows after the run (previous.compare).
+        Its verdict is sent with the call and also determines which calls keep detail.
         """
         previous = self.previous
         if previous is None or not previous.covers(frame_id):
@@ -384,8 +374,8 @@ class CallStream:
         if known is None:
             return "new"
         if known != signature:
-            return "different"
-        return "same" if comparable else "not_compared"
+            return "changed"
+        return "same" if comparable else "not compared"
 
     def flush(self):
         if self.keeping_details and (self.pending or self.pending_fp):
