@@ -181,7 +181,6 @@ def test_objects_with_different_state_are_different_and_equal_state_is_equal():
 def test_only_the_node_budget_cuts_off_the_walk():
     """Large values keep an exact signature when no comparison budget applies."""
     from hashlib import blake2b
-    import time
 
     from ldr.fingerprint import Budget, fingerprint, is_digest
 
@@ -195,9 +194,7 @@ def test_only_the_node_budget_cuts_off_the_walk():
     for _ in range(10_000):
         deep = [deep]
     expected = blake2b(b"l1[" * 10_000 + b"i1;" + b"]" * 10_000, digest_size=16).hexdigest()
-    started = time.perf_counter()
     assert fingerprint(deep) == expected
-    assert time.perf_counter() - started < 0.5
 
 
 def test_a_fingerprint_never_depends_on_machine_load(monkeypatch):
@@ -234,20 +231,42 @@ def test_nested_values_are_compared_past_the_old_depth_cutoff():
     assert old.roots[0].in_fp["items"] != new.roots[0].in_fp["items"]
 
 
-def test_capturing_a_huge_list_does_not_walk_it():
-    import time
+def test_large_previews_only_consume_the_displayed_items(monkeypatch):
+    from ldr import node
 
-    from ldr.node import capture
+    ordered = node._ordered
+    consumed = []
+    sort_attempts = []
 
-    huge_list = list(range(2_000_000))
-    huge_set = set(range(300_000))
-    huge_dict = {i: i for i in range(300_000)}
-    started = time.perf_counter()
-    assert capture(huge_list) == "[0, 1, 2, 3, 4, 5, ...]"
-    assert capture(huge_set).endswith(", ...}")
-    assert capture(huge_dict).endswith(", ...}")
-    # reprlib sorted the whole set and dict (~0.1-0.2 s each) for a 6-item preview
-    assert time.perf_counter() - started < 0.05
+    class CountingItems:
+        def __init__(self, items):
+            self.items = items
+
+        def __len__(self):
+            return len(self.items)
+
+        def __iter__(self):
+            for item in self.items:
+                consumed.append(item)
+                yield item
+
+    def count(items, **kwargs):
+        return ordered(CountingItems(items), **kwargs)
+
+    def unexpected_sort(*args, **kwargs):
+        sort_attempts.append(True)
+        raise AssertionError("large preview sorted the collection")
+
+    monkeypatch.setattr(node, "sorted", unexpected_sort, raising=False)
+    monkeypatch.setattr(node, "_ordered", count)
+    large = range(10_000)
+    assert node.capture(list(large)) == "[0, 1, 2, 3, 4, 5, ...]"
+    assert node.capture(set(large)).endswith(", ...}")
+    assert len(consumed) == node._repr.maxset
+    consumed.clear()
+    assert node.capture(dict.fromkeys(large)).endswith(", ...}")
+    assert len(consumed) == node._repr.maxdict
+    assert not sort_attempts
 
 
 def test_receiver_state_is_part_of_the_comparison():

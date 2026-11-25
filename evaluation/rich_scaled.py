@@ -633,6 +633,46 @@ def extract(prefix: str, database: str, root: str, divisor: int = 100, output: P
     return spec
 
 
+def calibrate(spec_path: Path | None = None) -> None:
+    """Check the generated workload against the source mix before timing it."""
+    import os
+    from tempfile import TemporaryDirectory
+    from ldr import processes
+
+    spec = load(spec_path or SPEC_PATH)
+    source, divisor = spec["source"], spec["divisor"]
+    with TemporaryDirectory(prefix="ldr-calibration-") as directory:
+        root = generate(Path(directory), spec_path).parent
+        search = os.pathsep.join(map(str, (HERE.parent, HERE)))
+        processes.run(
+            [sys.executable, "-m", "ldr", "run", "app.py"], cwd=root,
+            env=dict(os.environ, PYTHONPATH=search), capture_output=True, check=True,
+        )
+        with closing(sqlite3.connect(root / ".ldr" / "traces.sqlite3")) as connection:
+            calls, = connection.execute("SELECT COUNT(*) FROM call_records").fetchone()
+            rows = connection.execute("SELECT role, type, nodes FROM value_sizes").fetchall()
+
+    total = sum(nodes for _, _, nodes in rows)
+    observed = [(calls, len(spec["calls"]), 0), (total, source["nodes"] / divisor, .05),
+                (len(rows), source["walks"] / divisor, .05)]
+    for actual, expected, tolerance in observed:
+        if not math.isclose(actual, expected, rel_tol=tolerance):
+            raise ValueError(f"Rich fixture calibration differs: {actual!r}, expected {expected!r}")
+    for role, expected in source["role_share"].items():
+        actual = sum(nodes for entry, _, nodes in rows if entry == role) / total
+        if not math.isclose(actual, expected, abs_tol=.04):
+            raise ValueError(f"Rich fixture calibration differs for {role}: {actual}, expected {expected}")
+    if spec_path is None:
+        # The committed spec includes the largest ThemeStack from the source run.
+        stacks = [nodes for _, kind, nodes in rows if kind == "ThemeStack"]
+        if not stacks or max(stacks) != 2847:
+            raise ValueError("Rich fixture calibration lost the largest ThemeStack")
+    actual = sum(nodes for _, kind, nodes in rows if kind in ("ThemeStack", "Theme")) / total
+    expected = source["type_share"]["ThemeStack"] + source["type_share"]["Theme"]
+    if not math.isclose(actual, expected, abs_tol=.06):
+        raise ValueError(f"Rich fixture theme share differs: {actual}, expected {expected}")
+
+
 def main() -> int:
     arguments = sys.argv[1:]
     divisor = 100

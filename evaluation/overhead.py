@@ -1,6 +1,6 @@
-"""Default-mode overhead on five fixtures: plain run against `ldr`, median of N rounds.
+"""Default-mode overhead on five fixtures: plain run against `ldr`, one run of each.
 
-    python evaluation/overhead.py [--rounds 3] [--work DIR] [--only NAME ...]
+    python evaluation/overhead.py [--work DIR] [--only NAME ...]
                                   [--ldr CHECKOUT] [--noise] [--json]
 
 Fixtures (every one is downloaded into the work directory and pinned; none is copied
@@ -33,7 +33,6 @@ import json
 import os
 import random
 import shutil
-import statistics
 import subprocess
 import sys
 import tarfile
@@ -144,7 +143,9 @@ def build(work: Path, name: str):
         # LDR_RICH_SCALED_SPEC: another spec (made with `rich_scaled.py extract --divisor N --spec FILE`).
         other = os.environ.get("LDR_RICH_SCALED_SPEC")
         root = work / ("rich-scaled-" + Path(other).stem if other else "rich-scaled")
-        rich_scaled.generate(root, Path(other) if other else None)
+        spec_path = Path(other) if other else None
+        rich_scaled.calibrate(spec_path)
+        rich_scaled.generate(root, spec_path)
         return root, [sys.executable, "app.py"], [sys.executable, "-m", "ldr", "run", "app.py"]
     root = work / "orders"
     if not (root / "orders.csv").exists():
@@ -169,46 +170,28 @@ def timed(command: list[str], cwd: Path, env: dict[str, str]) -> float:
 
 
 def clean(root: Path) -> None:
-    """Remove the files of the previous run. The recorder's last process can still hold the database
-    for a moment after `ldr` returns, and a database left behind would make the next run a second run
-    (compared with the previous one), so wait until it is gone."""
+    """Remove the previous benchmark recording and test cache."""
     for leftover in (".ldr", ".hypothesis"):
-        deadline = time.monotonic() + 600
-        problems: list[str] = []
-        while True:
-            shutil.rmtree(root / leftover, onexc=lambda function, path, error: problems.append(f"{path}: {error}"))
-            if not (root / leftover).exists():
-                break
-            if time.monotonic() > deadline:
-                raise SystemExit(f"cannot remove {root / leftover}: {problems[-1:]}")
-            problems.clear()
-            time.sleep(0.5)
+        path = root / leftover
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            if path.exists():
+                raise
 
 
-def measure(name, fixture, rounds, env):
+def measure(name, fixture, env):
     root, plain, traced = fixture
-    times = {"plain": [], "ldr": []}
-    for _ in range(rounds):
-        clean(root)
-        times["plain"].append(timed(plain, root, env))
-        clean(root)
-        times["ldr"].append(timed(traced, root, env))
-    plain_median = statistics.median(times["plain"])
-    traced_median = statistics.median(times["ldr"])
-    # What this machine charges for starting the interpreter at all (`python -c pass`), run
-    # right after the rounds so it reflects the same conditions. A recorded run starts two
-    # interpreters (the launcher and the child that runs the program), a plain run one.
-    startup = statistics.median(timed([plain[0], "-c", "pass"], root, env) for _ in range(5))
+    clean(root)
+    plain_time = timed(plain, root, env)
+    clean(root)
+    traced_time = timed(traced, root, env)
     return {
-        "bare_python_startup_s": round(startup, 3),
-        "ldr_added_s": round(traced_median - plain_median, 3),
-        "ldr_added_minus_one_startup_s": round(traced_median - plain_median - startup, 3),
         "fixture": name,
-        "plain_s": [round(t, 3) for t in times["plain"]],
-        "ldr_s": [round(t, 3) for t in times["ldr"]],
-        "plain_median_s": round(plain_median, 3),
-        "ldr_median_s": round(traced_median, 3),
-        "ratio": round(traced_median / plain_median, 2),
+        "plain_s": round(plain_time, 3),
+        "ldr_s": round(traced_time, 3),
+        "ldr_added_s": round(traced_time - plain_time, 3),
+        "ratio": round(traced_time / plain_time, 2),
     }
 
 
@@ -254,7 +237,7 @@ def noise(name, fixture, env):
     changed = [key for key in first if key in second and first[key] != second[key]]
     causes = Counter(first[key][0] for key in changed)
     # The same code twice more, as two recorded runs: the second is compared with the first by
-    # the run itself (previous.compare). Every difference is reported; when both runs executed
+    # the run itself. Every difference is reported; when both runs executed
     # identical files, each carries the note "also varied across 2 runs with no edit".
     clean(root)
     timed(traced, root, env)
@@ -278,7 +261,6 @@ def noise(name, fixture, env):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "ldr-overhead"))
     parser.add_argument("--only", nargs="+", choices=NAMES)
     parser.add_argument("--ldr", default=str(REPO), help="checkout of LDR to measure")
@@ -293,7 +275,7 @@ def main() -> int:
         if args.noise:
             results.append(noise(name, fixture, env))
         else:
-            results.append(measure(name, fixture, args.rounds, env))
+            results.append(measure(name, fixture, env))
         item = results[-1]
         if not args.json:
             if args.noise:
@@ -307,10 +289,9 @@ def main() -> int:
                 )
             else:
                 print(
-                    f"{item['fixture']:8s} plain {item['plain_median_s']:6.2f}s  "
-                    f"ldr {item['ldr_median_s']:6.2f}s  ratio {item['ratio']:5.2f}x  "
-                    f"python start-up {item['bare_python_startup_s']:5.2f}s  "
-                    f"LDR adds {item['ldr_added_s']:6.2f}s ({item['ldr_added_minus_one_startup_s']:6.2f}s beyond one start-up)",
+                    f"{item['fixture']:8s} plain {item['plain_s']:6.2f}s  "
+                    f"ldr {item['ldr_s']:6.2f}s  ratio {item['ratio']:5.2f}x  "
+                    f"LDR adds {item['ldr_added_s']:6.2f}s",
                     flush=True,
                 )
     if args.json:

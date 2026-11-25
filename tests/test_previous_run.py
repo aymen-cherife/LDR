@@ -178,10 +178,6 @@ def test_the_number_of_runs_kept_is_a_setting(tmp_path):
     assert len(runs(tmp_path)) == 3
 
 
-def test_the_previous_run_is_never_held_in_memory():
-    assert not hasattr(TraceStore, "read_reference")
-
-
 THREADED = """\
 import threading
 

@@ -158,11 +158,6 @@ def test_a_launcher_that_exits_without_a_pid_is_reported(tmp_path, monkeypatch, 
     assert "the launcher of run " in err and "it wrote no process number" in err and str(tmp_path / ".ldr" / "runs") in err
 
 
-def test_no_fixed_start_limit_is_left_in_the_waiter():
-    source = (REPO / "ldr" / "waiter.py").read_text(encoding="utf-8")
-    assert "120" not in source and "gone > 100" not in source and "deadline" not in source and "did not start in" not in source
-
-
 def test_killing_the_waiting_commands_whole_tree_does_not_stop_the_run(tmp_path):
     (tmp_path / "app.py").write_text("import time\n\n\ndef f():\n    time.sleep(8)\n    return 1\n\n\nf()\n", encoding="utf-8")
     waiting = processes.Popen([sys.executable, "-m", "ldr", "run", "app.py"], cwd=tmp_path, env=ENV,

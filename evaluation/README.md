@@ -119,5 +119,4 @@ python evaluation/audit_line_budget.py /path/to/audit-checkouts --deps /path/to/
 These tools measure what the fingerprint walk and the previous-run lookup cost. They are for LDR's developers.
 
 - `overhead.py --only rich-scaled` runs a fixture that has the object types, sizes, roles and call counts of the rich run at 1/100 (`rich_scaled.py`, `rich_scaled_spec.json`). The spec comes from one recorded rich run and the rows of the walk probe; `python evaluation/rich_scaled.py extract ...` rewrites it. The fixture does not copy the work rich does between calls or who calls whom; see the docstring of `rich_scaled.py`.
-- `lookup_cost.py --before CHECKOUT --after CHECKOUT` times two checkouts of LDR in one session, each with a previous run to compare with, and times the comparison from inside (`lookup_probe/`).
 - `walk_probe/run_probe.py NAME PREFIX` records one run with a probe on the fingerprint walk (the walked object's identity, digest, node count and time, and what its nodes were made of). `repeated_walks.py PREFIX` counts the walks that read an object an earlier walk had already read, unchanged, and what share of the nodes and time they are.

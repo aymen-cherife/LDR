@@ -316,31 +316,6 @@ def test_a_locked_database_names_the_process_that_holds_it(ldr_dir):
     assert "database_locked" not in kinds(quick(ldr_dir))
 
 
-def test_a_locked_database_names_the_process_that_holds_it(ldr_dir):
-    database(ldr_dir).close()
-    path = str(ldr_dir / "traces.sqlite3")
-    holder = processes.Popen(
-        [sys.executable, "-c",
-         "import sqlite3,sys,time\n"
-         "c=sqlite3.connect(sys.argv[1]); c.isolation_level=None; c.execute('BEGIN EXCLUSIVE')\n"
-         "print('held', flush=True); time.sleep(60)", path],
-        stdout=subprocess.PIPE, text=True,
-    )
-    try:
-        assert holder.stdout.readline().strip() == "held"
-        report = quick(ldr_dir)
-        problem = next(p for p in report.problems if p.kind == "database_locked")
-        # the virtual environment's python.exe starts the real interpreter: the holder is it or its child
-        family = {holder.pid} | {pid for pid, parent, _ in machine.list_processes() if parent == holder.pid}
-        assert problem.number in family, report.lines()
-        assert str(problem.number) in problem.windows and str(problem.number) in problem.linux
-        assert report.facts["database_locked"] is True
-    finally:
-        holder.kill()
-        holder.wait()
-    assert "database_locked" not in kinds(quick(ldr_dir))
-
-
 def test_check_machine_alone_prints_the_summary_first_and_exits_zero(tmp_path):
     (tmp_path / ".ldr").mkdir()
     result = ldr(tmp_path, "check_machine", expected=0)

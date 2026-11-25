@@ -4,11 +4,7 @@ The fixture has the object types, sizes, roles and call counts of the rich run a
 repeats objects (the same ThemeStack is returned again and again) the way rich does."""
 
 import collections
-import os
-import sqlite3
-import subprocess
 import sys
-from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -19,7 +15,6 @@ sys.path.insert(0, str(REPO / "evaluation"))
 import rich_scaled  # noqa: E402
 
 from ldr import fingerprint  # noqa: E402
-from ldr import processes
 
 SPEC = rich_scaled.load()
 
@@ -77,31 +72,3 @@ def test_the_spec_has_a_hundredth_of_the_calls():
     assert sum(calls.values()) == len(SPEC["calls"])
     assert len(SPEC["calls"]) == pytest.approx(SPEC["calls_in_source"] / SPEC["divisor"], abs=1)
     assert set(calls) <= set(range(len(SPEC["functions"])))
-
-
-def test_the_recorded_run_has_the_calls_sizes_and_roles_of_the_spec(tmp_path):
-    root = rich_scaled.generate(tmp_path / "fixture").parent
-    result = processes.run(
-        [sys.executable, "-m", "ldr", "run", "app.py"], cwd=root, capture_output=True, text=True, timeout=900,
-        env=dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO), str(REPO / "evaluation")])),
-    )
-    assert result.returncode == 0, result.stdout[-1500:] + result.stderr[-1500:]
-    assert float((root / "loop_seconds.txt").read_text()) > 0
-    with closing(sqlite3.connect(root / ".ldr" / "traces.sqlite3")) as connection:
-        run = connection.execute("SELECT id FROM runs").fetchone()[0]
-        calls = connection.execute("SELECT COUNT(*) FROM call_records WHERE run_id = ?", (run,)).fetchone()[0]
-        rows = connection.execute(
-            "SELECT role, type, nodes FROM value_sizes WHERE run_id = ?", (run,)
-        ).fetchall()
-    source, divisor = SPEC["source"], SPEC["divisor"]
-    assert calls == len(SPEC["calls"])
-    total = sum(nodes for _, _, nodes in rows)
-    assert total == pytest.approx(source["nodes"] / divisor, rel=0.05)
-    assert len(rows) == pytest.approx(source["walks"] / divisor, rel=0.05)
-    for role, share in source["role_share"].items():
-        found = sum(nodes for r, _, nodes in rows if r == role) / total
-        assert found == pytest.approx(share, abs=0.04), role
-    stacks = [nodes for _, kind, nodes in rows if kind == "ThemeStack"]
-    assert max(stacks) == 2847
-    big = sum(nodes for _, kind, nodes in rows if kind in ("ThemeStack", "Theme")) / total
-    assert big == pytest.approx(source["type_share"]["ThemeStack"] + source["type_share"]["Theme"], abs=0.06)
