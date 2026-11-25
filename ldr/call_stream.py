@@ -24,11 +24,10 @@ FLUSH_INTERVAL = 0.1
 
 def call_signature(parts, error):
     """One comparable value for a call: its error type and fingerprint rows."""
-    digest = blake2b(digest_size=8)
-    digest.update((error or "").encode("utf-8", "surrogatepass"))
-    for role, name, token in parts:
-        digest.update(f"\x1f{role}\x1e{name}\x1e{token}".encode("utf-8", "surrogatepass"))
-    return digest.digest()
+    pieces = [f"\x1f{role}\x1e{name}\x1e{token}" for role, name, token in parts]
+    if error:
+        pieces.insert(0, error)
+    return blake2b("".join(pieces).encode("utf-8", "surrogatepass"), digest_size=8).digest()
 
 
 # One encoder for every record: json.dumps with non-default options builds a new

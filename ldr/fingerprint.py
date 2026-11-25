@@ -250,11 +250,11 @@ class _Walk:
         elif kind is bool:
             out.update(b"T" if value else b"F")
         elif kind is int:
-            out.update(b"i" + format(value, "x").encode() + b";")
+            out.update(f"i{value:x};".encode())
         elif kind is float:
-            out.update(b"f" + value.hex().encode() + b";")
+            out.update(f"f{value.hex()};".encode())
         elif kind is complex:
-            out.update(b"c" + value.real.hex().encode() + b"," + value.imag.hex().encode() + b";")
+            out.update(f"c{value.real.hex()},{value.imag.hex()};".encode())
         elif kind is str:
             if _looks_secret(value):
                 raise _Stop(REDACTED)
@@ -317,7 +317,7 @@ class _Walk:
             out.update(b"Pa")
             yield value.func, out
             yield value.args, out
-            out.update(str(len(value.keywords)).encode() + b"{")
+            out.update(b"%d{" % len(value.keywords))
             for key in sorted(value.keywords):
                 if is_secret_name(key):
                     raise _Stop(REDACTED)
@@ -336,12 +336,12 @@ class _Walk:
             return
         marker = id(value)
         if marker in self.active:
-            out.update(b"@" + str(len(self.active) - self.active[marker]).encode() + b";")
+            out.update(b"@%d;" % (len(self.active) - self.active[marker]))
             return
         self.active[marker] = len(self.active)
         try:
             self._text(b"O", reading.identity.encode("utf-8", "surrogatepass"), out)
-            out.update(str(len(reading.fields)).encode() + b"{")
+            out.update(b"%d{" % len(reading.fields))
             for name, item in reading.fields:
                 if name is not None:
                     if is_secret_name(name):
@@ -374,7 +374,7 @@ class _Walk:
                 if _looks_secret(item):
                     raise _Stop(REDACTED)
                 data = normalize_temp_paths(item).encode("utf-8", "surrogatepass")
-                pieces.append(b"s" + str(len(data)).encode() + b":" + data)
+                pieces.append(b"s%d:%s" % (len(data), data))
             body = b"".join(pieces)
         else:
             return False
@@ -386,24 +386,24 @@ class _Walk:
 
     @staticmethod
     def _text(tag: bytes, data: bytes, out: hashlib.blake2b) -> None:
-        out.update(tag + str(len(data)).encode() + b":" + data)
+        out.update(b"%s%d:%s" % (tag, len(data), data))
 
     def _container(self, kind: type, value: Any, out: hashlib.blake2b):
         marker = id(value)
         if marker in self.active:
             # A cycle: refer to the ancestor by distance, not by address.
-            out.update(b"@" + str(len(self.active) - self.active[marker]).encode() + b";")
+            out.update(b"@%d;" % (len(self.active) - self.active[marker]))
             return
         self.active[marker] = len(self.active)
         try:
             if kind is list or kind is tuple:
-                out.update((b"l" if kind is list else b"t") + str(len(value)).encode() + b"[")
+                out.update((b"l%d[" if kind is list else b"t%d[") % len(value))
                 if len(value) < FAST_PATH_MIN or not self._fast_items(value, out):
                     for item in value:
                         yield item, out
             elif kind is dict:
                 # Insertion order is part of the value.
-                out.update(b"d" + str(len(value)).encode() + b"{")
+                out.update(b"d%d{" % len(value))
                 for key, item in value.items():
                     if is_secret_name(key):
                         raise _Stop(REDACTED)
@@ -417,7 +417,7 @@ class _Walk:
                     yield item, part
                     parts.append(part.digest())
                 parts.sort()
-                out.update((b"e" if kind is set else b"z") + str(len(parts)).encode() + b"(")
+                out.update((b"e%d(" if kind is set else b"z%d(") % len(parts))
                 for part in parts:
                     out.update(part)
             out.update(b"]")

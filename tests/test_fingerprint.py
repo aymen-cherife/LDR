@@ -250,6 +250,43 @@ def test_structural_readers_reuse_and_refresh_the_layout(monkeypatch):
     assert len(discoveries) == 5
 
 
+def test_existing_fingerprint_encoding_bytes():
+    from decimal import Decimal
+    from ldr.fingerprint import fingerprint
+
+    cycle = []
+    cycle.append(cycle)
+    values = (
+        (None, False, -42, -0.0, 1 + 2j, "a\ud800\u00e9", b"\x00\xff", bytearray(b"\x01z"), Decimal("1.2300")),
+        {"z": (1, 2), "a": [False, {"red", "blue"}, frozenset((1, -4))]},
+        list(range(-33, 33)), ["\u00e9\ud800"] * 40, cycle,
+    )
+    assert [fingerprint(value) for value in values] == [
+        "8e97ee16bc25f02df4db15a2048a1635",
+        "344245e3cdf913d7384948924ca7f9ab",
+        "7b72ef8c37f7518415b6d9338cab2f58",
+        "8ae5c47f82b7cf1d45e0efd3b2e38dda",
+        "bbf4d489e5714af2668ccb14e694aa4f",
+    ]
+
+
+def test_call_signature_hashes_the_same_bytes_once(monkeypatch):
+    from ldr import call_stream
+
+    blake2b = call_stream.blake2b
+    seen = []
+
+    def digest(data=b"", **options):
+        seen.append(data)
+        return blake2b(data, **options)
+
+    monkeypatch.setattr(call_stream, "blake2b", digest)
+    parts = [("in", "arg\ud800", "1"), ("out", "arg\ud800", "2")]
+    assert call_stream.call_signature(parts, "Ex\u00e9").hex() == "fddf49c09f60f724"
+    expected = "Ex\u00e9\x1fin\x1earg\ud800\x1e1\x1fout\x1earg\ud800\x1e2"
+    assert seen == [expected.encode("utf-8", "surrogatepass")]
+
+
 def test_only_the_node_budget_cuts_off_the_walk():
     """Large values keep an exact signature when no comparison budget applies."""
     from hashlib import blake2b
