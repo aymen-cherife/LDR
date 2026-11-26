@@ -297,3 +297,18 @@ def test_layout_validation_is_reused_within_native_walk(monkeypatch):
     assert result(value, True) == result(value, False)
     # The Python reference itself validates once per object.
     assert len(calls) == 101
+
+
+def test_policy_replacement_during_fallback_refreshes_native_text_cache():
+    import datetime
+    from ldr import redact
+    secret = 'fallback-policy-value-296734'
+    assert fp.fingerprint([secret]) != fp.REDACTED
+    class Zone(datetime.tzinfo):
+        def utcoffset(self, value):
+            redact.load_environment({'MY_TOKEN': secret})
+            return datetime.timedelta(0)
+    try:
+        assert fp.fingerprint([datetime.datetime(2026, 1, 1, tzinfo=Zone()), secret]) == fp.REDACTED
+    finally:
+        redact.load_environment()

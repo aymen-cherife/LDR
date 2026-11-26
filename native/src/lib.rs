@@ -1,3 +1,259 @@
+use pyo3::sync::GILOnceCell;
+static REFERENCE_VALUES: GILOnceCell<Py<PyDict>> = GILOnceCell::new();
+struct References {
+    modules: HashMap<&'static str, Py<PyModule>>,
+    values: HashMap<&'static str, Py<PyAny>>,
+}
+impl References {
+    fn resolve(py: Python<'_>) -> PyResult<Self> {
+        let mut result = Self {
+            modules: HashMap::new(),
+            values: HashMap::new(),
+        };
+        result.modules.insert("abc", py.import("abc")?.unbind());
+        result
+            .modules
+            .insert("builtins", py.import("builtins")?.unbind());
+        result
+            .modules
+            .insert("datetime", py.import("datetime")?.unbind());
+        result
+            .modules
+            .insert("decimal", py.import("decimal")?.unbind());
+        result
+            .modules
+            .insert("functools", py.import("functools")?.unbind());
+        result
+            .modules
+            .insert("ldr.fingerprint", py.import("ldr.fingerprint")?.unbind());
+        result
+            .modules
+            .insert("ldr.redact", py.import("ldr.redact")?.unbind());
+        result
+            .modules
+            .insert("ldr.structure", py.import("ldr.structure")?.unbind());
+        result.modules.insert("types", py.import("types")?.unbind());
+        result.values.insert(
+            "abc:ABCMeta",
+            result.module(py, "abc").getattr("ABCMeta")?.unbind(),
+        );
+        result.values.insert(
+            "builtins:format",
+            result.module(py, "builtins").getattr("format")?.unbind(),
+        );
+        result.values.insert(
+            "builtins:range",
+            result.module(py, "builtins").getattr("range")?.unbind(),
+        );
+        result.values.insert(
+            "builtins:sorted",
+            result.module(py, "builtins").getattr("sorted")?.unbind(),
+        );
+        result.values.insert(
+            "datetime:timedelta",
+            result.module(py, "datetime").getattr("timedelta")?.unbind(),
+        );
+        result.values.insert(
+            "datetime:timezone",
+            result.module(py, "datetime").getattr("timezone")?.unbind(),
+        );
+        result.values.insert(
+            "decimal:Decimal",
+            result.module(py, "decimal").getattr("Decimal")?.unbind(),
+        );
+        result.values.insert(
+            "functools:partial",
+            result.module(py, "functools").getattr("partial")?.unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:CACHE_LIMIT",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("CACHE_LIMIT")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:FAST_PATH_MIN",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("FAST_PATH_MIN")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:SHORT_TEXT",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("SHORT_TEXT")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:STATS",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("STATS")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:_Stop",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("_Stop")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:_TMP_PLACEHOLDER",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("_TMP_PLACEHOLDER")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:_TMP_RE",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("_TMP_RE")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:_current_caches",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("_current_caches")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.fingerprint:_secret_cache",
+            result
+                .module(py, "ldr.fingerprint")
+                .getattr("_secret_cache")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.redact:_ENV_MIN_LENGTH",
+            result
+                .module(py, "ldr.redact")
+                .getattr("_ENV_MIN_LENGTH")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.redact:_MARKERS",
+            result
+                .module(py, "ldr.redact")
+                .getattr("_MARKERS")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.redact:_SHAPES",
+            result.module(py, "ldr.redact").getattr("_SHAPES")?.unbind(),
+        );
+        result.values.insert(
+            "ldr.redact:_argv_secrets",
+            result
+                .module(py, "ldr.redact")
+                .getattr("_argv_secrets")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.redact:_environment",
+            result
+                .module(py, "ldr.redact")
+                .getattr("_environment")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.redact:is_secret_name",
+            result
+                .module(py, "ldr.redact")
+                .getattr("is_secret_name")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.structure:_BASE_EXC_ARGS",
+            result
+                .module(py, "ldr.structure")
+                .getattr("_BASE_EXC_ARGS")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.structure:_TYPE_MODULE",
+            result
+                .module(py, "ldr.structure")
+                .getattr("_TYPE_MODULE")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.structure:_TYPE_NAME",
+            result
+                .module(py, "ldr.structure")
+                .getattr("_TYPE_NAME")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.structure:_TYPE_QUALNAME",
+            result
+                .module(py, "ldr.structure")
+                .getattr("_TYPE_QUALNAME")?
+                .unbind(),
+        );
+        result.values.insert(
+            "ldr.structure:_layout",
+            result
+                .module(py, "ldr.structure")
+                .getattr("_layout")?
+                .unbind(),
+        );
+        result.values.insert(
+            "types:BuiltinFunctionType",
+            result
+                .module(py, "types")
+                .getattr("BuiltinFunctionType")?
+                .unbind(),
+        );
+        result.values.insert(
+            "types:FunctionType",
+            result.module(py, "types").getattr("FunctionType")?.unbind(),
+        );
+        result.values.insert(
+            "types:MemberDescriptorType",
+            result
+                .module(py, "types")
+                .getattr("MemberDescriptorType")?
+                .unbind(),
+        );
+        result.values.insert(
+            "types:MethodType",
+            result.module(py, "types").getattr("MethodType")?.unbind(),
+        );
+        for (key, name) in [
+            ("ldr.redact:_name_cache", "_name_cache"),
+            ("ldr.redact:_CAMEL", "_CAMEL"),
+            ("ldr.redact:_SECRET_NAME", "_SECRET_NAME"),
+        ] {
+            result
+                .values
+                .insert(key, result.module(py, "ldr.redact").getattr(name)?.unbind());
+        }
+        let saved =
+            REFERENCE_VALUES.get_or_try_init(py, || Ok::<_, PyErr>(PyDict::new(py).unbind()))?;
+        let saved = saved.bind(py);
+        for (name, value) in result.values.iter_mut() {
+            if let Some(previous) = saved.get_item(*name)? {
+                if previous.is(value.bind(py)) {
+                    *value = previous.unbind();
+                    continue;
+                }
+            }
+            saved.set_item(*name, value.bind(py))?;
+        }
+        Ok(result)
+    }
+    fn module<'py>(&self, py: Python<'py>, key: &str) -> Bound<'py, PyModule> {
+        self.modules[key].bind(py).clone()
+    }
+    fn get<'py>(&self, py: Python<'py>, key: &str) -> Bound<'py, PyAny> {
+        self.values[key].bind(py).clone()
+    }
+}
 use blake2::{
     digest::{Update, VariableOutput},
     Blake2bVar,
@@ -62,33 +318,81 @@ fn write(_py: Python<'_>, hash: &Digest, data: &[u8]) {
     hash.borrow_mut().update(data);
 }
 
+fn secret_name(
+    py: Python<'_>,
+    name: &Bound<'_, PyAny>,
+    refs: &References,
+    plans: &mut HashMap<usize, Option<ObjectPlan>>,
+) -> PyResult<bool> {
+    if !name.is_exact_instance_of::<PyString>() {
+        if name.is_instance_of::<PyString>() {
+            plans.clear();
+            return refs
+                .get(py, "ldr.redact:is_secret_name")
+                .call1((name,))?
+                .is_truthy();
+        }
+        return Ok(false);
+    }
+    let cache = refs
+        .get(py, "ldr.redact:_name_cache")
+        .downcast_into::<PyDict>()?;
+    if let Some(found) = cache.get_item(name)? {
+        return found.is_truthy();
+    }
+    let expanded = refs
+        .get(py, "ldr.redact:_CAMEL")
+        .call_method1("sub", ("_", name))?;
+    let found = !refs
+        .get(py, "ldr.redact:_SECRET_NAME")
+        .call_method1("search", (expanded,))?
+        .is_none();
+    if cache.len() >= 65_536 {
+        cache.clear();
+    }
+    cache.set_item(name, found)?;
+    Ok(found)
+}
+
 fn secret_text(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
     fingerprint: &Bound<'_, PyModule>,
+    refs: &References,
 ) -> PyResult<()> {
-    let redact = py.import("ldr.redact")?;
-    let cache = fingerprint
-        .getattr("_secret_cache")?
+    let redact = refs.module(py, "ldr.redact");
+    let cache = refs
+        .get(py, "ldr.fingerprint:_secret_cache")
         .downcast_into::<PyDict>()?;
-    let short = value.len()? <= fingerprint.getattr("SHORT_TEXT")?.extract::<usize>()?;
+    let short = value.len()?
+        <= refs
+            .get(py, "ldr.fingerprint:SHORT_TEXT")
+            .extract::<usize>()?;
     let cached = if short { cache.get_item(value)? } else { None };
     let secret = if let Some(found) = cached {
         found.is_truthy()?
     } else {
         let mut found = false;
-        for pair in redact.getattr("_environment")?.get_item(0)?.try_iter()? {
+        for pair in refs
+            .get(py, "ldr.redact:_environment")
+            .get_item(0)?
+            .try_iter()?
+        {
             if value.contains(pair?.get_item(0)?)? {
                 found = true;
                 break;
             }
         }
         if !found {
-            for item in redact.getattr("_argv_secrets")?.get_item(1)?.try_iter()? {
+            for item in refs
+                .get(py, "ldr.redact:_argv_secrets")
+                .get_item(1)?
+                .try_iter()?
+            {
                 let item = item?;
                 if item.len()? > 0
                     && (value.eq(&item)?
-                        || (item.len()? >= redact.getattr("_ENV_MIN_LENGTH")?.extract()?
+                        || (item.len()? >= refs.get(py, "ldr.redact:_ENV_MIN_LENGTH").extract()?
                             && value.contains(&item)?))
                 {
                     found = true;
@@ -98,8 +402,8 @@ fn secret_text(
         }
         if !found {
             let lower = value.call_method0("lower")?;
-            let markers = redact.getattr("_MARKERS")?;
-            for shape in redact.getattr("_SHAPES")?.try_iter()? {
+            let markers = refs.get(py, "ldr.redact:_MARKERS");
+            for shape in refs.get(py, "ldr.redact:_SHAPES").try_iter()? {
                 let shape = shape?;
                 let mut eligible = false;
                 for marker in markers.get_item(shape.get_item(0)?)?.try_iter()? {
@@ -120,7 +424,7 @@ fn secret_text(
             }
         }
         if short {
-            if cache.len() >= fingerprint.getattr("CACHE_LIMIT")?.extract()? {
+            if cache.len() >= refs.get(py, "ldr.fingerprint:CACHE_LIMIT").extract()? {
                 cache.clear();
             }
             cache.set_item(value, found)?;
@@ -129,7 +433,7 @@ fn secret_text(
     };
     if secret {
         return Err(PyErr::from_value(
-            fingerprint.getattr("_Stop")?.call1(("redacted",))?,
+            refs.get(py, "ldr.fingerprint:_Stop").call1(("redacted",))?,
         ));
     }
     Ok(())
@@ -138,15 +442,19 @@ fn text_bytes(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
     fingerprint: &Bound<'_, PyModule>,
+    refs: &References,
 ) -> PyResult<Vec<u8>> {
-    secret_text(py, value, fingerprint)?;
-    let regex = fingerprint.getattr("_TMP_RE")?;
+    secret_text(py, value, fingerprint, refs)?;
+    let regex = refs.get(py, "ldr.fingerprint:_TMP_RE");
     let normalized = if regex.is_none() {
         value.clone()
     } else {
-        let pair = regex.call_method1("subn", (fingerprint.getattr("_TMP_PLACEHOLDER")?, value))?;
+        let pair = regex.call_method1(
+            "subn",
+            (refs.get(py, "ldr.fingerprint:_TMP_PLACEHOLDER"), value),
+        )?;
         let count: usize = pair.get_item(1)?.extract()?;
-        let stats = fingerprint.getattr("STATS")?;
+        let stats = refs.get(py, "ldr.fingerprint:STATS");
         let old: usize = stats.getattr("tmp_normalized")?.extract()?;
         stats.setattr("tmp_normalized", old + count)?;
         pair.get_item(0)?
@@ -158,10 +466,10 @@ fn text_bytes(
     Ok(encoded)
 }
 
-fn identity(py: Python<'_>, cls: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    let structure = py.import("ldr.structure")?;
-    let module = structure.getattr("_TYPE_MODULE")?.call1((cls,))?;
-    let name = structure.getattr("_TYPE_QUALNAME")?.call1((cls,))?;
+fn identity(py: Python<'_>, cls: &Bound<'_, PyAny>, refs: &References) -> PyResult<Vec<u8>> {
+    let structure = refs.module(py, "ldr.structure");
+    let module = refs.get(py, "ldr.structure:_TYPE_MODULE").call1((cls,))?;
+    let name = refs.get(py, "ldr.structure:_TYPE_QUALNAME").call1((cls,))?;
     let module = if module.is_exact_instance_of::<PyString>() {
         module
     } else {
@@ -170,7 +478,7 @@ fn identity(py: Python<'_>, cls: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     let name = if name.is_exact_instance_of::<PyString>() {
         name
     } else {
-        structure.getattr("_TYPE_NAME")?.call1((cls,))?
+        refs.get(py, "ldr.structure:_TYPE_NAME").call1((cls,))?
     };
     let text = PyString::new(py, ".").call_method1("join", ((module, name),))?;
     Ok(text
@@ -192,16 +500,17 @@ fn object_fields(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
     plans: &mut HashMap<usize, Option<ObjectPlan>>,
+    refs: &References,
 ) -> PyResult<Option<(Vec<u8>, Vec<(Option<Py<PyAny>>, Py<PyAny>)>)>> {
     let cls = value.get_type();
     let marker = cls.as_ptr() as usize;
     if !plans.contains_key(&marker) {
-        let structure = py.import("ldr.structure")?;
+        let structure = refs.module(py, "ldr.structure");
         // The existing weak per-class reader performs full mutation validation.
-        let layout = structure.getattr("_layout")?.call1((&cls,))?;
+        let layout = refs.get(py, "ldr.structure:_layout").call1((&cls,))?;
         let reader = layout.get_item(0)?;
         let namespaces = layout.get_item(1)?;
-        let types = py.import("types")?;
+        let types = refs.module(py, "types");
         for namespace in namespaces.try_iter()? {
             let namespace = namespace?;
             for hook in ["__getattr__", "__getattribute__"] {
@@ -225,7 +534,7 @@ fn object_fields(
                 let descriptor = namespace.call_method1("get", (member.get_item(1)?,))?;
                 if !descriptor
                     .get_type()
-                    .is(&types.getattr("MemberDescriptorType")?)
+                    .is(&refs.get(py, "types:MemberDescriptorType"))
                 {
                     plans.insert(marker, None);
                     return Ok(None);
@@ -303,8 +612,7 @@ fn object_fields(
     if plan.exception {
         fields.push((
             Some(PyString::new(py, "args").into_any().unbind()),
-            py.import("ldr.structure")?
-                .getattr("_BASE_EXC_ARGS")?
+            refs.get(py, "ldr.structure:_BASE_EXC_ARGS")
                 .call1((value,))?
                 .unbind(),
         ));
@@ -340,15 +648,19 @@ fn tagged(tag: &str, bytes: &[u8]) -> Vec<u8> {
     result.extend(bytes);
     result
 }
-fn leaf_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
+fn leaf_bytes(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    refs: &References,
+) -> PyResult<Option<Vec<u8>>> {
     let kind = value.get_type();
-    let types = py.import("types")?;
-    if kind.is(&py.get_type::<pyo3::types::PyType>())
-        || kind.is(&py.import("abc")?.getattr("ABCMeta")?)
-    {
-        return Ok(Some(tagged("C", &identity(py, value)?)));
+    let types = refs.module(py, "types");
+    if kind.is(&py.get_type::<pyo3::types::PyType>()) || kind.is(&refs.get(py, "abc:ABCMeta")) {
+        return Ok(Some(tagged("C", &identity(py, value, refs)?)));
     }
-    if kind.is(&types.getattr("FunctionType")?) || kind.is(&types.getattr("BuiltinFunctionType")?) {
+    if kind.is(&refs.get(py, "types:FunctionType"))
+        || kind.is(&refs.get(py, "types:BuiltinFunctionType"))
+    {
         let text = PyString::new(py, ".").call_method1(
             "join",
             ((
@@ -379,7 +691,7 @@ fn leaf_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u
     if value.is(&py.NotImplemented()) {
         return Ok(Some(b"X".to_vec()));
     }
-    if kind.is(&py.import("builtins")?.getattr("range")?) {
+    if kind.is(&refs.get(py, "builtins:range")) {
         let start = value.getattr("start")?.str()?.to_str()?.to_owned();
         let stop = value.getattr("stop")?.str()?.to_str()?.to_owned();
         let step = value.getattr("step")?.str()?.to_str()?.to_owned();
@@ -388,25 +700,24 @@ fn leaf_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u
             format!("{start},{stop},{step}").as_bytes(),
         )));
     }
-    let datetime = py.import("datetime")?;
+    let datetime = refs.module(py, "datetime");
     for name in ["datetime", "date", "time"] {
         if kind.is(&datetime.getattr(name)?) {
             if name != "date" {
                 let zone = value.getattr("tzinfo")?;
-                if !zone.is_none() && !zone.get_type().is(&datetime.getattr("timezone")?) {
+                if !zone.is_none() && !zone.get_type().is(&refs.get(py, "datetime:timezone")) {
                     return Ok(None);
                 }
             }
             let text: String = value.call_method0("isoformat")?.extract()?;
-            let label: String = py
-                .import("ldr.structure")?
-                .getattr("_TYPE_NAME")?
+            let label: String = refs
+                .get(py, "ldr.structure:_TYPE_NAME")
                 .call1((&kind,))?
                 .extract()?;
             return Ok(Some(tagged("M", format!("{label}{text}").as_bytes())));
         }
     }
-    if kind.is(&datetime.getattr("timedelta")?) {
+    if kind.is(&refs.get(py, "datetime:timedelta")) {
         let days: i64 = value.getattr("days")?.extract()?;
         let seconds: i64 = value.getattr("seconds")?.extract()?;
         let micros: i64 = value.getattr("microseconds")?.extract()?;
@@ -415,7 +726,7 @@ fn leaf_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u
             format!("td{days},{seconds},{micros}").as_bytes(),
         )));
     }
-    if kind.is(&py.import("decimal")?.getattr("Decimal")?) {
+    if kind.is(&refs.get(py, "decimal:Decimal")) {
         return Ok(Some(tagged("D", value.str()?.to_str()?.as_bytes())));
     }
     Ok(None)
@@ -423,6 +734,7 @@ fn leaf_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u
 
 #[pyfunction]
 fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<String> {
+    let mut refs = References::resolve(py)?;
     let hash = Hash::new().state;
     let mut stack = vec![Task::Node(value, hash.clone())];
     let mut active: HashMap<usize, usize> = walk.getattr("active")?.extract()?;
@@ -453,9 +765,9 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
     }
 
     let ceiling: Option<usize> = walk.getattr("budget")?.getattr("max_nodes")?.extract()?;
-    let fingerprint = py.import("ldr.fingerprint")?;
-    fingerprint.getattr("_current_caches")?.call0()?;
-    let secret = py.import("ldr.redact")?.getattr("is_secret_name")?;
+    let fingerprint = refs.module(py, "ldr.fingerprint");
+    refs.get(py, "ldr.fingerprint:_current_caches").call0()?;
+    let secret = refs.get(py, "ldr.redact:is_secret_name");
     let outcome: PyResult<()> = (|| {
         while let Some(task) = stack.pop() {
             match task {
@@ -467,9 +779,9 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                 Task::Fields(mut fields, out) => {
                     if let Some((name, value)) = fields.next() {
                         if let Some(name) = name {
-                            if secret.call1((name.bind(py),))?.is_truthy()? {
+                            if secret_name(py, name.bind(py), &refs, &mut plans)? {
                                 return Err(PyErr::from_value(
-                                    fingerprint.getattr("_Stop")?.call1(("redacted",))?,
+                                    refs.get(py, "ldr.fingerprint:_Stop").call1(("redacted",))?,
                                 ));
                             }
                             let data = name
@@ -492,6 +804,8 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                     to_python!();
                     let next = iterator.bind(py).try_iter()?.next();
                     from_python!();
+                    refs = References::resolve(py)?;
+                    refs.get(py, "ldr.fingerprint:_current_caches").call0()?;
                     if let Some(child) = next {
                         let child = child?;
                         let value = child.get_item(0)?.unbind();
@@ -537,9 +851,9 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         }
                         let key = unsafe { Bound::from_borrowed_ptr(py, key) };
                         let value = unsafe { Bound::from_borrowed_ptr(py, value) };
-                        if secret.call1((&key,))?.is_truthy()? {
+                        if secret_name(py, &key, &refs, &mut plans)? {
                             return Err(PyErr::from_value(
-                                fingerprint.getattr("_Stop")?.call1(("redacted",))?,
+                                refs.get(py, "ldr.fingerprint:_Stop").call1(("redacted",))?,
                             ));
                         }
                         stack.push(Task::DictItems(
@@ -599,13 +913,13 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         || kind.is(&py.get_type::<PyInt>())
                         || kind.is(&py.get_type::<PyFloat>());
                     if !(scalar || list || tuple || dict || set || frozen) {
-                        let method = kind.is(&py.import("types")?.getattr("MethodType")?);
-                        let partial = kind.is(&py.import("functools")?.getattr("partial")?);
+                        let method = kind.is(&refs.get(py, "types:MethodType"));
+                        let partial = kind.is(&refs.get(py, "functools:partial"));
                         if method || partial {
                             visited += 1;
                             if ceiling.is_some_and(|limit| visited > limit) {
                                 return Err(PyErr::from_value(
-                                    fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                    refs.get(py, "ldr.fingerprint:_Stop").call1(("unknown",))?,
                                 ));
                             }
                             immutable = false;
@@ -613,7 +927,10 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                 write(py, &out, b"Mt");
                                 let receiver = value.getattr("__self__")?;
                                 stack.push(Task::Raw(
-                                    tagged("T", &identity(py, receiver.get_type().as_any())?),
+                                    tagged(
+                                        "T",
+                                        &identity(py, receiver.get_type().as_any(), &refs)?,
+                                    ),
                                     out.clone(),
                                 ));
                                 stack.push(Task::Node(value.getattr("__func__")?.unbind(), out));
@@ -621,10 +938,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                 write(py, &out, b"Pa");
                                 let kwargs =
                                     value.getattr("keywords")?.downcast_into::<PyDict>()?;
-                                let keys = py
-                                    .import("builtins")?
-                                    .getattr("sorted")?
-                                    .call1((&kwargs,))?;
+                                let keys = refs.get(py, "builtins:sorted").call1((&kwargs,))?;
                                 let mut fields = Vec::new();
                                 for key in keys.try_iter()? {
                                     let key = key?;
@@ -645,11 +959,11 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             }
                             continue;
                         }
-                        if let Some(bytes) = leaf_bytes(py, value)? {
+                        if let Some(bytes) = leaf_bytes(py, value, &refs)? {
                             visited += 1;
                             if ceiling.is_some_and(|limit| visited > limit) {
                                 return Err(PyErr::from_value(
-                                    fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                    refs.get(py, "ldr.fingerprint:_Stop").call1(("unknown",))?,
                                 ));
                             }
                             if !kind.is(&py.get_type::<pyo3::types::PyComplex>()) {
@@ -659,32 +973,33 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             continue;
                         }
                         // Known leaves retain their distinct tags. Other safe layouts are read here.
-                        let types = py.import("types")?;
+                        let types = refs.module(py, "types");
                         let known = kind.is(&py.get_type::<pyo3::types::PyType>())
-                            || kind.is(&py.import("abc")?.getattr("ABCMeta")?)
-                            || kind.is(&types.getattr("FunctionType")?)
-                            || kind.is(&types.getattr("BuiltinFunctionType")?);
+                            || kind.is(&refs.get(py, "abc:ABCMeta"))
+                            || kind.is(&refs.get(py, "types:FunctionType"))
+                            || kind.is(&refs.get(py, "types:BuiltinFunctionType"));
                         let known = known
-                            || kind.is(&py.import("functools")?.getattr("partial")?)
-                            || kind.is(&types.getattr("MethodType")?)
-                            || kind.is(&py.import("decimal")?.getattr("Decimal")?)
+                            || kind.is(&refs.get(py, "functools:partial"))
+                            || kind.is(&refs.get(py, "types:MethodType"))
+                            || kind.is(&refs.get(py, "decimal:Decimal"))
                             || ["datetime", "date", "time", "timedelta"]
                                 .iter()
                                 .any(|name| {
-                                    kind.is(&py.import("datetime").unwrap().getattr(*name).unwrap())
+                                    kind.is(&refs.module(py, "datetime").getattr(*name).unwrap())
                                 })
                             || kind.is(&py.get_type::<pyo3::types::PyComplex>())
-                            || kind.is(&py.import("builtins")?.getattr("range")?)
+                            || kind.is(&refs.get(py, "builtins:range"))
                             || value.is(&py.Ellipsis())
                             || value.is(&py.NotImplemented());
                         if !known {
                             if let Ok(Some((identity, fields))) =
-                                object_fields(py, value, &mut plans)
+                                object_fields(py, value, &mut plans, &refs)
                             {
                                 visited += 1;
                                 if ceiling.is_some_and(|limit| visited > limit) {
                                     return Err(PyErr::from_value(
-                                        fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                        refs.get(py, "ldr.fingerprint:_Stop")
+                                            .call1(("unknown",))?,
                                     ));
                                 }
                                 immutable = false;
@@ -706,18 +1021,21 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                 continue;
                             }
                         }
-                        let count: usize = fingerprint
-                            .getattr("STATS")?
+                        let count: usize = refs
+                            .get(py, "ldr.fingerprint:STATS")
                             .getattr("python_nodes")?
                             .extract()?;
-                        fingerprint
-                            .getattr("STATS")?
+                        refs.get(py, "ldr.fingerprint:STATS")
                             .setattr("python_nodes", count + 1)?;
                         plans.clear();
                         to_python!();
                         let wrapped = Py::new(py, Hash { state: out.clone() })?;
                         let children = walk.call_method1("_encode", (value, wrapped));
                         from_python!();
+                        refs = References::resolve(py)?;
+                        refs.get(py, "ldr.fingerprint:_current_caches").call0()?;
+                        refs = References::resolve(py)?;
+                        refs.get(py, "ldr.fingerprint:_current_caches").call0()?;
                         let children = children?;
                         if !children.is_none() {
                             stack.push(Task::Children(children.unbind()));
@@ -727,12 +1045,12 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                     visited += 1;
                     if ceiling.is_some_and(|limit| visited > limit) {
                         return Err(PyErr::from_value(
-                            fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                            refs.get(py, "ldr.fingerprint:_Stop").call1(("unknown",))?,
                         ));
                     }
                     if bytes {
                         let decoded = value.call_method1("decode", ("latin-1",))?;
-                        secret_text(py, &decoded, &fingerprint)?;
+                        secret_text(py, &decoded, &fingerprint, &refs)?;
                         let data = py.get_type::<PyBytes>().call1((value,))?;
                         let data = data.downcast::<PyBytes>()?.as_bytes();
                         let mutable = kind.is(&py.get_type::<PyByteArray>());
@@ -747,15 +1065,14 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         );
                         write(py, &out, data);
                     } else if text {
-                        write(py, &out, &text_bytes(py, value, &fingerprint)?);
+                        write(py, &out, &text_bytes(py, value, &fingerprint, &refs)?);
                     } else if value.is_none() {
                         write(py, &out, b"N");
                     } else if kind.is(&py.get_type::<PyBool>()) {
                         write(py, &out, if value.is_truthy()? { b"T" } else { b"F" });
                     } else if kind.is(&py.get_type::<PyInt>()) {
-                        let hex = py
-                            .import("builtins")?
-                            .getattr("format")?
+                        let hex = refs
+                            .get(py, "builtins:format")
                             .call1((value, "x"))?
                             .extract::<String>()?;
                         write(py, &out, format!("i{hex};").as_bytes());
@@ -777,7 +1094,9 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         // Keep that exact ordering, including normalization counters.
                         if (list || tuple)
                             && value.len()?
-                                >= fingerprint.getattr("FAST_PATH_MIN")?.extract::<usize>()?
+                                >= refs
+                                    .get(py, "ldr.fingerprint:FAST_PATH_MIN")
+                                    .extract::<usize>()?
                         {
                             let strings = value.try_iter()?.all(|item| {
                                 item.map(|v| v.get_type().is(&py.get_type::<PyString>()))
@@ -792,12 +1111,13 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                 );
                                 let mut body = Vec::new();
                                 for item in value.try_iter()? {
-                                    body.extend(text_bytes(py, &item?, &fingerprint)?);
+                                    body.extend(text_bytes(py, &item?, &fingerprint, &refs)?);
                                 }
                                 visited += value.len()?;
                                 if ceiling.is_some_and(|limit| visited > limit) {
                                     return Err(PyErr::from_value(
-                                        fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                        refs.get(py, "ldr.fingerprint:_Stop")
+                                            .call1(("unknown",))?,
                                     ));
                                 }
                                 write(py, &out, &body);
