@@ -8,7 +8,18 @@ import pytest
 
 from ldr import fingerprint as fp
 
-native = pytest.importorskip("ldr._native")
+try:
+    from ldr import _native as native
+except ModuleNotFoundError as error:
+    if error.name != "ldr._native":
+        raise
+    pytest.skip("native module not built", allow_module_level=True)
+except ImportError:
+    # A missing extension is optional. An existing extension that fails to load is a failure.
+    import importlib.util
+    if importlib.util.find_spec("ldr._native") is not None:
+        raise
+    pytest.skip("native module not built", allow_module_level=True)
 
 
 class Base:
@@ -33,7 +44,7 @@ def result(value, native_reader, budget=fp.DEFAULT_BUDGET, partial=False):
             out = hashlib.blake2b(digest_size=16)
             walk.encode(value, out)
             digest = out.hexdigest()
-        return digest, walk.partial, walk.immutable
+        return bytes.fromhex(digest), walk.partial, walk.immutable
     except fp._Stop as stop:
         return stop.status
 
@@ -88,3 +99,91 @@ def test_layout_changes_and_descriptors():
     Layout.x = Descriptor()
     value.b = 2
     assert result(value, True) == result(value, False)
+
+
+def generated_value(rng, depth):
+    if depth == 0:
+        return rng.choice([None, False, True, rng.randrange(-2**100, 2**100),
+                           rng.random(), "texté", "\ud800", b"bytes"])
+    children = [generated_value(rng, depth - 1) for _ in range(rng.randrange(6))]
+    kind = rng.randrange(6)
+    if kind == 0:
+        return children
+    if kind == 1:
+        return tuple(children)
+    if kind == 2:
+        return {str(index): value for index, value in enumerate(children)}
+    if kind == 3:
+        return set(rng.sample(range(100), rng.randrange(12)))
+    if kind == 4:
+        value = Slots()
+        value.extra = children
+        return value
+    value = [children]
+    value.append(value)
+    return value
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_generated_values_have_identical_bytes(seed):
+    rng = random.Random(seed)
+    value = generated_value(rng, 4)
+    for budget in (fp.DEFAULT_BUDGET, fp.Budget(20_000), fp.Budget(20)):
+        for partial in (False, True):
+            assert result(value, True, budget, partial) == result(value, False, budget, partial)
+
+
+@pytest.mark.parametrize("length", [20_000, 20_001, 100_000])
+def test_large_generated_values_have_identical_bytes(length):
+    value = list(range(length))
+    assert result(value, True) == result(value, False)
+    assert result(value, True, fp.Budget(20_000)) == result(value, False, fp.Budget(20_000))
+
+
+def test_existing_fingerprint_values(tmp_path):
+    import os
+    import sys
+    from pathlib import Path
+    from ldr import processes
+
+    root = Path(__file__).resolve().parents[1]
+    probe = root / "tests" / "native_probe"
+    # sitecustomize is inherited by the existing tests' CLI and seed probes too.
+    failures = tmp_path / "parity-failures.txt"
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(probe), str(root))),
+               LDR_NATIVE_TEST_FAILURES=str(failures))
+    completed = processes.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/test_fingerprint.py",
+         "tests/test_fingerprint_rule5.py", "tests/test_per_call_fingerprints.py"],
+        cwd=root, env=env, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not failures.exists(), failures.read_text()
+
+
+@pytest.mark.parametrize("kind", ["ThemeStack", "Segment", "Style", "Text", "Console"])
+def test_real_rich_objects_have_identical_bytes(kind):
+    from rich.console import Console
+    from rich.segment import Segment
+    from rich.style import Style
+    from rich.text import Text
+    from rich.theme import Theme, ThemeStack
+
+    style = Style(color="red", bold=True, link="https://example.com")
+    values = {
+        "ThemeStack": ThemeStack(Theme({"test": style})),
+        "Segment": Segment("évidence", style),
+        "Style": style,
+        "Text": Text("évidence", style=style),
+        "Console": Console(width=80, force_terminal=True),
+    }
+    value = values[kind]
+    for partial in (False, True):
+        assert result(value, True, partial=partial) == result(value, False, partial=partial)
+
+
+def test_native_bulk_path_respects_python_threshold(monkeypatch):
+    monkeypatch.setattr(fp, "FAST_PATH_MIN", 4)
+    value = ["plain"] * 9 + ["ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"]
+    budget = fp.Budget(2)
+    assert result(value, True, budget) == result(value, False, budget)
