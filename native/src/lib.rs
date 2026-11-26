@@ -233,6 +233,15 @@ impl References {
                 .values
                 .insert(key, result.module(py, "ldr.redact").getattr(name)?.unbind());
         }
+        for (key, name) in [
+            ("datetime:datetime", "datetime"),
+            ("datetime:date", "date"),
+            ("datetime:time", "time"),
+        ] {
+            result
+                .values
+                .insert(key, result.module(py, "datetime").getattr(name)?.unbind());
+        }
         let saved =
             REFERENCE_VALUES.get_or_try_init(py, || Ok::<_, PyErr>(PyDict::new(py).unbind()))?;
         let saved = saved.bind(py);
@@ -302,6 +311,12 @@ impl Hash {
     }
 }
 
+#[derive(Default)]
+struct Workspace {
+    stack: Vec<Task>,
+    buffer: Vec<u8>,
+}
+
 enum Task {
     Node(Py<PyAny>, Digest),
     Children(Py<PyAny>),
@@ -354,13 +369,7 @@ fn secret_name(
     Ok(found)
 }
 
-fn secret_text(
-    py: Python<'_>,
-    value: &Bound<'_, PyAny>,
-    fingerprint: &Bound<'_, PyModule>,
-    refs: &References,
-) -> PyResult<()> {
-    let redact = refs.module(py, "ldr.redact");
+fn secret_text(py: Python<'_>, value: &Bound<'_, PyAny>, refs: &References) -> PyResult<()> {
     let cache = refs
         .get(py, "ldr.fingerprint:_secret_cache")
         .downcast_into::<PyDict>()?;
@@ -438,13 +447,8 @@ fn secret_text(
     }
     Ok(())
 }
-fn text_bytes(
-    py: Python<'_>,
-    value: &Bound<'_, PyAny>,
-    fingerprint: &Bound<'_, PyModule>,
-    refs: &References,
-) -> PyResult<Vec<u8>> {
-    secret_text(py, value, fingerprint, refs)?;
+fn text_bytes(py: Python<'_>, value: &Bound<'_, PyAny>, refs: &References) -> PyResult<Vec<u8>> {
+    secret_text(py, value, refs)?;
     let regex = refs.get(py, "ldr.fingerprint:_TMP_RE");
     let normalized = if regex.is_none() {
         value.clone()
@@ -467,7 +471,6 @@ fn text_bytes(
 }
 
 fn identity(py: Python<'_>, cls: &Bound<'_, PyAny>, refs: &References) -> PyResult<Vec<u8>> {
-    let structure = refs.module(py, "ldr.structure");
     let module = refs.get(py, "ldr.structure:_TYPE_MODULE").call1((cls,))?;
     let name = refs.get(py, "ldr.structure:_TYPE_QUALNAME").call1((cls,))?;
     let module = if module.is_exact_instance_of::<PyString>() {
@@ -505,12 +508,11 @@ fn object_fields(
     let cls = value.get_type();
     let marker = cls.as_ptr() as usize;
     if !plans.contains_key(&marker) {
-        let structure = refs.module(py, "ldr.structure");
         // The existing weak per-class reader performs full mutation validation.
         let layout = refs.get(py, "ldr.structure:_layout").call1((&cls,))?;
         let reader = layout.get_item(0)?;
         let namespaces = layout.get_item(1)?;
-        let types = refs.module(py, "types");
+
         for namespace in namespaces.try_iter()? {
             let namespace = namespace?;
             for hook in ["__getattr__", "__getattribute__"] {
@@ -654,7 +656,7 @@ fn leaf_bytes(
     refs: &References,
 ) -> PyResult<Option<Vec<u8>>> {
     let kind = value.get_type();
-    let types = refs.module(py, "types");
+
     if kind.is(&py.get_type::<pyo3::types::PyType>()) || kind.is(&refs.get(py, "abc:ABCMeta")) {
         return Ok(Some(tagged("C", &identity(py, value, refs)?)));
     }
@@ -700,9 +702,12 @@ fn leaf_bytes(
             format!("{start},{stop},{step}").as_bytes(),
         )));
     }
-    let datetime = refs.module(py, "datetime");
-    for name in ["datetime", "date", "time"] {
-        if kind.is(&datetime.getattr(name)?) {
+    for (name, key) in [
+        ("datetime", "datetime:datetime"),
+        ("date", "datetime:date"),
+        ("time", "datetime:time"),
+    ] {
+        if kind.is(&refs.get(py, key)) {
             if name != "date" {
                 let zone = value.getattr("tzinfo")?;
                 if !zone.is_none() && !zone.get_type().is(&refs.get(py, "datetime:timezone")) {
@@ -734,9 +739,20 @@ fn leaf_bytes(
 
 #[pyfunction]
 fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<String> {
+    encode_with_workspace(py, walk, value, &mut Workspace::default())
+}
+fn encode_with_workspace(
+    py: Python<'_>,
+    walk: Bound<'_, PyAny>,
+    value: Py<PyAny>,
+    workspace: &mut Workspace,
+) -> PyResult<String> {
     let mut refs = References::resolve(py)?;
     let hash = Hash::new().state;
-    let mut stack = vec![Task::Node(value, hash.clone())];
+    workspace.stack.clear();
+    workspace.stack.push(Task::Node(value, hash.clone()));
+    let stack = &mut workspace.stack;
+    let buffer = &mut workspace.buffer;
     let mut active: HashMap<usize, usize> = walk.getattr("active")?.extract()?;
     let initial_active = active.clone();
     let mut plans = HashMap::new();
@@ -765,9 +781,8 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
     }
 
     let ceiling: Option<usize> = walk.getattr("budget")?.getattr("max_nodes")?.extract()?;
-    let fingerprint = refs.module(py, "ldr.fingerprint");
+
     refs.get(py, "ldr.fingerprint:_current_caches").call0()?;
-    let secret = refs.get(py, "ldr.redact:is_secret_name");
     let outcome: PyResult<()> = (|| {
         while let Some(task) = stack.pop() {
             match task {
@@ -970,7 +985,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             continue;
                         }
                         // Known leaves retain their distinct tags. Other safe layouts are read here.
-                        let types = refs.module(py, "types");
+
                         let known = kind.is(&py.get_type::<pyo3::types::PyType>())
                             || kind.is(&refs.get(py, "abc:ABCMeta"))
                             || kind.is(&refs.get(py, "types:FunctionType"))
@@ -979,11 +994,14 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             || kind.is(&refs.get(py, "functools:partial"))
                             || kind.is(&refs.get(py, "types:MethodType"))
                             || kind.is(&refs.get(py, "decimal:Decimal"))
-                            || ["datetime", "date", "time", "timedelta"]
-                                .iter()
-                                .any(|name| {
-                                    kind.is(&refs.module(py, "datetime").getattr(*name).unwrap())
-                                })
+                            || [
+                                "datetime:datetime",
+                                "datetime:date",
+                                "datetime:time",
+                                "datetime:timedelta",
+                            ]
+                            .iter()
+                            .any(|name| kind.is(&refs.get(py, name)))
                             || kind.is(&py.get_type::<pyo3::types::PyComplex>())
                             || kind.is(&refs.get(py, "builtins:range"))
                             || value.is(&py.Ellipsis())
@@ -1031,8 +1049,6 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         from_python!();
                         refs = References::resolve(py)?;
                         refs.get(py, "ldr.fingerprint:_current_caches").call0()?;
-                        refs = References::resolve(py)?;
-                        refs.get(py, "ldr.fingerprint:_current_caches").call0()?;
                         let children = children?;
                         if !children.is_none() {
                             stack.push(Task::Children(children.unbind()));
@@ -1047,7 +1063,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                     }
                     if bytes {
                         let decoded = value.call_method1("decode", ("latin-1",))?;
-                        secret_text(py, &decoded, &fingerprint, &refs)?;
+                        secret_text(py, &decoded, &refs)?;
                         let data = py.get_type::<PyBytes>().call1((value,))?;
                         let data = data.downcast::<PyBytes>()?.as_bytes();
                         let mutable = kind.is(&py.get_type::<PyByteArray>());
@@ -1062,20 +1078,25 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         );
                         write(py, &out, data);
                     } else if text {
-                        write(py, &out, &text_bytes(py, value, &fingerprint, &refs)?);
+                        write(py, &out, &text_bytes(py, value, &refs)?);
                     } else if value.is_none() {
                         write(py, &out, b"N");
                     } else if kind.is(&py.get_type::<PyBool>()) {
                         write(py, &out, if value.is_truthy()? { b"T" } else { b"F" });
                     } else if kind.is(&py.get_type::<PyInt>()) {
-                        let hex = refs
-                            .get(py, "builtins:format")
-                            .call1((value, "x"))?
-                            .extract::<String>()?;
-                        write(py, &out, format!("i{hex};").as_bytes());
+                        let hex = refs.get(py, "builtins:format").call1((value, "x"))?;
+                        buffer.clear();
+                        buffer.push(b'i');
+                        buffer.extend(hex.downcast::<PyString>()?.to_str()?.as_bytes());
+                        buffer.push(b';');
+                        write(py, &out, buffer);
                     } else if kind.is(&py.get_type::<PyFloat>()) {
-                        let hex: String = value.call_method0("hex")?.extract()?;
-                        write(py, &out, format!("f{hex};").as_bytes());
+                        let hex = value.call_method0("hex")?;
+                        buffer.clear();
+                        buffer.push(b'f');
+                        buffer.extend(hex.downcast::<PyString>()?.to_str()?.as_bytes());
+                        buffer.push(b';');
+                        write(py, &out, buffer);
                     } else {
                         if list || dict || set {
                             immutable = false;
@@ -1116,11 +1137,12 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                     format!("{}{}[", if list { "l" } else { "t" }, value.len()?)
                                         .as_bytes(),
                                 );
-                                let mut body = Vec::new();
+                                buffer.clear();
+                                let body = &mut *buffer;
                                 for index in 0..value.len()? {
                                     let item = value.get_item(index)?;
                                     if item_type.is(&py.get_type::<PyString>()) {
-                                        body.extend(text_bytes(py, &item, &fingerprint, &refs)?);
+                                        body.extend(text_bytes(py, &item, &refs)?);
                                     } else if item_type.is(&py.get_type::<PyBool>()) {
                                         body.extend(if item.is_truthy()? { b"T" } else { b"F" });
                                     } else if item_type.is(&py.get_type::<PyFloat>()) {
@@ -1141,7 +1163,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                             .call1(("unknown",))?,
                                     ));
                                 }
-                                write(py, &out, &body);
+                                write(py, &out, body);
                                 continue;
                             }
                         }
@@ -1180,6 +1202,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
         }
         Ok(())
     })();
+    stack.clear();
     if outcome.is_err() {
         active = initial_active;
     }
@@ -1191,6 +1214,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
 
 #[pyfunction]
 fn capture(py: Python<'_>, generator: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let mut workspace = Workspace::default();
     let mut sent = py.None();
     let mut error: Option<PyErr> = None;
     loop {
@@ -1207,7 +1231,7 @@ fn capture(py: Python<'_>, generator: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         };
         let walk = item.get_item(0)?;
         let value = item.get_item(1)?.unbind();
-        match encode(py, walk, value) {
+        match encode_with_workspace(py, walk, value, &mut workspace) {
             Ok(digest) => sent = PyString::new(py, &digest).into_any().unbind(),
             Err(failure) => error = Some(failure),
         }

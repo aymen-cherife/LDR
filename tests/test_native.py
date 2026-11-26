@@ -323,3 +323,11 @@ def test_numeric_bulk_budget_preserves_python_node_accounting():
     with pytest.raises(fp._Stop):
         native.encode(actual, value)
     assert actual.visited == expected.visited
+
+
+def test_native_capture_has_reusable_traversal_workspace():
+    from pathlib import Path
+    source = (Path(__file__).parents[1] / 'native/src/lib.rs').read_text()
+    capture = source[source.index('fn capture('):source.index('#[pymodule]')]
+    assert 'Workspace::default()' in capture
+    assert 'encode_with_workspace' in capture
