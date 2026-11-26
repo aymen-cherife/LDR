@@ -19,7 +19,6 @@ from time import perf_counter_ns
 from contextlib import nullcontext
 
 from .fingerprint import REDACTED, STATS, fingerprint, fingerprint_details, lifted as fingerprint_lifted
-from . import fingerprint as fingerprint_module
 from .node import Node, capture, capture_error, capture_state, is_secret_name, redact_source_line
 from .redact import redact, same_text_policy, text_policy
 from .structure import type_label
@@ -262,14 +261,7 @@ class Recorder:
             if name in frame.f_locals and name not in ("self", "cls")
         }
 
-    def _argument_fingerprints(self, code, frame, *, entering=False):
-        if fingerprint_module._native is None:
-            return self._argument_fingerprints_python(code, frame, entering=entering)
-        return fingerprint_module._native.capture(
-            self._argument_fingerprints_native(code, frame, entering=entering)
-        )
-
-    def _argument_fingerprints_python(self, code, frame, *, entering=False) -> dict[str, str]:
+    def _argument_fingerprints(self, code, frame, *, entering=False) -> dict[str, str]:
         """Fingerprint each argument, reusing proven stable entry digests at exit."""
         walked = STATS.nodes
         result: dict[str, str] = {}
@@ -321,68 +313,6 @@ class Recorder:
             else:
                 mark = STATS.walks
                 result[name] = fp_value(value, name)
-                if STATS.walks != mark:
-                    self._note_walk(frame, "entry" if entering else "exit", name)
-        if reusable and same_text_policy(policy):
-            self._immutable_inputs[id(frame)] = (policy, reusable)
-        self._charge(code, walked)
-        return result
-
-    def _argument_fingerprints_native(self, code, frame, *, entering=False) -> dict[str, str]:
-        """Fingerprint each argument, reusing proven stable entry digests at exit."""
-        walked = STATS.nodes
-        result: dict[str, str] = {}
-        locals_ = frame.f_locals
-        remember = entering and self.call_stream is not None
-        policy = text_policy() if remember else None
-        reusable = {}
-        saved = self._immutable_inputs.pop(id(frame), None)
-        saved_policy, saved_values = saved if saved is not None else (None, {})
-        # A receiver that is the same object as the calling call's receiver is read by
-        # that call (at its entry and exit), not again here. The first parameter only.
-        receiver = code.co_varnames[0] if code.co_argcount and code.co_varnames[0] in _RECEIVERS else None
-        skipped = None
-        if remember:
-            held = locals_.get(receiver) if receiver is not None else None
-            skipped = receiver is not None and held is not None and held is self._caller_receiver(frame)
-            self._receivers[id(frame)] = (frame, held, skipped)
-            if skipped:
-                self.call_stream.receivers_shared += 1
-        else:
-            # Every call is registered at entry, so every call is released here.
-            known = self._receivers.pop(id(frame), None)
-            skipped = known is not None and known[0] is frame and known[2]
-        for name in self._argument_names(code):
-            if name not in locals_:
-                continue
-            if skipped and name == receiver:
-                continue
-            value = locals_[name]
-            previous = saved_values.get(name)
-            if (
-                previous is not None
-                and value is previous[0]
-                and same_text_policy(saved_policy)
-            ):
-                result[name] = previous[1]
-            elif remember:
-                if is_secret_name(name):
-                    result[name] = REDACTED
-                    continue
-                mark = STATS.walks
-                token, immutable = yield from fingerprint_module._capture_details(value, partial_ok=name in _RECEIVERS)
-                if STATS.walks != mark:
-                    self._note_walk(frame, "entry", name)
-                if immutable:
-                    # Keep the original object alive for the identity check at exit.
-                    reusable[name] = (value, token)
-                result[name] = token
-            else:
-                mark = STATS.walks
-                if is_secret_name(name):
-                    result[name] = REDACTED
-                else:
-                    result[name], _ = yield from fingerprint_module._capture_details(value, partial_ok=name in _RECEIVERS)
                 if STATS.walks != mark:
                     self._note_walk(frame, "entry" if entering else "exit", name)
         if reusable and same_text_policy(policy):
@@ -844,13 +774,6 @@ class Recorder:
         return None
 
     def _close(self, code, frame, timing, *, error=None, return_value=None):
-        if fingerprint_module._native is None:
-            return self._close_python(code, frame, timing, error=error, return_value=return_value)
-        return fingerprint_module._native.capture(
-            self._close_native(code, frame, timing, error=error, return_value=return_value)
-        )
-
-    def _close_python(self, code, frame, timing, *, error=None, return_value=None):
         matched = self._matching_stack(frame)
         if matched is None:
             self._size_rows.pop(id(frame), None)
@@ -890,97 +813,6 @@ class Recorder:
         if self.call_stream is not None:
             with self._no_ceiling(code):
                 exit_fps = self._argument_fingerprints(code, frame)
-            self._send_sizes(frame, frame_id)
-            self.call_stream.close(
-                frame,
-                frame_id,
-                exit_fps,
-                out_fp,
-                error,
-                out,
-                timing,
-                return_value,
-                shape_of(return_value) if error is None else None,
-                changes,
-            )
-
-        if isinstance(entry, _Shadow):
-            del self._addresses[entry.address]
-            if error is None:
-                for child in entry.children:
-                    _mark_handled(child)
-                    if entry.preserve_children:
-                        self._attach(child, parent_stack)
-                return
-            try:
-                arguments = self._arguments(code, frame)
-            except Exception:
-                arguments = {}
-            source_id, module, line, file, callsite = self._metadata(code, frame)
-            promoted = Node(
-                name=code.co_qualname,
-                in_=arguments,
-                error=error,
-                module=module,
-                file=file,
-                source_id=source_id,
-                line=line,
-                callsite=callsite,
-                children=entry.children,
-                frame_id=frame_id,
-            )
-            self._set_node_timing(promoted, timing)
-            self._attach(promoted, parent_stack)
-            return
-
-        self._set_node_timing(entry, timing)
-        entry.out = out
-        entry.out_fp = out_fp
-        entry.error = error
-        if error is None:
-            for child in entry.children:
-                _mark_handled(child)
-
-    def _close_native(self, code, frame, timing, *, error=None, return_value=None):
-        matched = self._matching_stack(frame)
-        if matched is None:
-            self._size_rows.pop(id(frame), None)
-            self._immutable_inputs.pop(id(frame), None)
-            self._receivers.pop(id(frame), None)
-            self._mutable_evidence.pop(id(frame), None)
-            return
-        parent_stack, entry = matched
-        node_retained = isinstance(entry, Node)
-        frame_id = entry.frame_id if node_retained else self._addresses[entry.address]
-        stream = self.call_stream
-        out = out_fp = None
-        if error is None:
-            if node_retained or (stream is not None and stream.detail_for(frame)):
-                out = capture(return_value)
-            if node_retained or stream is not None:
-                walked = STATS.nodes
-                mark = STATS.walks
-                with self._no_ceiling(code):
-                    out_fp, _ = yield from fingerprint_module._capture_details(return_value)
-                if STATS.walks != mark:
-                    self._note_walk(frame, "exit", None)
-                self._charge(code, walked)
-        if isinstance(entry, Node) and self._focus_matches(
-            entry.frame_id, self._entry_segment(entry)
-        ):
-            self._capture_state_transition(code, frame, None)
-        if isinstance(entry, Node):
-            self._finish_mutable_argument_evidence(entry, frame)
-        self.suspended.pop(self._entry_fid(entry), None)
-        _stack.set(parent_stack)
-        changes = None
-        if self._mutable_evidence and not isinstance(entry, Node):
-            saved = self._mutable_evidence.pop(id(frame), None)
-            if saved:
-                changes = self._changed_arguments(saved, frame)
-        if self.call_stream is not None:
-            with self._no_ceiling(code):
-                exit_fps = yield from self._argument_fingerprints_native(code, frame)
             self._send_sizes(frame, frame_id)
             self.call_stream.close(
                 frame,

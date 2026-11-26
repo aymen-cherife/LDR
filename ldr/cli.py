@@ -1484,10 +1484,6 @@ def main(argv=None) -> int:
                         for key in ("started", "stored", "unfinished", "write_failed")
                     },
                 }
-            status["native_reader"] = {"python_nodes": sum(
-                (summary.get("fingerprint") or {}).get("python_nodes", 0)
-                for summary in stream_summaries
-            )}
             store.finish(status)
             # The slowdown and the hot functions are for LDR's developers: they stay in the
             # stored run and are not part of what the agent is shown.
