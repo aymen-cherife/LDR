@@ -312,3 +312,14 @@ def test_policy_replacement_during_fallback_refreshes_native_text_cache():
         assert fp.fingerprint([datetime.datetime(2026, 1, 1, tzinfo=Zone()), secret]) == fp.REDACTED
     finally:
         redact.load_environment()
+
+
+def test_numeric_bulk_budget_preserves_python_node_accounting():
+    value = list(range(100))
+    expected = fp._Walk(fp.Budget(5))
+    with pytest.raises(fp._Stop):
+        expected.encode(value, hashlib.blake2b(digest_size=16))
+    actual = fp._Walk(fp.Budget(5))
+    with pytest.raises(fp._Stop):
+        native.encode(actual, value)
+    assert actual.visited == expected.visited

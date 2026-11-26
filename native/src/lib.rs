@@ -1093,16 +1093,26 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         // Python's string bulk path checks redaction before its budget check.
                         // Keep that exact ordering, including normalization counters.
                         if (list || tuple)
+                            && value.len()? > 0
                             && value.len()?
                                 >= refs
                                     .get(py, "ldr.fingerprint:FAST_PATH_MIN")
                                     .extract::<usize>()?
                         {
-                            let strings = value.try_iter()?.all(|item| {
-                                item.map(|v| v.get_type().is(&py.get_type::<PyString>()))
-                                    .unwrap_or(false)
-                            });
-                            if strings {
+                            let first = value.get_item(0)?;
+                            let item_type = first.get_type();
+                            let eligible = item_type.is(&py.get_type::<PyString>())
+                                || item_type.is(&py.get_type::<PyInt>())
+                                || item_type.is(&py.get_type::<PyFloat>())
+                                || item_type.is(&py.get_type::<PyBool>());
+                            let mut homogeneous = eligible;
+                            for index in 0..value.len()? {
+                                if !value.get_item(index)?.get_type().is(&item_type) {
+                                    homogeneous = false;
+                                    break;
+                                }
+                            }
+                            if homogeneous {
                                 write(
                                     py,
                                     &out,
@@ -1110,8 +1120,22 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                         .as_bytes(),
                                 );
                                 let mut body = Vec::new();
-                                for item in value.try_iter()? {
-                                    body.extend(text_bytes(py, &item?, &fingerprint, &refs)?);
+                                for index in 0..value.len()? {
+                                    let item = value.get_item(index)?;
+                                    if item_type.is(&py.get_type::<PyString>()) {
+                                        body.extend(text_bytes(py, &item, &fingerprint, &refs)?);
+                                    } else if item_type.is(&py.get_type::<PyBool>()) {
+                                        body.extend(if item.is_truthy()? { b"T" } else { b"F" });
+                                    } else if item_type.is(&py.get_type::<PyFloat>()) {
+                                        let hex: String = item.call_method0("hex")?.extract()?;
+                                        body.extend(format!("f{hex};").as_bytes());
+                                    } else {
+                                        let hex: String = refs
+                                            .get(py, "builtins:format")
+                                            .call1((&item, "x"))?
+                                            .extract()?;
+                                        body.extend(format!("i{hex};").as_bytes());
+                                    }
                                 }
                                 visited += value.len()?;
                                 if ceiling.is_some_and(|limit| visited > limit) {
