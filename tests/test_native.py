@@ -187,3 +187,9 @@ def test_native_bulk_path_respects_python_threshold(monkeypatch):
     value = ["plain"] * 9 + ["ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"]
     budget = fp.Budget(2)
     assert result(value, True, budget) == result(value, False, budget)
+
+@pytest.mark.parametrize('value', ['plain', 'é\ud800', b'bytes', bytearray(b'bytes'), ['plain'] * 40])
+def test_text_is_native(value):
+    before = fp.STATS.python_nodes
+    assert result(value, True) == result(value, False)
+    assert fp.STATS.python_nodes == before
