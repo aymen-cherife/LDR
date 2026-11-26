@@ -283,3 +283,17 @@ def test_direct_container_paths_do_not_construct_python_iterators():
     source = (Path(__file__).parents[1] / 'native/src/lib.rs').read_text()
     items = source[source.index('Task::Items('):source.index('Task::SetItems(', source.index('Task::Items('))]
     assert '.try_iter()' not in items
+
+
+def test_layout_validation_is_reused_within_native_walk(monkeypatch):
+    from ldr import structure
+    original = structure._layout
+    calls = []
+    def layout(cls):
+        calls.append(cls)
+        return original(cls)
+    monkeypatch.setattr(structure, '_layout', layout)
+    value = [Slots() for _ in range(100)]
+    assert result(value, True) == result(value, False)
+    # The Python reference itself validates once per object.
+    assert len(calls) == 101

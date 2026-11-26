@@ -179,162 +179,160 @@ fn identity(py: Python<'_>, cls: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         .as_bytes()
         .to_vec())
 }
+struct ObjectPlan {
+    identity: Vec<u8>,
+    base: Option<Py<PyAny>>,
+    named: Option<Py<PyAny>>,
+    exception: bool,
+    members: Vec<(Py<PyAny>, Py<PyAny>)>,
+    dictionary: Option<Py<PyAny>>,
+    has_state: bool,
+}
 fn object_fields(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
+    plans: &mut HashMap<usize, Option<ObjectPlan>>,
 ) -> PyResult<Option<(Vec<u8>, Vec<(Option<Py<PyAny>>, Py<PyAny>)>)>> {
-    let structure = py.import("ldr.structure")?;
     let cls = value.get_type();
-    let mro = structure.getattr("_TYPE_MRO")?.call1((&cls,))?;
-    let types = py.import("types")?;
-    let member_type = types.getattr("MemberDescriptorType")?;
-    let getset_type = types.getattr("GetSetDescriptorType")?;
-    let mut exception = false;
-    let mut namespaces = Vec::new();
-    let mut dictionary = None;
-    let mut base = None;
-    let mut named = None;
-    let mut has_state = mro.len()? == 1;
-    for owner in mro.try_iter()? {
-        let owner = owner?;
-        if owner.is(&py.get_type::<pyo3::exceptions::PyBaseException>()) {
-            exception = true;
-        }
-        let namespace = structure.getattr("_TYPE_DICT")?.call1((&owner,))?;
-        for hook in ["__getattr__", "__getattribute__"] {
-            let descriptor = namespace.call_method1("get", (hook,))?;
-            if descriptor.is_instance_of::<pyo3::types::PyFunction>() {
-                return Ok(None);
+    let marker = cls.as_ptr() as usize;
+    if !plans.contains_key(&marker) {
+        let structure = py.import("ldr.structure")?;
+        // The existing weak per-class reader performs full mutation validation.
+        let layout = structure.getattr("_layout")?.call1((&cls,))?;
+        let reader = layout.get_item(0)?;
+        let namespaces = layout.get_item(1)?;
+        let types = py.import("types")?;
+        for namespace in namespaces.try_iter()? {
+            let namespace = namespace?;
+            for hook in ["__getattr__", "__getattribute__"] {
+                if namespace
+                    .call_method1("get", (hook,))?
+                    .is_instance_of::<pyo3::types::PyFunction>()
+                {
+                    plans.insert(marker, None);
+                    return Ok(None);
+                }
             }
         }
-        for candidate in [
-            py.get_type::<PyList>().into_any(),
-            py.get_type::<PyTuple>().into_any(),
-            py.get_type::<PyDict>().into_any(),
-            py.get_type::<PySet>().into_any(),
-            py.get_type::<PyFrozenSet>().into_any(),
-        ] {
-            if owner.is(&candidate) {
-                base = Some(candidate);
+        let owners = reader.getattr("owners")?;
+        let mut members = Vec::new();
+        for index in (0..owners.len()?).rev() {
+            let owner = owners.get_item(index)?;
+            let namespace = namespaces.get_item(index)?;
+            for member in owner.getattr("members")?.try_iter()? {
+                let member = member?;
+                let name = member.get_item(0)?;
+                let descriptor = namespace.call_method1("get", (member.get_item(1)?,))?;
+                if !descriptor
+                    .get_type()
+                    .is(&types.getattr("MemberDescriptorType")?)
+                {
+                    plans.insert(marker, None);
+                    return Ok(None);
+                }
+                members.push((name.unbind(), descriptor.unbind()));
             }
         }
-        let fields = namespace.call_method1("get", ("_fields",))?;
-        if named.is_none()
-            && fields.is_exact_instance_of::<PyTuple>()
-            && fields.try_iter()?.all(|v| {
-                v.map(|v| v.is_exact_instance_of::<PyString>())
-                    .unwrap_or(false)
-            })
-        {
-            named = Some(fields);
-        }
-        let descriptor = namespace.call_method1("get", ("__dict__",))?;
-        if dictionary.is_none() && descriptor.get_type().is(&getset_type) {
-            dictionary = Some(descriptor);
-            has_state = true;
-        }
-        if namespace.contains("__slots__")? {
-            has_state = true;
-        }
-        namespaces.push((owner, namespace));
+        let dictionary = reader.getattr("dictionary")?;
+        let dictionary = if dictionary.is_none() {
+            None
+        } else {
+            Some(
+                namespaces
+                    .get_item(dictionary.extract::<usize>()?)?
+                    .get_item("__dict__")?
+                    .unbind(),
+            )
+        };
+        let base = reader.getattr("base")?;
+        let named = reader.getattr("named_fields")?;
+        let identity = reader
+            .getattr("identity")?
+            .call_method1("encode", ("utf-8", "surrogatepass"))?
+            .downcast::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        plans.insert(
+            marker,
+            Some(ObjectPlan {
+                identity,
+                base: if base.is_none() {
+                    None
+                } else {
+                    Some(base.unbind())
+                },
+                named: if named.is_none() {
+                    None
+                } else {
+                    Some(named.unbind())
+                },
+                exception: reader.getattr("exception")?.extract()?,
+                members,
+                dictionary,
+                has_state: reader.getattr("has_state")?.extract()?,
+            }),
+        );
     }
+    let plan = match plans.get(&marker).unwrap() {
+        Some(plan) => plan,
+        None => return Ok(None),
+    };
     let mut fields = Vec::new();
-    if let Some(base) = base {
+    if let Some(base) = &plan.base {
+        let base = base.bind(py);
         let iter = if base.is(&py.get_type::<PyDict>()) {
             base.getattr("items")?.call1((value,))?
         } else {
             base.getattr("__iter__")?.call1((value,))?
         };
-        let items: Vec<_> = iter.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-        let named = if base.is(&py.get_type::<PyTuple>()) {
-            named
-        } else {
-            None
-        };
-        let names = if let Some(names) = named {
-            if names.len()? == items.len() {
-                Some(names)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let items = iter.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        let names = plan
+            .named
+            .as_ref()
+            .filter(|n| n.bind(py).len().ok() == Some(items.len()));
         for (index, item) in items.into_iter().enumerate() {
             fields.push((
-                if let Some(ref names) = names {
-                    Some(names.get_item(index)?.unbind())
-                } else {
-                    None
+                match names {
+                    Some(names) => Some(names.bind(py).get_item(index)?.unbind()),
+                    None => None,
                 },
                 item.unbind(),
             ));
         }
     }
-    if exception {
+    if plan.exception {
         fields.push((
             Some(PyString::new(py, "args").into_any().unbind()),
-            structure
+            py.import("ldr.structure")?
                 .getattr("_BASE_EXC_ARGS")?
                 .call1((value,))?
                 .unbind(),
         ));
     }
-    for (owner, namespace) in namespaces.iter().rev() {
-        let slots = namespace.call_method1("get", ("__slots__",))?;
-        let slots: Vec<_> = if slots.is_exact_instance_of::<PyString>() {
-            vec![slots]
-        } else if slots.is_exact_instance_of::<PyTuple>() || slots.is_exact_instance_of::<PyList>()
-        {
-            slots.try_iter()?.collect::<PyResult<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        for name in slots {
-            if !name.is_exact_instance_of::<PyString>() {
-                continue;
-            }
-            let text: String = name.extract()?;
-            if text == "__dict__" || text == "__weakref__" {
-                continue;
-            }
-            let stored = if text.starts_with("__") && !text.ends_with("__") {
-                let owner_name: String = structure
-                    .getattr("_TYPE_NAME")?
-                    .call1((owner,))?
-                    .extract()?;
-                format!("_{}{text}", owner_name.trim_start_matches('_'))
-            } else {
-                text
-            };
-            let descriptor = namespace.call_method1("get", (stored,))?;
-            if !descriptor.get_type().is(&member_type) {
-                return Ok(None);
-            }
-            match descriptor.call_method1("__get__", (value,)) {
-                Ok(item) => fields.push((Some(name.unbind()), item.unbind())),
-                Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => (),
-                Err(_) => return Ok(None),
-            }
+    for (name, descriptor) in &plan.members {
+        match descriptor.bind(py).call_method1("__get__", (value,)) {
+            Ok(item) => fields.push((Some(name.clone_ref(py)), item.unbind())),
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => (),
+            Err(error) => return Err(error),
         }
     }
     let mut state = false;
-    if let Some(descriptor) = dictionary {
-        if let Ok(dict) = descriptor.call_method1("__get__", (value,)) {
-            if let Ok(dict) = dict.downcast::<PyDict>() {
+    if let Some(descriptor) = &plan.dictionary {
+        if let Ok(dictionary) = descriptor.bind(py).call_method1("__get__", (value,)) {
+            if let Ok(dictionary) = dictionary.downcast::<PyDict>() {
                 state = true;
-                for (key, item) in dict.iter() {
-                    if key.is_exact_instance_of::<PyString>() {
-                        fields.push((Some(key.unbind()), item.unbind()));
+                for (name, item) in dictionary.iter() {
+                    if name.is_exact_instance_of::<PyString>() {
+                        fields.push((Some(name.unbind()), item.unbind()));
                     }
                 }
             }
         }
     }
-    if fields.is_empty() && !state && !has_state {
+    if fields.is_empty() && !state && !plan.has_state {
         return Ok(None);
     }
-    Ok(Some((identity(py, cls.as_any())?, fields)))
+    Ok(Some((plan.identity.clone(), fields)))
 }
 
 fn tagged(tag: &str, bytes: &[u8]) -> Vec<u8> {
@@ -429,6 +427,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
     let mut stack = vec![Task::Node(value, hash.clone())];
     let mut active: HashMap<usize, usize> = walk.getattr("active")?.extract()?;
     let initial_active = active.clone();
+    let mut plans = HashMap::new();
     let mut visited: usize = walk.getattr("visited")?.extract()?;
     let mut immutable: bool = walk.getattr("immutable")?.extract()?;
     let mut partial: bool = walk.getattr("partial")?.extract()?;
@@ -489,6 +488,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                     active.remove(&marker);
                 }
                 Task::Children(iterator) => {
+                    plans.clear();
                     to_python!();
                     let next = iterator.bind(py).try_iter()?.next();
                     from_python!();
@@ -678,7 +678,9 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             || value.is(&py.Ellipsis())
                             || value.is(&py.NotImplemented());
                         if !known {
-                            if let Ok(Some((identity, fields))) = object_fields(py, value) {
+                            if let Ok(Some((identity, fields))) =
+                                object_fields(py, value, &mut plans)
+                            {
                                 visited += 1;
                                 if ceiling.is_some_and(|limit| visited > limit) {
                                     return Err(PyErr::from_value(
@@ -711,6 +713,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         fingerprint
                             .getattr("STATS")?
                             .setattr("python_nodes", count + 1)?;
+                        plans.clear();
                         to_python!();
                         let wrapped = Py::new(py, Hash { state: out.clone() })?;
                         let children = walk.call_method1("_encode", (value, wrapped));
@@ -820,7 +823,10 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             write(py, &out, format!("{tag}{}{open}", value.len()?).as_bytes());
                             if dict {
                                 stack.push(Task::DictItems(
-                                    value.clone().unbind(), 0, value.len()?, value.len()?,
+                                    value.clone().unbind(),
+                                    0,
+                                    value.len()?,
+                                    value.len()?,
                                     out,
                                 ));
                             } else {
