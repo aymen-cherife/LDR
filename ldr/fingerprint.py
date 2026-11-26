@@ -594,3 +594,90 @@ def _fingerprint_details(
             STATS.walks += 1
             STATS.walked = walk.visited
             STATS.walked_type = type(value)
+
+def _capture_details(
+    value: Any, budget: Budget | None = None, *, partial_ok: bool = False
+) -> tuple[str, bool]:
+    """Return the existing fingerprint and whether it can be reused for this object.
+
+    Without an explicit budget the process's node ceiling applies (see ``configure``): a
+    value over it is sketched, and the token ends with ``SKETCH_MARK``.
+    """
+    implicit = budget is None
+    if implicit:
+        budget = _effective()
+    sketch = implicit and budget is not DEFAULT_BUDGET
+    if CACHE and implicit:
+        key = _cache_key(value)
+        if key is not None:
+            _current_caches()
+            key = (key, partial_ok)
+            found = _value_cache.get(key)
+            if found is not None:
+                return found
+            normalized = STATS.tmp_normalized
+            found = (yield from _capture_walk(value, budget, partial_ok, sketch=sketch))
+            # A normalized temp path is counted for the gaps line on every
+            # occurrence, so it is never answered from the cache.
+            if STATS.tmp_normalized == normalized:
+                if len(_value_cache) >= CACHE_LIMIT:
+                    _value_cache.clear()
+                _value_cache[key] = found
+            return found
+        if type(value) in (tuple, frozenset):
+            # A deeply immutable value keeps its fingerprint between calls (see IDENTITY_LIMIT).
+            _current_caches()
+            entry = _identity_cache.get((id(value), partial_ok))
+            if entry is not None and entry[0] is value:  # the same object, not a reused id
+                return entry[1]
+            normalized = STATS.tmp_normalized
+            found = (yield from _capture_walk(value, budget, partial_ok, sketch=sketch))
+            if (
+                found[1] and found[0] not in STATUSES and STATS.last_visited >= IDENTITY_MIN_NODES
+                and STATS.tmp_normalized == normalized
+            ):
+                if len(_identity_cache) >= IDENTITY_LIMIT:
+                    _identity_cache.pop(next(iter(_identity_cache)))  # oldest first
+                _identity_cache[id(value), partial_ok] = (value, found)
+            return found
+    return (yield from _capture_walk(value, budget, partial_ok, sketch=sketch))
+
+
+def _capture_walk(
+    value: Any, budget: Budget, partial_ok: bool, sketch: bool = False
+) -> tuple[str, bool]:
+    walk = None
+    try:
+        out = hashlib.blake2b(digest_size=DIGEST_BYTES)
+        walk = _Walk(budget, partial_ok)
+        if _native is None:
+            walk.encode(value, out)
+            digest = out.hexdigest()
+        else:
+            digest = yield (walk, value)
+        STATS.last_visited = walk.visited
+        return digest + (PARTIAL_MARK if walk.partial else ""), (
+            walk.immutable and not walk.partial
+        )
+    except _Stop as stop:
+        if (
+            stop.status == UNKNOWN and sketch and walk is not None
+            and budget.max_nodes is not None and walk.visited > budget.max_nodes
+        ):
+            try:
+                return _sketch(value), False  # over the node ceiling: a sketch, never a guess
+            except _Stop as inner:
+                return inner.status, False
+            except Exception:
+                return FAILED, False
+        return stop.status, False
+    except RecursionError:
+        return UNKNOWN, False
+    except Exception:
+        return FAILED, False
+    finally:
+        if walk is not None:
+            STATS.nodes += walk.visited
+            STATS.walks += 1
+            STATS.walked = walk.visited
+            STATS.walked_type = type(value)

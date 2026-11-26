@@ -236,3 +236,43 @@ def test_native_clears_active_path_on_walk_failure():
         native.encode(walk, value)
     assert walk.active == {}
     assert walk.visited == 2
+
+
+def test_argument_capture_batches_entry_and_preserves_mutations(monkeypatch):
+    """One native entry per argument capture, with fresh mutable exit evidence."""
+    from ldr.tracer import Recorder
+
+    class NativeProbe:
+        entries = 0
+
+        def encode(self, *args):
+            self.entries += 1
+            return native.encode(*args)
+
+        def capture(self, *args):
+            self.entries += 1
+            return native.capture(*args)
+
+    def target(first, second):
+        pass
+
+    class Frame:
+        f_back = None
+
+        def __init__(self):
+            self.f_locals = {"first": [1, 2], "second": {"a": 3}}
+
+    monkeypatch.setattr(fp, "CACHE", False)
+    probe = NativeProbe()
+    monkeypatch.setattr(fp, "_native", probe)
+    recorder = Recorder([])
+    frame = Frame()
+    entry = recorder._argument_fingerprints(target.__code__, frame, entering=True)
+    assert probe.entries == 1
+    frame.f_locals["first"].append(4)
+    frame.f_locals["second"]["a"] = 5
+    probe.entries = 0
+    exit_ = recorder._argument_fingerprints(target.__code__, frame)
+    assert probe.entries == 1
+    assert entry["first"] != exit_["first"]
+    assert entry["second"] != exit_["second"]

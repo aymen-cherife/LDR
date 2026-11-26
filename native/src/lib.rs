@@ -811,9 +811,35 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
     Ok(result)
 }
 
+#[pyfunction]
+fn capture(py: Python<'_>, generator: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let mut sent = py.None();
+    let mut error: Option<PyErr> = None;
+    loop {
+        let next = match error.take() {
+            Some(failure) => generator.call_method1("throw", (failure.value(py),)),
+            None => generator.call_method1("send", (sent.bind(py),)),
+        };
+        let item = match next {
+            Ok(item) => item,
+            Err(failure) if failure.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                return Ok(failure.value(py).getattr("value")?.unbind());
+            }
+            Err(failure) => return Err(failure),
+        };
+        let walk = item.get_item(0)?;
+        let value = item.get_item(1)?.unbind();
+        match encode(py, walk, value) {
+            Ok(digest) => sent = PyString::new(py, &digest).into_any().unbind(),
+            Err(failure) => error = Some(failure),
+        }
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Hash>()?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
+    m.add_function(wrap_pyfunction!(capture, m)?)?;
     Ok(())
 }
