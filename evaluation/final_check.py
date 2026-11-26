@@ -130,7 +130,17 @@ def controlled_comparison(python_reader, native_reader, work, fixture="rich"):
     import run_phases
 
     root, _, traced = overhead.build(work, fixture)
+    # Avoid an editable install leaking the native extension across checkouts.
+    traced = [overhead.bench_python(work), *traced[1:]]
     overhead.clean(root)
+    for label, checkout, expected in (("python", python_reader, False), ("native", native_reader, True)):
+        env = overhead.environment(checkout, root)
+        probe = processes.check_output(
+            [traced[0], "-c", "import importlib.util; print(importlib.util.find_spec('ldr._native') is not None)"],
+            cwd=root, env=env, text=True,
+        ).strip()
+        if probe != str(expected):
+            raise RuntimeError(f"{label} checkout must have native module importable={expected}, got {probe}")
     first_env = overhead.environment(python_reader, root)
     run_phases.one(root, traced, first_env)
     with tempfile.TemporaryDirectory(prefix="ldr-previous-") as scratch:
