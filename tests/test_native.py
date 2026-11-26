@@ -193,3 +193,9 @@ def test_text_is_native(value):
     before = fp.STATS.python_nodes
     assert result(value, True) == result(value, False)
     assert fp.STATS.python_nodes == before
+
+@pytest.mark.parametrize('value', [Slots(), type('Plain', (), {})()])
+def test_safe_structural_values_are_native(value):
+    before = fp.STATS.python_nodes
+    assert result(value, True) == result(value, False)
+    assert fp.STATS.python_nodes == before

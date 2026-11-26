@@ -45,6 +45,8 @@ enum Task {
     DictItems(Py<PyAny>, Py<Hash>),
     SetItems(Py<PyAny>, Py<Hash>, Vec<Py<Hash>>, bool),
     Close(usize, Py<Hash>),
+    ObjectClose(usize, Py<Hash>),
+    Fields(std::vec::IntoIter<(Option<Py<PyAny>>, Py<PyAny>)>, Py<Hash>),
 }
 
 fn write(py: Python<'_>, hash: &Py<Hash>, data: &[u8]) {
@@ -147,6 +149,170 @@ fn text_bytes(
     Ok(encoded)
 }
 
+fn identity(py: Python<'_>, cls: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let structure = py.import("ldr.structure")?;
+    let module = structure.getattr("_TYPE_MODULE")?.call1((cls,))?;
+    let name = structure.getattr("_TYPE_QUALNAME")?.call1((cls,))?;
+    let module = if module.is_exact_instance_of::<PyString>() {
+        module
+    } else {
+        PyString::new(py, "").into_any()
+    };
+    let name = if name.is_exact_instance_of::<PyString>() {
+        name
+    } else {
+        structure.getattr("_TYPE_NAME")?.call1((cls,))?
+    };
+    let text = PyString::new(py, ".").call_method1("join", ((module, name),))?;
+    Ok(text
+        .call_method1("encode", ("utf-8", "surrogatepass"))?
+        .downcast::<PyBytes>()?
+        .as_bytes()
+        .to_vec())
+}
+fn object_fields(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Option<(Vec<u8>, Vec<(Option<Py<PyAny>>, Py<PyAny>)>)>> {
+    let structure = py.import("ldr.structure")?;
+    let cls = value.get_type();
+    let mro = structure.getattr("_TYPE_MRO")?.call1((&cls,))?;
+    let types = py.import("types")?;
+    let member_type = types.getattr("MemberDescriptorType")?;
+    let getset_type = types.getattr("GetSetDescriptorType")?;
+    let mut namespaces = Vec::new();
+    let mut dictionary = None;
+    let mut base = None;
+    let mut named = None;
+    let mut has_state = mro.len()? == 1;
+    for owner in mro.try_iter()? {
+        let owner = owner?;
+        if owner.is(&py.get_type::<pyo3::exceptions::PyBaseException>()) {
+            return Ok(None);
+        }
+        let namespace = structure.getattr("_TYPE_DICT")?.call1((&owner,))?;
+        for hook in ["__getattr__", "__getattribute__"] {
+            let descriptor = namespace.call_method1("get", (hook,))?;
+            if descriptor.is_instance_of::<pyo3::types::PyFunction>() {
+                return Ok(None);
+            }
+        }
+        for candidate in [
+            py.get_type::<PyList>().into_any(),
+            py.get_type::<PyTuple>().into_any(),
+            py.get_type::<PyDict>().into_any(),
+            py.get_type::<PySet>().into_any(),
+            py.get_type::<PyFrozenSet>().into_any(),
+        ] {
+            if owner.is(&candidate) {
+                base = Some(candidate);
+            }
+        }
+        let fields = namespace.call_method1("get", ("_fields",))?;
+        if named.is_none()
+            && fields.is_exact_instance_of::<PyTuple>()
+            && fields.try_iter()?.all(|v| {
+                v.map(|v| v.is_exact_instance_of::<PyString>())
+                    .unwrap_or(false)
+            })
+        {
+            named = Some(fields);
+        }
+        let descriptor = namespace.call_method1("get", ("__dict__",))?;
+        if dictionary.is_none() && descriptor.get_type().is(&getset_type) {
+            dictionary = Some(descriptor);
+            has_state = true;
+        }
+        if namespace.contains("__slots__")? {
+            has_state = true;
+        }
+        namespaces.push((owner, namespace));
+    }
+    let mut fields = Vec::new();
+    if let Some(base) = base {
+        let iter = if base.is(&py.get_type::<PyDict>()) {
+            base.getattr("items")?.call1((value,))?
+        } else {
+            base.getattr("__iter__")?.call1((value,))?
+        };
+        let items: Vec<_> = iter.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        let names = if let Some(names) = named {
+            if names.len()? == items.len() {
+                Some(names)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        for (index, item) in items.into_iter().enumerate() {
+            fields.push((
+                if let Some(ref names) = names {
+                    Some(names.get_item(index)?.unbind())
+                } else {
+                    None
+                },
+                item.unbind(),
+            ));
+        }
+    }
+    for (owner, namespace) in namespaces.iter().rev() {
+        let slots = namespace.call_method1("get", ("__slots__",))?;
+        let slots: Vec<_> = if slots.is_exact_instance_of::<PyString>() {
+            vec![slots]
+        } else if slots.is_exact_instance_of::<PyTuple>() || slots.is_exact_instance_of::<PyList>()
+        {
+            slots.try_iter()?.collect::<PyResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        for name in slots {
+            if !name.is_exact_instance_of::<PyString>() {
+                continue;
+            }
+            let text: String = name.extract()?;
+            if text == "__dict__" || text == "__weakref__" {
+                continue;
+            }
+            let stored = if text.starts_with("__") && !text.ends_with("__") {
+                let owner_name: String = structure
+                    .getattr("_TYPE_NAME")?
+                    .call1((owner,))?
+                    .extract()?;
+                format!("_{}{text}", owner_name.trim_start_matches('_'))
+            } else {
+                text
+            };
+            let descriptor = namespace.call_method1("get", (stored,))?;
+            if !descriptor.get_type().is(&member_type) {
+                return Ok(None);
+            }
+            match descriptor.call_method1("__get__", (value,)) {
+                Ok(item) => fields.push((Some(name.unbind()), item.unbind())),
+                Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => (),
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+    let mut state = false;
+    if let Some(descriptor) = dictionary {
+        if let Ok(dict) = descriptor.call_method1("__get__", (value,)) {
+            if let Ok(dict) = dict.downcast::<PyDict>() {
+                state = true;
+                for (key, item) in dict.iter() {
+                    if key.is_exact_instance_of::<PyString>() {
+                        fields.push((Some(key.unbind()), item.unbind()));
+                    }
+                }
+            }
+        }
+    }
+    if fields.is_empty() && !state && !has_state {
+        return Ok(None);
+    }
+    Ok(Some((identity(py, cls.as_any())?, fields)))
+}
+
 #[pyfunction]
 fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<String> {
     let hash = Py::new(py, Hash::new())?;
@@ -158,6 +324,29 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
     let secret = py.import("ldr.redact")?.getattr("is_secret_name")?;
     while let Some(task) = stack.pop() {
         match task {
+            Task::ObjectClose(marker, out) => {
+                write(py, &out, b"}");
+                active.del_item(marker)?;
+            }
+            Task::Fields(mut fields, out) => {
+                if let Some((name, value)) = fields.next() {
+                    if let Some(name) = name {
+                        if secret.call1((name.bind(py),))?.is_truthy()? {
+                            return Err(PyErr::from_value(
+                                fingerprint.getattr("_Stop")?.call1(("redacted",))?,
+                            ));
+                        }
+                        let data = name
+                            .bind(py)
+                            .call_method1("encode", ("utf-8", "surrogatepass"))?;
+                        let bytes = data.downcast::<PyBytes>()?.as_bytes();
+                        write(py, &out, format!("n{}:", bytes.len()).as_bytes());
+                        write(py, &out, bytes);
+                    }
+                    stack.push(Task::Fields(fields, out.clone_ref(py)));
+                    stack.push(Task::Node(value, out));
+                }
+            }
             Task::Close(marker, out) => {
                 write(py, &out, b"]");
                 active.del_item(marker)?;
@@ -231,6 +420,50 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                     || kind.is(&py.get_type::<PyInt>())
                     || kind.is(&py.get_type::<PyFloat>());
                 if !(scalar || list || tuple || dict || set || frozen) {
+                    // Known leaves retain their distinct tags. Other safe layouts are read here.
+                    let types = py.import("types")?;
+                    let known = kind.is(&py.get_type::<pyo3::types::PyType>())
+                        || kind.is(&py.import("abc")?.getattr("ABCMeta")?)
+                        || kind.is(&types.getattr("FunctionType")?)
+                        || kind.is(&types.getattr("BuiltinFunctionType")?);
+                    let known = known
+                        || kind.is(&py.import("functools")?.getattr("partial")?)
+                        || kind.is(&types.getattr("MethodType")?)
+                        || kind.is(&py.import("decimal")?.getattr("Decimal")?)
+                        || ["datetime", "date", "time", "timedelta"]
+                            .iter()
+                            .any(|name| {
+                                kind.is(&py.import("datetime").unwrap().getattr(*name).unwrap())
+                            })
+                        || kind.is(&py.get_type::<pyo3::types::PyComplex>())
+                        || kind.is(&py.import("builtins")?.getattr("range")?)
+                        || value.is_ellipsis()
+                        || value.is(&py.NotImplemented());
+                    if !known {
+                        if let Some((identity, fields)) = object_fields(py, value)? {
+                            let visited: usize = walk.getattr("visited")?.extract()?;
+                            walk.setattr("visited", visited + 1)?;
+                            if ceiling.is_some_and(|limit| visited + 1 > limit) {
+                                return Err(PyErr::from_value(
+                                    fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                ));
+                            }
+                            walk.setattr("immutable", false)?;
+                            let marker = value.as_ptr() as usize;
+                            if let Some(depth) = active.get_item(marker)? {
+                                let depth: usize = depth.extract()?;
+                                write(py, &out, format!("@{};", active.len() - depth).as_bytes());
+                                continue;
+                            }
+                            active.set_item(marker, active.len())?;
+                            write(py, &out, format!("O{}:", identity.len()).as_bytes());
+                            write(py, &out, &identity);
+                            write(py, &out, format!("{}{{", fields.len()).as_bytes());
+                            stack.push(Task::ObjectClose(marker, out.clone_ref(py)));
+                            stack.push(Task::Fields(fields.into_iter(), out));
+                            continue;
+                        }
+                    }
                     let count: usize = fingerprint
                         .getattr("STATS")?
                         .getattr("python_nodes")?
