@@ -6,10 +6,9 @@ Build with the checkout's Python and copy the extension into `ldr/` for local us
 . .venv/bin/activate
 maturin build --release --manifest-path native/Cargo.toml -o /tmp/ldr-wheels
 python - <<'PY'
-import glob
 import zipfile
 from pathlib import Path
-with zipfile.ZipFile(glob.glob('/tmp/ldr-wheels/ldr_native_prototype-*.whl')[0]) as wheel:
+with zipfile.ZipFile(max(Path('/tmp/ldr-wheels').glob('*.whl'), key=lambda path: path.stat().st_mtime)) as wheel:
     for name in wheel.namelist():
         if Path(name).name.startswith('_native.') and name.endswith(('.so', '.pyd')):
             Path('ldr', Path(name).name).write_bytes(wheel.read(name))

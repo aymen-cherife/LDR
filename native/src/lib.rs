@@ -176,7 +176,10 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                     stack.push(Task::Close(marker, out.clone_ref(py)));
                     // Python's string bulk path checks redaction before its budget check.
                     // Keep that exact ordering, including normalization counters.
-                    if (list || tuple) && value.len()? >= 32 {
+                    if (list || tuple)
+                        && value.len()?
+                            >= fingerprint.getattr("FAST_PATH_MIN")?.extract::<usize>()?
+                    {
                         let strings = value.try_iter()?.all(|item| {
                             item.map(|v| v.get_type().is(&py.get_type::<PyString>()))
                                 .unwrap_or(false)
