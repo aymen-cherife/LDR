@@ -25,10 +25,14 @@ def measure(owner, method, name):
     @functools.wraps(original)
     def timed(*args, **kwargs):
         start = perf_counter()
+        wait_before = timings.get("writer_wait", 0)
         try:
             return original(*args, **kwargs)
         finally:
-            record(name, start)
+            elapsed = perf_counter() - start
+            if name in ("report_ordered_scan", "report_grouped_counts"):
+                elapsed -= timings.get("writer_wait", 0) - wait_before
+            timings[name] = timings.get(name, 0) + elapsed
 
     setattr(owner, method, timed)
 
@@ -154,6 +158,9 @@ if output and program:
         return connect(*args, factory=ComparisonConnection, **kwargs)
 
     sqlite3.connect = connect_comparison
+    from ldr.sink import RemoteStore
+
+    measure(RemoteStore, "sync", "writer_wait")
     measure(sqlreport, "frame_index", "report_ordered_scan")
     measure(sqlreport, "counts", "report_grouped_counts")
     measure(summary, "summarize", "result_serialization_and_write")

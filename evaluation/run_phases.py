@@ -20,16 +20,17 @@ import overhead
 from ldr import processes
 
 HERE = Path(__file__).resolve().parent
+HASH_SEED = "0"
 STEPS = (
     "call_records_move_with_indexes", "fingerprint_lookup_move_with_index",
-    "report_ordered_scan", "report_grouped_counts",
+    "report_ordered_scan", "report_grouped_counts", "writer_wait",
     "result_serialization_and_write", "output_drain",
 )
 
 
 def one(root: Path, command: list[str], env: dict) -> dict:
     with tempfile.TemporaryDirectory(prefix="ldr-phases-") as scratch:
-        instrumented = dict(env, LDR_PHASE_OUTPUT=scratch)
+        instrumented = dict(env, LDR_PHASE_OUTPUT=scratch, PYTHONHASHSEED=HASH_SEED)
         instrumented["PYTHONPATH"] += os.pathsep + str(HERE / "phase_probe")
         overhead_started = time.time()
         started = time.perf_counter()
@@ -50,7 +51,7 @@ def one(root: Path, command: list[str], env: dict) -> dict:
     program_end = timing["execution_finished_at"]
     first = state["started_at"] + state["first_call_s"]
     measured = program["seconds"] | supervisor["seconds"]
-    post_run = {step: measured[step] for step in STEPS}
+    post_run = {step: measured.get(step, 0.0) for step in STEPS}
     post_run["comparison_temp_index"] = measured.get("comparison_temp_index", 0.0)
     post_run["comparison"] = timing.get("comparison_seconds", 0.0) - post_run["comparison_temp_index"]
     post_run["untimed"] = state["child_ended_at"] - program_end - sum(post_run.values())
@@ -87,7 +88,7 @@ def main() -> int:
             for run in ("first", "second"):
                 row = one(root, traced, env)
                 print(json.dumps({
-                    "checkout": label, "commit": commit, "fixture": name, "run": run,
+                    "checkout": label, "commit": commit, "fixture": name, "run": run, "pythonhashseed": HASH_SEED,
                     "platform": platform.platform(), "mode": "default", **row,
                 }), flush=True)
     return 0
