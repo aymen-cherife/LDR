@@ -199,3 +199,15 @@ def test_safe_structural_values_are_native(value):
     before = fp.STATS.python_nodes
     assert result(value, True) == result(value, False)
     assert fp.STATS.python_nodes == before
+
+@pytest.mark.parametrize('value', [type, len, lambda: None, range(3), 1j])
+def test_builtin_leaves_are_native(value):
+    before = fp.STATS.python_nodes
+    assert result(value, True) == result(value, False)
+    assert fp.STATS.python_nodes == before
+
+@pytest.mark.parametrize('value', [functools.partial(pow, 2, exp=3), Slots.__init__.__get__(Slots()), ValueError('value')])
+def test_native_callable_and_exception_fields(value):
+    before=fp.STATS.python_nodes
+    assert result(value, True)==result(value,False)
+    assert fp.STATS.python_nodes==before

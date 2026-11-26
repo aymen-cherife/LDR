@@ -45,6 +45,7 @@ enum Task {
     DictItems(Py<PyAny>, Py<Hash>),
     SetItems(Py<PyAny>, Py<Hash>, Vec<Py<Hash>>, bool),
     Close(usize, Py<Hash>),
+    Raw(Vec<u8>, Py<Hash>),
     ObjectClose(usize, Py<Hash>),
     Fields(std::vec::IntoIter<(Option<Py<PyAny>>, Py<PyAny>)>, Py<Hash>),
 }
@@ -180,6 +181,7 @@ fn object_fields(
     let types = py.import("types")?;
     let member_type = types.getattr("MemberDescriptorType")?;
     let getset_type = types.getattr("GetSetDescriptorType")?;
+    let mut exception = false;
     let mut namespaces = Vec::new();
     let mut dictionary = None;
     let mut base = None;
@@ -188,7 +190,7 @@ fn object_fields(
     for owner in mro.try_iter()? {
         let owner = owner?;
         if owner.is(&py.get_type::<pyo3::exceptions::PyBaseException>()) {
-            return Ok(None);
+            exception = true;
         }
         let namespace = structure.getattr("_TYPE_DICT")?.call1((&owner,))?;
         for hook in ["__getattr__", "__getattribute__"] {
@@ -236,6 +238,11 @@ fn object_fields(
             base.getattr("__iter__")?.call1((value,))?
         };
         let items: Vec<_> = iter.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        let named = if base.is(&py.get_type::<PyTuple>()) {
+            named
+        } else {
+            None
+        };
         let names = if let Some(names) = named {
             if names.len()? == items.len() {
                 Some(names)
@@ -255,6 +262,15 @@ fn object_fields(
                 item.unbind(),
             ));
         }
+    }
+    if exception {
+        fields.push((
+            Some(PyString::new(py, "args").into_any().unbind()),
+            structure
+                .getattr("_BASE_EXC_ARGS")?
+                .call1((value,))?
+                .unbind(),
+        ));
     }
     for (owner, namespace) in namespaces.iter().rev() {
         let slots = namespace.call_method1("get", ("__slots__",))?;
@@ -313,6 +329,92 @@ fn object_fields(
     Ok(Some((identity(py, cls.as_any())?, fields)))
 }
 
+fn tagged(tag: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut result = format!("{tag}{}:", bytes.len()).into_bytes();
+    result.extend(bytes);
+    result
+}
+fn leaf_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
+    let kind = value.get_type();
+    let types = py.import("types")?;
+    if kind.is(&py.get_type::<pyo3::types::PyType>())
+        || kind.is(&py.import("abc")?.getattr("ABCMeta")?)
+    {
+        return Ok(Some(tagged("C", &identity(py, value)?)));
+    }
+    if kind.is(&types.getattr("FunctionType")?) || kind.is(&types.getattr("BuiltinFunctionType")?) {
+        let text = PyString::new(py, ".").call_method1(
+            "join",
+            ((
+                {
+                    let module = value.getattr("__module__")?;
+                    if module.is_none() {
+                        PyString::new(py, "None").into_any()
+                    } else if module.is_exact_instance_of::<PyString>() {
+                        module
+                    } else {
+                        return Ok(None);
+                    }
+                },
+                value.getattr("__qualname__")?,
+            ),),
+        )?;
+        let bytes = text.call_method1("encode", ("utf-8", "surrogatepass"))?;
+        return Ok(Some(tagged("Y", bytes.downcast::<PyBytes>()?.as_bytes())));
+    }
+    if kind.is(&py.get_type::<pyo3::types::PyComplex>()) {
+        let real: String = value.getattr("real")?.call_method0("hex")?.extract()?;
+        let imag: String = value.getattr("imag")?.call_method0("hex")?.extract()?;
+        return Ok(Some(format!("c{real},{imag};").into_bytes()));
+    }
+    if value.is(&py.Ellipsis()) {
+        return Ok(Some(b"E".to_vec()));
+    }
+    if value.is(&py.NotImplemented()) {
+        return Ok(Some(b"X".to_vec()));
+    }
+    if kind.is(&py.import("builtins")?.getattr("range")?) {
+        let start = value.getattr("start")?.str()?.to_str()?.to_owned();
+        let stop = value.getattr("stop")?.str()?.to_str()?.to_owned();
+        let step = value.getattr("step")?.str()?.to_str()?.to_owned();
+        return Ok(Some(tagged(
+            "R",
+            format!("{start},{stop},{step}").as_bytes(),
+        )));
+    }
+    let datetime = py.import("datetime")?;
+    for name in ["datetime", "date", "time"] {
+        if kind.is(&datetime.getattr(name)?) {
+            if name != "date" {
+                let zone = value.getattr("tzinfo")?;
+                if !zone.is_none() && !zone.get_type().is(&datetime.getattr("timezone")?) {
+                    return Ok(None);
+                }
+            }
+            let text: String = value.call_method0("isoformat")?.extract()?;
+            let label: String = py
+                .import("ldr.structure")?
+                .getattr("_TYPE_NAME")?
+                .call1((&kind,))?
+                .extract()?;
+            return Ok(Some(tagged("M", format!("{label}{text}").as_bytes())));
+        }
+    }
+    if kind.is(&datetime.getattr("timedelta")?) {
+        let days: i64 = value.getattr("days")?.extract()?;
+        let seconds: i64 = value.getattr("seconds")?.extract()?;
+        let micros: i64 = value.getattr("microseconds")?.extract()?;
+        return Ok(Some(tagged(
+            "M",
+            format!("td{days},{seconds},{micros}").as_bytes(),
+        )));
+    }
+    if kind.is(&py.import("decimal")?.getattr("Decimal")?) {
+        return Ok(Some(tagged("D", value.str()?.to_str()?.as_bytes())));
+    }
+    Ok(None)
+}
+
 #[pyfunction]
 fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<String> {
     let hash = Py::new(py, Hash::new())?;
@@ -324,6 +426,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
     let secret = py.import("ldr.redact")?.getattr("is_secret_name")?;
     while let Some(task) = stack.pop() {
         match task {
+            Task::Raw(bytes, out) => write(py, &out, &bytes),
             Task::ObjectClose(marker, out) => {
                 write(py, &out, b"}");
                 active.del_item(marker)?;
@@ -420,6 +523,68 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                     || kind.is(&py.get_type::<PyInt>())
                     || kind.is(&py.get_type::<PyFloat>());
                 if !(scalar || list || tuple || dict || set || frozen) {
+                    let method = kind.is(&py.import("types")?.getattr("MethodType")?);
+                    let partial = kind.is(&py.import("functools")?.getattr("partial")?);
+                    if method || partial {
+                        let visited: usize = walk.getattr("visited")?.extract()?;
+                        walk.setattr("visited", visited + 1)?;
+                        if ceiling.is_some_and(|limit| visited + 1 > limit) {
+                            return Err(PyErr::from_value(
+                                fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                            ));
+                        }
+                        walk.setattr("immutable", false)?;
+                        if method {
+                            write(py, &out, b"Mt");
+                            let receiver = value.getattr("__self__")?;
+                            stack.push(Task::Raw(
+                                tagged("T", &identity(py, receiver.get_type().as_any())?),
+                                out.clone_ref(py),
+                            ));
+                            stack.push(Task::Node(value.getattr("__func__")?.unbind(), out));
+                        } else {
+                            write(py, &out, b"Pa");
+                            let kwargs = value.getattr("keywords")?.downcast_into::<PyDict>()?;
+                            let keys = py
+                                .import("builtins")?
+                                .getattr("sorted")?
+                                .call1((&kwargs,))?;
+                            let mut fields = Vec::new();
+                            for key in keys.try_iter()? {
+                                let key = key?;
+                                fields.push((
+                                    Some(key.clone().unbind()),
+                                    kwargs.get_item(&key)?.unwrap().unbind(),
+                                ));
+                            }
+                            stack.push(Task::Raw(b"}".to_vec(), out.clone_ref(py)));
+                            stack.push(Task::Fields(fields.into_iter(), out.clone_ref(py)));
+                            stack.push(Task::Raw(
+                                format!("{}{{", kwargs.len()).into_bytes(),
+                                out.clone_ref(py),
+                            ));
+                            stack.push(Task::Node(
+                                value.getattr("args")?.unbind(),
+                                out.clone_ref(py),
+                            ));
+                            stack.push(Task::Node(value.getattr("func")?.unbind(), out));
+                        }
+                        continue;
+                    }
+                    if let Some(bytes) = leaf_bytes(py, value)? {
+                        let visited: usize = walk.getattr("visited")?.extract()?;
+                        walk.setattr("visited", visited + 1)?;
+                        if ceiling.is_some_and(|limit| visited + 1 > limit) {
+                            return Err(PyErr::from_value(
+                                fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                            ));
+                        }
+                        if !kind.is(&py.get_type::<pyo3::types::PyComplex>()) {
+                            walk.setattr("immutable", false)?;
+                        }
+                        write(py, &out, &bytes);
+                        continue;
+                    }
                     // Known leaves retain their distinct tags. Other safe layouts are read here.
                     let types = py.import("types")?;
                     let known = kind.is(&py.get_type::<pyo3::types::PyType>())
@@ -437,10 +602,10 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             })
                         || kind.is(&py.get_type::<pyo3::types::PyComplex>())
                         || kind.is(&py.import("builtins")?.getattr("range")?)
-                        || value.is_ellipsis()
+                        || value.is(&py.Ellipsis())
                         || value.is(&py.NotImplemented());
                     if !known {
-                        if let Some((identity, fields)) = object_fields(py, value)? {
+                        if let Ok(Some((identity, fields))) = object_fields(py, value) {
                             let visited: usize = walk.getattr("visited")?.extract()?;
                             walk.setattr("visited", visited + 1)?;
                             if ceiling.is_some_and(|limit| visited + 1 > limit) {
