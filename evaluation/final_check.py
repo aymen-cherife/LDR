@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -123,12 +124,39 @@ def comparison(folder, baseline, work):
     return code or cleaned
 
 
+def controlled_comparison(python_reader, native_reader, work, fixture="rich"):
+    """Measure both readers against copies of one recording at the same path."""
+    import overhead
+    import run_phases
+
+    root, _, traced = overhead.build(work, fixture)
+    overhead.clean(root)
+    first_env = overhead.environment(python_reader, root)
+    run_phases.one(root, traced, first_env)
+    with tempfile.TemporaryDirectory(prefix="ldr-previous-") as scratch:
+        previous = Path(scratch) / "previous"
+        shutil.copytree(root / ".ldr", previous)
+        for label, checkout in (("python", python_reader), ("native", native_reader)):
+            overhead.clean(root)
+            shutil.copytree(previous, root / ".ldr")
+            env = overhead.environment(checkout, root)
+            result = run_phases.one(root, traced, env)
+            commit = processes.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+            print(json.dumps({"checkout": label, "commit": commit, "fixture": fixture,
+                              "run": "controlled second", "pythonhashseed": run_phases.HASH_SEED,
+                              "platform": sys.platform, "mode": "default", **result}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", default="faa55d3", nargs="?", help="commit for same_records")
     parser.add_argument("--work", default=Path(tempfile.gettempdir()) / "ldr-overhead", type=Path,
                         help="benchmark fixture cache")
+    parser.add_argument("--python-reader", type=Path)
+    parser.add_argument("--native-reader", type=Path)
     args = parser.parse_args()
+    if bool(args.python_reader) != bool(args.native_reader):
+        parser.error("--python-reader and --native-reader must be supplied together")
     commit = processes.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
     folder = Path(tempfile.mkdtemp(prefix="ldr-final-check-"))
     suite, machine, phases = [folder / f"{name}.log" for name in ("suite", "machine", "rich")]
@@ -137,6 +165,13 @@ def main():
     phases_code = run(phases, python(HERE / "run_phases.py", "--checkout", f"current={REPO}",
                                      "--only", "rich", "--work", args.work.resolve()))
     compare_code = comparison(folder, args.baseline, args.work.resolve())
+    controlled_code = 0
+    if args.python_reader:
+        try:
+            controlled_comparison(args.python_reader.resolve(), args.native_reader.resolve(), args.work.resolve())
+        except Exception as error:
+            print(f"Controlled comparison failed: {error}", file=sys.stderr)
+            controlled_code = 1
 
     print(f"LDR final check · {commit} · baseline {args.baseline}")
     suite_summary(suite, suite_code)
@@ -146,7 +181,7 @@ def main():
     timings_summary(phases, phases_code)
     compare_summary(folder / "same_records.log", compare_code)
     print(f"Logs · {folder}")
-    return int(any((suite_code, machine_code, phases_code, compare_code)))
+    return int(any((suite_code, machine_code, phases_code, compare_code, controlled_code)))
 
 
 if __name__ == "__main__":
