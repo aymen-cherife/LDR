@@ -788,8 +788,7 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                 .bind(py)
                                 .call_method1("encode", ("utf-8", "surrogatepass"))?;
                             let bytes = data.downcast::<PyBytes>()?.as_bytes();
-                            write(py, &out, format!("n{}:", bytes.len()).as_bytes());
-                            write(py, &out, bytes);
+                            write(py, &out, &tagged("n", bytes));
                         }
                         stack.push(Task::Fields(fields, out.clone()));
                         stack.push(Task::Node(value, out));
@@ -884,15 +883,13 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             })
                             .collect();
                         bytes.sort();
-                        write(
-                            py,
-                            &out,
+                        let mut body =
                             format!("{}{}(", if frozen { "z" } else { "e" }, bytes.len())
-                                .as_bytes(),
-                        );
+                                .into_bytes();
                         for part in bytes {
-                            write(py, &out, &part);
+                            body.extend(part);
                         }
+                        write(py, &out, &body);
                     }
                 }
                 Task::Node(value, out) => {
@@ -1013,9 +1010,9 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                                     continue;
                                 }
                                 active.insert(marker, active.len());
-                                write(py, &out, format!("O{}:", identity.len()).as_bytes());
-                                write(py, &out, &identity);
-                                write(py, &out, format!("{}{{", fields.len()).as_bytes());
+                                let mut header = tagged("O", &identity);
+                                header.extend(format!("{}{{", fields.len()).as_bytes());
+                                write(py, &out, &header);
                                 stack.push(Task::ObjectClose(marker, out.clone()));
                                 stack.push(Task::Fields(fields.into_iter(), out));
                                 continue;
