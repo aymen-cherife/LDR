@@ -24,6 +24,11 @@ import struct
 import tempfile
 from typing import Any
 
+try:
+    from . import _native
+except ImportError:
+    _native = None
+
 from .redact import contains_secret, is_secret_name, same_text_policy, text_policy
 from .structure import read, type_identity, type_label
 
@@ -160,10 +165,11 @@ def is_digest(token: str | None) -> bool:
 class _Stats:
     """Process-wide counters, read by the recorder to report cost and gaps."""
 
-    __slots__ = ("nodes", "tmp_normalized", "last_visited", "walks", "walked", "walked_type")
+    __slots__ = ("nodes", "python_nodes", "tmp_normalized", "last_visited", "walks", "walked", "walked_type")
 
     def __init__(self) -> None:
         self.nodes = 0
+        self.python_nodes = 0
         self.tmp_normalized = 0
         self.last_visited = 0
         # The latest walk: how many there have been, its node count and the type of its value.
@@ -557,9 +563,13 @@ def _fingerprint_details(
     try:
         out = hashlib.blake2b(digest_size=DIGEST_BYTES)
         walk = _Walk(budget, partial_ok)
-        walk.encode(value, out)
+        if _native is None:
+            walk.encode(value, out)
+            digest = out.hexdigest()
+        else:
+            digest = _native.encode(walk, value)
         STATS.last_visited = walk.visited
-        return out.hexdigest() + (PARTIAL_MARK if walk.partial else ""), (
+        return digest + (PARTIAL_MARK if walk.partial else ""), (
             walk.immutable and not walk.partial
         )
     except _Stop as stop:

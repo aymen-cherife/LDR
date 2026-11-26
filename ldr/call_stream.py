@@ -422,6 +422,7 @@ class CallStream:
                 "calls": dict(sorted(self.counts.items(), key=lambda item: (-item[1], item[0]))[:50]),
                 "fingerprint": {
                     "tmp_normalized": STATS.tmp_normalized,
+                    "python_nodes": STATS.python_nodes,
                     "receivers_shared": self.receivers_shared,
                     "cost": dict(self.cost),
                 },
