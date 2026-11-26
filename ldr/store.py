@@ -52,7 +52,10 @@ def invocation_descriptor(
     normalized_target = target
     if os.path.exists(target_file):
         normalized_target = _portable_path(target_file, project_root) + suffix
+    from .fingerprint import SIGNATURE_VERSION
+
     return {
+        "signature_version": SIGNATURE_VERSION,
         "runner": runner,
         "target": normalized_target,
         # Credentials on the command line must not be stored or hashed into a key.

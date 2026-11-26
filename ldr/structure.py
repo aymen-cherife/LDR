@@ -23,6 +23,7 @@ _BASE_EXC_ARGS = BaseException.__dict__["args"].__get__
 
 _BUILTIN_BASES = (dict, list, tuple, set, frozenset)
 _ABSENT = object()
+UNSET = object()
 
 
 class Reading(NamedTuple):
@@ -202,12 +203,13 @@ def _builtin_content(value: Any, base: type) -> list[tuple[str | None, Any]]:
     return [(None, item) for item in tuple(iterator(value))]
 
 
-def read(value: Any) -> Reading | None:
+def read(value: Any, *, include_unset: bool = False, unset_marker: Any = UNSET, extra_slots: set[int] | None = None) -> Reading | None:
     """Structural reading of a non-builtin instance, or None if unreadable."""
     cls = type(value)
     try:
         reader, namespaces = _layout(cls)
         fields: list[tuple[str | None, Any]] = []
+        added_slots: set[int] = set() if extra_slots is None else extra_slots
 
         if reader.base is not None:
             content = _builtin_content(value, reader.base)
@@ -220,25 +222,47 @@ def read(value: Any) -> Reading | None:
         if reader.exception:
             fields.append(("args", _BASE_EXC_ARGS(value)))
 
-        replaced = False
-        for owner, namespace in zip(reversed(reader.owners), reversed(namespaces)):
-            for name, stored, original, member in owner.members:
-                descriptor = namespace.get(stored)
-                if id(descriptor) != original:
-                    replaced = True
-                    member = type(descriptor) is types.MemberDescriptorType
-                if member:
+        if include_unset:
+            # Member descriptors describe physical slots even when __slots__ is edited.
+            for owner, namespace in zip(reversed(reader.owners), reversed(namespaces)):
+                klass = owner.owner()
+                if klass is None:
+                    return None
+                declared = {stored: name for name, stored, _, _ in owner.members}
+                prefix = "_" + type_label(klass).lstrip("_") + "__"
+                for stored, descriptor in namespace.items():
+                    if stored in ("__dict__", "__weakref__") or type(descriptor) is not types.MemberDescriptorType:
+                        continue
+                    name = declared.get(stored)
+                    if name is None:
+                        name = "__" + stored[len(prefix):] if stored.startswith(prefix) and not stored.endswith("__") else stored
+                        added_slots.add(len(fields))
                     try:
                         fields.append((name, descriptor.__get__(value)))
                     except AttributeError:
-                        continue  # slot declared but never assigned
-        if replaced:
-            _discover(cls, _TYPE_MRO(cls), _names(cls))
+                        fields.append((name, unset_marker))
+        else:
+            replaced = False
+            for owner, namespace in zip(reversed(reader.owners), reversed(namespaces)):
+                for name, stored, original, member in owner.members:
+                    descriptor = namespace.get(stored)
+                    if id(descriptor) != original:
+                        replaced = True
+                        member = type(descriptor) is types.MemberDescriptorType
+                    if member:
+                        try:
+                            fields.append((name, descriptor.__get__(value)))
+                        except AttributeError:
+                            if include_unset:
+                                fields.append((name, unset_marker))
+                            continue  # slot declared but never assigned
+            if replaced:
+                _discover(cls, _TYPE_MRO(cls), _names(cls))
         state = _read_dict(value, reader, namespaces)
         if state is not None:
             fields.extend((key, item) for key, item in tuple(state.items()) if type(key) is str)
 
-        if not fields and state is None and not reader.has_state:
+        if state is None and not reader.has_state and all(index in added_slots for index in range(len(fields))):
             return None
         return Reading(reader.names[0], reader.identity, fields)
     except Exception:

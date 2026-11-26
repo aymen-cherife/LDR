@@ -16,6 +16,7 @@ import datetime
 import decimal
 import functools
 import hashlib
+import math
 import types
 from dataclasses import dataclass
 import os
@@ -35,6 +36,38 @@ FAILED = "failed"  # reading the value raised
 STATUSES = (UNSUPPORTED, UNKNOWN, REDACTED, FAILED)
 
 DIGEST_BYTES = 16
+SIGNATURE_VERSION = 2
+
+
+def _u64(number: int) -> bytes:
+    return struct.pack("<Q", number)
+
+
+def _integer(value: int) -> bytes:
+    if -(1 << 63) <= value < (1 << 63):
+        return b"i" + struct.pack("<q", value)
+    length = ((value if value >= 0 else ~value).bit_length() + 8) // 8
+    return b"I" + _u64(length) + value.to_bytes(length, "little", signed=True)
+
+
+def _float(value: float) -> bytes:
+    return struct.pack("<Q", 0x7ff8000000000000) if math.isnan(value) else struct.pack("<d", value)
+
+
+def _offset(value) -> bytes:
+    offset = value.utcoffset()
+    if offset is None:
+        return b"n"
+    microseconds = (offset.days * 86400 + offset.seconds) * 1_000_000 + offset.microseconds
+    return b"z" + struct.pack("<q", microseconds)
+
+
+def _date(value) -> bytes:
+    return struct.pack("<HBB", value.year, value.month, value.day)
+
+
+def _time(value) -> bytes:
+    return struct.pack("<BBBI", value.hour, value.minute, value.second, value.microsecond) + _offset(value)
 
 
 @dataclass(frozen=True)
@@ -94,7 +127,6 @@ class _Stop(Exception):
 CACHE = True
 CACHE_LIMIT = 65_536
 SHORT_TEXT = 256
-_secret_cache: dict[str, bool] = {}
 _value_cache: dict = {}
 _cache_policy = None
 
@@ -102,23 +134,13 @@ _cache_policy = None
 def _current_caches():
     global _cache_policy
     if _cache_policy is None or not same_text_policy(_cache_policy):
-        _secret_cache.clear()
         _value_cache.clear()
         _identity_cache.clear()
         _cache_policy = text_policy()
 
 
 def _looks_secret(text: str) -> bool:
-    if not CACHE or len(text) > SHORT_TEXT:
-        return contains_secret(text)
-    _current_caches()
-    found = _secret_cache.get(text)
-    if found is None:
-        found = contains_secret(text)
-        if len(_secret_cache) >= CACHE_LIMIT:
-            _secret_cache.clear()
-        _secret_cache[text] = found
-    return found
+    return contains_secret(text)
 
 
 def _scalar_key(value):
@@ -227,22 +249,34 @@ class _Walk:
         self.immutable = True
         self.active: dict[int, int] = {}
         self.visited = 0
+        self._count_nodes = True
 
     def encode(self, value: Any, out: hashlib.blake2b) -> None:
-        stack = [iter(((value, out),))]
+        stack = [(iter(((value, out),)), True)]
         while stack:
-            child = next(stack[-1], None)
+            iterator, counted = stack[-1]
+            self._count_nodes = counted
+            child = next(iterator, None)
             if child is None:
                 stack.pop()
+                continue
+            if len(child) == 3:
+                item, target, child_counted = child
+                child_counted = counted and child_counted
             else:
-                children = self._encode(*child)
-                if children is not None:
-                    stack.append(children)
+                item, target = child
+                child_counted = counted
+            self._count_nodes = child_counted
+            children = self._encode(item, target)
+            if children is not None:
+                stack.append((children, child_counted))
+        self._count_nodes = True
 
     def _encode(self, value: Any, out: hashlib.blake2b):
-        self.visited += 1
+        if self._count_nodes:
+            self.visited += 1
         budget = self.budget
-        if budget.max_nodes is not None and self.visited > budget.max_nodes:
+        if self._count_nodes and budget.max_nodes is not None and self.visited > budget.max_nodes:
             raise _Stop(UNKNOWN)
         kind = type(value)
         if value is None:
@@ -250,11 +284,11 @@ class _Walk:
         elif kind is bool:
             out.update(b"T" if value else b"F")
         elif kind is int:
-            out.update(f"i{value:x};".encode())
+            out.update(_integer(value))
         elif kind is float:
-            out.update(f"f{value.hex()};".encode())
+            out.update(b"f" + _float(value))
         elif kind is complex:
-            out.update(f"c{value.real.hex()},{value.imag.hex()};".encode())
+            out.update(b"c" + _float(value.real) + _float(value.imag))
         elif kind is str:
             if _looks_secret(value):
                 raise _Stop(REDACTED)
@@ -289,12 +323,16 @@ class _Walk:
             # A name, never a read: for a built-in bound method (``[].append``) that is the
             # name only, not the object it is bound to.
             self._text(b"Y", name.encode("utf-8", "surrogatepass"), out)
-        elif kind in (datetime.datetime, datetime.date, datetime.time):
-            self._text(b"M", (type_label(kind) + value.isoformat()).encode(), out)
+        elif kind is datetime.datetime:
+            out.update(b"MD" + _date(value) + _time(value))
+        elif kind is datetime.date:
+            out.update(b"Md" + _date(value))
+        elif kind is datetime.time:
+            out.update(b"MT" + _time(value))
         elif kind is datetime.timedelta:
-            self._text(b"M", f"td{value.days},{value.seconds},{value.microseconds}".encode(), out)
+            out.update(b"Mt" + struct.pack("<qII", value.days, value.seconds, value.microseconds))
         elif kind is range:
-            self._text(b"R", f"{value.start},{value.stop},{value.step}".encode(), out)
+            out.update(b"R" + _integer(value.start) + _integer(value.stop) + _integer(value.step))
         elif value is Ellipsis:
             out.update(b"E")
         elif value is NotImplemented:
@@ -307,26 +345,27 @@ class _Walk:
         if kind is types.MethodType:
             # The function's name and the receiver's type. The receiver itself is not read:
             # a method is a way to call something, not a value to compare.
-            out.update(b"Mt")
+            out.update(b"m")
             yield value.__func__, out
             self._text(b"T", type_identity(type(value.__self__)).encode("utf-8", "surrogatepass"), out)
         else:
             # The wrapped callable and every bound argument, read like any other value:
             # secrets in them are redacted the same way. Keywords are an unordered set
             # of names, so they are sorted.
-            out.update(b"Pa")
+            out.update(b"P")
             yield value.func, out
             yield value.args, out
-            out.update(b"%d{" % len(value.keywords))
+            out.update(_u64(len(value.keywords)))
             for key in sorted(value.keywords):
                 if is_secret_name(key):
                     raise _Stop(REDACTED)
                 self._text(b"n", key.encode("utf-8", "surrogatepass"), out)
                 yield value.keywords[key], out
-            out.update(b"}")
 
     def _object(self, value: Any, out: hashlib.blake2b):
-        reading = read(value)
+        unset = object()
+        extra_slots: set[int] = set()
+        reading = read(value, include_unset=True, unset_marker=unset, extra_slots=extra_slots)
         if reading is None:
             if not self.partial_ok:
                 raise _Stop(UNSUPPORTED)
@@ -336,19 +375,27 @@ class _Walk:
             return
         marker = id(value)
         if marker in self.active:
-            out.update(b"@%d;" % (len(self.active) - self.active[marker]))
+            out.update(b"@" + _u64(len(self.active) - self.active[marker]))
             return
         self.active[marker] = len(self.active)
         try:
             self._text(b"O", reading.identity.encode("utf-8", "surrogatepass"), out)
-            out.update(b"%d{" % len(reading.fields))
-            for name, item in reading.fields:
-                if name is not None:
-                    if is_secret_name(name):
+            out.update(_u64(len(reading.fields)))
+            for index, (name, item) in enumerate(reading.fields):
+                if name is None:
+                    out.update(b"p")
+                else:
+                    if item is not unset and is_secret_name(name):
                         raise _Stop(REDACTED)
                     self._text(b"n", name.encode("utf-8", "surrogatepass"), out)
-                yield item, out
-            out.update(b"}")
+                if item is unset:
+                    out.update(b"u")
+                else:
+                    out.update(b"v")
+                    if index in extra_slots:
+                        yield item, out, False
+                    else:
+                        yield item, out
         finally:
             del self.active[marker]
 
@@ -363,9 +410,9 @@ class _Walk:
             return False
         item_kind = next(iter(kinds))
         if item_kind is int:
-            body = "".join(["i%x;" % item for item in value]).encode()
+            body = b"".join(_integer(item) for item in value)
         elif item_kind is float:
-            body = "".join(["f" + item.hex() + ";" for item in value]).encode()
+            body = b"".join(b"f" + _float(item) for item in value)
         elif item_kind is bool:
             body = "".join(["T" if item else "F" for item in value]).encode()
         elif item_kind is str:
@@ -374,36 +421,37 @@ class _Walk:
                 if _looks_secret(item):
                     raise _Stop(REDACTED)
                 data = normalize_temp_paths(item).encode("utf-8", "surrogatepass")
-                pieces.append(b"s%d:%s" % (len(data), data))
+                pieces.append(b"s" + _u64(len(data)) + data)
             body = b"".join(pieces)
         else:
             return False
-        self.visited += len(value)
-        if self.budget.max_nodes is not None and self.visited > self.budget.max_nodes:
+        if self._count_nodes:
+            self.visited += len(value)
+        if self._count_nodes and self.budget.max_nodes is not None and self.visited > self.budget.max_nodes:
             raise _Stop(UNKNOWN)
         out.update(body)
         return True
 
     @staticmethod
     def _text(tag: bytes, data: bytes, out: hashlib.blake2b) -> None:
-        out.update(b"%s%d:%s" % (tag, len(data), data))
+        out.update(tag + _u64(len(data)) + data)
 
     def _container(self, kind: type, value: Any, out: hashlib.blake2b):
         marker = id(value)
         if marker in self.active:
             # A cycle: refer to the ancestor by distance, not by address.
-            out.update(b"@%d;" % (len(self.active) - self.active[marker]))
+            out.update(b"@" + _u64(len(self.active) - self.active[marker]))
             return
         self.active[marker] = len(self.active)
         try:
             if kind is list or kind is tuple:
-                out.update((b"l%d[" if kind is list else b"t%d[") % len(value))
+                out.update((b"l" if kind is list else b"t") + _u64(len(value)))
                 if len(value) < FAST_PATH_MIN or not self._fast_items(value, out):
                     for item in value:
                         yield item, out
             elif kind is dict:
                 # Insertion order is part of the value.
-                out.update(b"d%d{" % len(value))
+                out.update(b"d" + _u64(len(value)))
                 for key, item in value.items():
                     if is_secret_name(key):
                         raise _Stop(REDACTED)
@@ -417,10 +465,9 @@ class _Walk:
                     yield item, part
                     parts.append(part.digest())
                 parts.sort()
-                out.update((b"e%d(" if kind is set else b"z%d(") % len(parts))
+                out.update((b"e" if kind is set else b"z") + _u64(len(parts)))
                 for part in parts:
                     out.update(part)
-            out.update(b"]")
         finally:
             del self.active[marker]
 
@@ -464,7 +511,7 @@ def _sketch(value: Any) -> str:
                 parts.append(f"{_shallow(key)}:{_shallow(item)}")
     elif kind in (set, frozenset):
         parts.append(f"len={len(value)}")
-        parts += sorted(_shallow(item) for item in list(value)[:64])
+        parts += sorted(_shallow(item) for item in value)[:64]
     else:
         reading = read(value)
         if reading is not None:
@@ -526,7 +573,7 @@ def fingerprint_details(
             found = _fingerprint_details(value, budget, partial_ok, sketch=sketch)
             # A normalized temp path is counted for the gaps line on every
             # occurrence, so it is never answered from the cache.
-            if STATS.tmp_normalized == normalized:
+            if STATS.tmp_normalized == normalized and found[0] != REDACTED:
                 if len(_value_cache) >= CACHE_LIMIT:
                     _value_cache.clear()
                 _value_cache[key] = found

@@ -116,7 +116,7 @@ def test_the_caches_are_bounded(monkeypatch):
     for number in range(1000):
         fingerprint_details(number)
         fp._looks_secret(f"word{number}")
-    assert len(fp._value_cache) <= 100 and len(fp._secret_cache) <= 100
+    assert len(fp._value_cache) <= 100
 
 
 def test_temp_paths_are_counted_every_time(monkeypatch):

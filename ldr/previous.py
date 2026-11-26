@@ -71,8 +71,47 @@ def script_run(connection, run_id: str) -> str | None:
         return None
     key = invocation_key(invocation)
     for other, text, status in earlier:
-        if not _skipped(json.loads(status)) and invocation_key(json.loads(text)) == key:
-            return other
+        candidate = json.loads(text)
+        if not _skipped(json.loads(status)) and invocation_key(candidate) == key:
+            return other if candidate.get("signature_version", 1) == invocation.get("signature_version", 1) else None
+    return None
+
+
+def incompatible_reference(connection, run_id: str, reference_id: str) -> str | None:
+    rows = connection.execute("SELECT id, invocation FROM runs WHERE id IN (?, ?)", (run_id, reference_id)).fetchall()
+    invocations = {row[0]: json.loads(row[1]) for row in rows}
+    if run_id not in invocations or reference_id not in invocations:
+        return None
+    old = invocations[reference_id].get("signature_version", 1)
+    current = invocations[run_id].get("signature_version", 1)
+    return f"signature format v{old} is incompatible with v{current}" if old != current else None
+
+
+def incompatible_previous(connection, run_id: str) -> str | None:
+    """Explain an incompatible immediately preceding matching recording, if any."""
+    invocation, earlier = _candidates(connection, run_id)
+    if invocation is None:
+        return None
+    runner = invocation.get("runner")
+    mine = tests_of(connection, run_id) if runner == "pytest" else None
+    for other, text, status in earlier:
+        if _skipped(json.loads(status)):
+            continue
+        candidate = json.loads(text)
+        if runner == "pytest":
+            theirs = tests_of(connection, other)
+            shared = mine & theirs
+            if not shared:
+                shared = {node for node in theirs if re.match(r"gw\d+/", node) and node.split("/", 1)[1] in mine}
+            if candidate.get("runner") != "pytest" or not shared:
+                continue
+        elif invocation_key(candidate) != invocation_key(invocation):
+            continue
+        old = candidate.get("signature_version", 1)
+        current = invocation.get("signature_version", 1)
+        if old != current:
+            return f"signature format v{old} is incompatible with v{current}"
+        return None
     return None
 
 
@@ -137,6 +176,8 @@ def run_for_tests(connection, run_id: str, node_ids, *, replicated=False) -> tup
         else:
             shared = theirs & mine
         if shared:
+            if json.loads(text).get("signature_version", 1) != invocation.get("signature_version", 1):
+                return None, None
             return other, [encode_node_id(node) for node in sorted(shared)]
     return None, None
 

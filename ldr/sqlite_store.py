@@ -14,7 +14,7 @@ from time import monotonic, sleep, time_ns
 from uuid import uuid4
 
 from . import previous
-from .fingerprint import DEFAULT_WALK_CEILING, is_digest
+from .fingerprint import DEFAULT_WALK_CEILING, SIGNATURE_VERSION, is_digest
 from .node import Node, capture_error
 
 DEFAULT_BATCH_SIZE = 1000
@@ -282,6 +282,7 @@ class TraceStore:
         last_calls=DEFAULT_LAST_CALLS,
         walk_ceiling=DEFAULT_WALK_CEILING,
     ):
+        invocation = {**invocation, "signature_version": SIGNATURE_VERSION}
         directory = Path(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
@@ -385,6 +386,11 @@ class TraceStore:
                     run_id, roots = previous.run_for_tests(
                         connection, self.run_id, node_ids, replicated=replicated
                     )
+                if run_id is not None:
+                    current = connection.execute("SELECT invocation FROM runs WHERE id = ?", (self.run_id,)).fetchone()
+                    earlier = connection.execute("SELECT invocation FROM runs WHERE id = ?", (run_id,)).fetchone()
+                    if not current or not earlier or json.loads(current[0]).get("signature_version", 1) != json.loads(earlier[0]).get("signature_version", 1):
+                        run_id = None
                 if run_id is not None:
                     reference = previous.load(connection, run_id, roots)
                     row = connection.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()

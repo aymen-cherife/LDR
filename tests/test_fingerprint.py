@@ -227,11 +227,11 @@ def test_structural_readers_reuse_and_refresh_the_layout(monkeypatch):
         return original(cls, *args)
 
     monkeypatch.setattr(structure, "_discover", discover)
-    mixed = ("b708e14f5d46396e4070956471460969", "Slots(inherited=3, __hidden=5, extra=7)")
-    edited = ("98415b3f7b3f5873fc5b3038e8d3e213", "Slots(inherited=3, extra=7)")
-    expected = dict(mixed=mixed, reuse=mixed, edited_slots=edited, restored_slots=mixed,
+    mixed = ("61f14c9d3dfeec7e903619d5f977d8e5", "Slots(inherited=3, __hidden=5, extra=7)")
+    edited = ("df8fa61257d4efa668c1a380f5b70e54", "Slots(inherited=3, extra=7)")
+    expected = dict(mixed=mixed, reuse=mixed, edited_slots=(mixed[0], edited[1]), restored_slots=mixed,
                     replaced_descriptor=edited,
-                    reassigned_class=("c25803a64a7778ab901d33e191a87df7", "Other(inherited=3, extra=7)"))
+                    reassigned_class=("6b009810f88ec8bf03e56100d7a67562", "Other(inherited=3, extra=7)"))
     samples = _layout_samples()
     # Keep the recorder active when the fixture edits its class.
     import fixtures.values as v
@@ -262,11 +262,11 @@ def test_existing_fingerprint_encoding_bytes():
         list(range(-33, 33)), ["\u00e9\ud800"] * 40, cycle,
     )
     assert [fingerprint(value) for value in values] == [
-        "8e97ee16bc25f02df4db15a2048a1635",
-        "344245e3cdf913d7384948924ca7f9ab",
-        "7b72ef8c37f7518415b6d9338cab2f58",
-        "8ae5c47f82b7cf1d45e0efd3b2e38dda",
-        "bbf4d489e5714af2668ccb14e694aa4f",
+        "6a6f792bd69d4eb09254da02f118946f",
+        "1afed85c762282acfa3edc8866eb5a59",
+        "7e60a5288b03d10225475b18f185b776",
+        "dbd91b84d1a9a15d94482db0c782a727",
+        "ef6f463217b6944f73e220a3725ebeb7",
     ]
 
 
@@ -302,7 +302,7 @@ def test_only_the_node_budget_cuts_off_the_walk():
     deep = 1
     for _ in range(10_000):
         deep = [deep]
-    expected = blake2b(b"l1[" * 10_000 + b"i1;" + b"]" * 10_000, digest_size=16).hexdigest()
+    expected = blake2b((b"l" + (1).to_bytes(8, "little")) * 10_000 + b"i" + (1).to_bytes(8, "little", signed=True), digest_size=16).hexdigest()
     assert fingerprint(deep) == expected
 
 

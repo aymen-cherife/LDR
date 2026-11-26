@@ -1484,6 +1484,18 @@ def main(argv=None) -> int:
                         for key in ("started", "stored", "unfinished", "write_failed")
                     },
                 }
+            if not status.get("reference"):
+                try:
+                    from contextlib import closing
+                    with closing(store._connect()) as connection:
+                        if rerun_plan is not None:
+                            mismatch = previous.incompatible_reference(connection, store.run_id, rerun_plan["source_run"])
+                        else:
+                            mismatch = previous.incompatible_previous(connection, store.run_id)
+                    if mismatch:
+                        status["previous_unavailable"] = mismatch
+                except (OSError, sqlite3.Error, ValueError):
+                    pass
             store.finish(status)
             # The slowdown and the hot functions are for LDR's developers: they stay in the
             # stored run and are not part of what the agent is shown.
@@ -1526,6 +1538,8 @@ def main(argv=None) -> int:
         )
         if reference_status := status.get("reference"):
             redaction_note += _previous_run_note(reference_status)
+        elif status.get("previous_unavailable"):
+            redaction_note += f"PREVIOUS RUN: none ({status['previous_unavailable']}).\n"
         elif rerun_plan is None and requested_mode in {"run", "pytest", "module"}:
             redaction_note += "PREVIOUS RUN: none (no earlier run of this target to compare with).\n"
         if status.get("too_large"):

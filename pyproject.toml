@@ -10,8 +10,8 @@ requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
-pytest = ["pytest>=7"]
+test = ["pytest>=7", "rich==15.0.0"]
+pytest = ["pytest>=7", "rich==15.0.0"]
 
 [project.scripts]
 ldr = "ldr.launch:main"
