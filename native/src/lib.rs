@@ -7,28 +7,36 @@ use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString,
     PyTuple,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+type Digest = Rc<RefCell<Blake2bVar>>;
 
-#[pyclass]
+#[pyclass(unsendable)]
 struct Hash {
-    state: Blake2bVar,
+    state: Digest,
 }
 
 impl Hash {
     fn new() -> Self {
         Self {
-            state: Blake2bVar::new(16).unwrap(),
+            state: Rc::new(RefCell::new(Blake2bVar::new(16).unwrap())),
         }
     }
     fn bytes(&self) -> Vec<u8> {
         let mut result = vec![0; 16];
-        self.state.clone().finalize_variable(&mut result).unwrap();
+        self.state
+            .borrow()
+            .clone()
+            .finalize_variable(&mut result)
+            .unwrap();
         result
     }
 }
 #[pymethods]
 impl Hash {
     fn update(&mut self, data: &[u8]) {
-        self.state.update(data);
+        self.state.borrow_mut().update(data);
     }
     fn digest<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.bytes())
@@ -39,19 +47,19 @@ impl Hash {
 }
 
 enum Task {
-    Node(Py<PyAny>, Py<Hash>),
+    Node(Py<PyAny>, Digest),
     Children(Py<PyAny>),
-    Items(Py<PyAny>, Py<Hash>),
-    DictItems(Py<PyAny>, Py<Hash>),
-    SetItems(Py<PyAny>, Py<Hash>, Vec<Py<Hash>>, bool),
-    Close(usize, Py<Hash>),
-    Raw(Vec<u8>, Py<Hash>),
-    ObjectClose(usize, Py<Hash>),
-    Fields(std::vec::IntoIter<(Option<Py<PyAny>>, Py<PyAny>)>, Py<Hash>),
+    Items(Py<PyAny>, Digest),
+    DictItems(Py<PyAny>, Digest),
+    SetItems(Py<PyAny>, Digest, Vec<Digest>, bool),
+    Close(usize, Digest),
+    Raw(Vec<u8>, Digest),
+    ObjectClose(usize, Digest),
+    Fields(std::vec::IntoIter<(Option<Py<PyAny>>, Py<PyAny>)>, Digest),
 }
 
-fn write(py: Python<'_>, hash: &Py<Hash>, data: &[u8]) {
-    hash.borrow_mut(py).state.update(data);
+fn write(_py: Python<'_>, hash: &Digest, data: &[u8]) {
+    hash.borrow_mut().update(data);
 }
 
 fn secret_text(
@@ -417,345 +425,389 @@ fn leaf_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u
 
 #[pyfunction]
 fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<String> {
-    let hash = Py::new(py, Hash::new())?;
-    let mut stack = vec![Task::Node(value, hash.clone_ref(py))];
-    let active = walk.getattr("active")?.downcast_into::<PyDict>()?;
+    let hash = Hash::new().state;
+    let mut stack = vec![Task::Node(value, hash.clone())];
+    let mut active: HashMap<usize, usize> = walk.getattr("active")?.extract()?;
+    let initial_active = active.clone();
+    let mut visited: usize = walk.getattr("visited")?.extract()?;
+    let mut immutable: bool = walk.getattr("immutable")?.extract()?;
+    let mut partial: bool = walk.getattr("partial")?.extract()?;
+    macro_rules! to_python {
+        () => {{
+            walk.setattr("visited", visited)?;
+            walk.setattr("immutable", immutable)?;
+            walk.setattr("partial", partial)?;
+            let dict = walk.getattr("active")?.downcast_into::<PyDict>()?;
+            dict.clear();
+            for (key, value) in &active {
+                dict.set_item(*key, *value)?;
+            }
+        }};
+    }
+    macro_rules! from_python {
+        () => {{
+            visited = walk.getattr("visited")?.extract()?;
+            immutable = walk.getattr("immutable")?.extract()?;
+            partial = walk.getattr("partial")?.extract()?;
+            active = walk.getattr("active")?.extract()?;
+        }};
+    }
+
     let ceiling: Option<usize> = walk.getattr("budget")?.getattr("max_nodes")?.extract()?;
     let fingerprint = py.import("ldr.fingerprint")?;
     fingerprint.getattr("_current_caches")?.call0()?;
     let secret = py.import("ldr.redact")?.getattr("is_secret_name")?;
-    while let Some(task) = stack.pop() {
-        match task {
-            Task::Raw(bytes, out) => write(py, &out, &bytes),
-            Task::ObjectClose(marker, out) => {
-                write(py, &out, b"}");
-                active.del_item(marker)?;
-            }
-            Task::Fields(mut fields, out) => {
-                if let Some((name, value)) = fields.next() {
-                    if let Some(name) = name {
-                        if secret.call1((name.bind(py),))?.is_truthy()? {
+    let outcome: PyResult<()> = (|| {
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Raw(bytes, out) => write(py, &out, &bytes),
+                Task::ObjectClose(marker, out) => {
+                    write(py, &out, b"}");
+                    active.remove(&marker);
+                }
+                Task::Fields(mut fields, out) => {
+                    if let Some((name, value)) = fields.next() {
+                        if let Some(name) = name {
+                            if secret.call1((name.bind(py),))?.is_truthy()? {
+                                return Err(PyErr::from_value(
+                                    fingerprint.getattr("_Stop")?.call1(("redacted",))?,
+                                ));
+                            }
+                            let data = name
+                                .bind(py)
+                                .call_method1("encode", ("utf-8", "surrogatepass"))?;
+                            let bytes = data.downcast::<PyBytes>()?.as_bytes();
+                            write(py, &out, format!("n{}:", bytes.len()).as_bytes());
+                            write(py, &out, bytes);
+                        }
+                        stack.push(Task::Fields(fields, out.clone()));
+                        stack.push(Task::Node(value, out));
+                    }
+                }
+                Task::Close(marker, out) => {
+                    write(py, &out, b"]");
+                    active.remove(&marker);
+                }
+                Task::Children(iterator) => {
+                    to_python!();
+                    let next = iterator.bind(py).try_iter()?.next();
+                    from_python!();
+                    if let Some(child) = next {
+                        let child = child?;
+                        let value = child.get_item(0)?.unbind();
+                        let out = child.get_item(1)?.extract::<PyRef<Hash>>()?.state.clone();
+                        stack.push(Task::Children(iterator));
+                        stack.push(Task::Node(value, out));
+                    }
+                }
+                Task::Items(iterator, out) => {
+                    if let Some(child) = iterator.bind(py).try_iter()?.next() {
+                        let child = child?.unbind();
+                        stack.push(Task::Items(iterator, out.clone()));
+                        stack.push(Task::Node(child, out));
+                    }
+                }
+                Task::DictItems(iterator, out) => {
+                    if let Some(pair) = iterator.bind(py).try_iter()?.next() {
+                        let pair = pair?;
+                        let key = pair.get_item(0)?;
+                        if secret.call1((&key,))?.is_truthy()? {
                             return Err(PyErr::from_value(
                                 fingerprint.getattr("_Stop")?.call1(("redacted",))?,
                             ));
                         }
-                        let data = name
-                            .bind(py)
-                            .call_method1("encode", ("utf-8", "surrogatepass"))?;
-                        let bytes = data.downcast::<PyBytes>()?.as_bytes();
-                        write(py, &out, format!("n{}:", bytes.len()).as_bytes());
-                        write(py, &out, bytes);
-                    }
-                    stack.push(Task::Fields(fields, out.clone_ref(py)));
-                    stack.push(Task::Node(value, out));
-                }
-            }
-            Task::Close(marker, out) => {
-                write(py, &out, b"]");
-                active.del_item(marker)?;
-            }
-            Task::Children(iterator) => {
-                if let Some(child) = iterator.bind(py).try_iter()?.next() {
-                    let child = child?;
-                    let value = child.get_item(0)?.unbind();
-                    let out = child.get_item(1)?.extract::<Py<Hash>>()?;
-                    stack.push(Task::Children(iterator));
-                    stack.push(Task::Node(value, out));
-                }
-            }
-            Task::Items(iterator, out) => {
-                if let Some(child) = iterator.bind(py).try_iter()?.next() {
-                    let child = child?.unbind();
-                    stack.push(Task::Items(iterator, out.clone_ref(py)));
-                    stack.push(Task::Node(child, out));
-                }
-            }
-            Task::DictItems(iterator, out) => {
-                if let Some(pair) = iterator.bind(py).try_iter()?.next() {
-                    let pair = pair?;
-                    let key = pair.get_item(0)?;
-                    if secret.call1((&key,))?.is_truthy()? {
-                        return Err(PyErr::from_value(
-                            fingerprint.getattr("_Stop")?.call1(("redacted",))?,
-                        ));
-                    }
-                    let value = pair.get_item(1)?.unbind();
-                    stack.push(Task::DictItems(iterator, out.clone_ref(py)));
-                    stack.push(Task::Node(value, out.clone_ref(py)));
-                    stack.push(Task::Node(key.unbind(), out));
-                }
-            }
-            Task::SetItems(iterator, out, mut parts, frozen) => {
-                if let Some(child) = iterator.bind(py).try_iter()?.next() {
-                    let child = child?.unbind();
-                    let part = Py::new(py, Hash::new())?;
-                    parts.push(part.clone_ref(py));
-                    stack.push(Task::SetItems(iterator, out, parts, frozen));
-                    stack.push(Task::Node(child, part));
-                } else {
-                    let mut bytes: Vec<_> = parts.iter().map(|p| p.borrow(py).bytes()).collect();
-                    bytes.sort();
-                    write(
-                        py,
-                        &out,
-                        format!("{}{}(", if frozen { "z" } else { "e" }, bytes.len()).as_bytes(),
-                    );
-                    for part in bytes {
-                        write(py, &out, &part);
+                        let value = pair.get_item(1)?.unbind();
+                        stack.push(Task::DictItems(iterator, out.clone()));
+                        stack.push(Task::Node(value, out.clone()));
+                        stack.push(Task::Node(key.unbind(), out));
                     }
                 }
-            }
-            Task::Node(value, out) => {
-                let value = value.bind(py);
-                let kind = value.get_type();
-                let list = kind.is(&py.get_type::<PyList>());
-                let tuple = kind.is(&py.get_type::<PyTuple>());
-                let dict = kind.is(&py.get_type::<PyDict>());
-                let set = kind.is(&py.get_type::<PySet>());
-                let frozen = kind.is(&py.get_type::<PyFrozenSet>());
-                let text = kind.is(&py.get_type::<PyString>());
-                let bytes =
-                    kind.is(&py.get_type::<PyBytes>()) || kind.is(&py.get_type::<PyByteArray>());
-                let scalar = bytes
-                    || text
-                    || value.is_none()
-                    || kind.is(&py.get_type::<PyBool>())
-                    || kind.is(&py.get_type::<PyInt>())
-                    || kind.is(&py.get_type::<PyFloat>());
-                if !(scalar || list || tuple || dict || set || frozen) {
-                    let method = kind.is(&py.import("types")?.getattr("MethodType")?);
-                    let partial = kind.is(&py.import("functools")?.getattr("partial")?);
-                    if method || partial {
-                        let visited: usize = walk.getattr("visited")?.extract()?;
-                        walk.setattr("visited", visited + 1)?;
-                        if ceiling.is_some_and(|limit| visited + 1 > limit) {
-                            return Err(PyErr::from_value(
-                                fingerprint.getattr("_Stop")?.call1(("unknown",))?,
-                            ));
-                        }
-                        walk.setattr("immutable", false)?;
-                        if method {
-                            write(py, &out, b"Mt");
-                            let receiver = value.getattr("__self__")?;
-                            stack.push(Task::Raw(
-                                tagged("T", &identity(py, receiver.get_type().as_any())?),
-                                out.clone_ref(py),
-                            ));
-                            stack.push(Task::Node(value.getattr("__func__")?.unbind(), out));
-                        } else {
-                            write(py, &out, b"Pa");
-                            let kwargs = value.getattr("keywords")?.downcast_into::<PyDict>()?;
-                            let keys = py
-                                .import("builtins")?
-                                .getattr("sorted")?
-                                .call1((&kwargs,))?;
-                            let mut fields = Vec::new();
-                            for key in keys.try_iter()? {
-                                let key = key?;
-                                fields.push((
-                                    Some(key.clone().unbind()),
-                                    kwargs.get_item(&key)?.unwrap().unbind(),
-                                ));
-                            }
-                            stack.push(Task::Raw(b"}".to_vec(), out.clone_ref(py)));
-                            stack.push(Task::Fields(fields.into_iter(), out.clone_ref(py)));
-                            stack.push(Task::Raw(
-                                format!("{}{{", kwargs.len()).into_bytes(),
-                                out.clone_ref(py),
-                            ));
-                            stack.push(Task::Node(
-                                value.getattr("args")?.unbind(),
-                                out.clone_ref(py),
-                            ));
-                            stack.push(Task::Node(value.getattr("func")?.unbind(), out));
-                        }
-                        continue;
-                    }
-                    if let Some(bytes) = leaf_bytes(py, value)? {
-                        let visited: usize = walk.getattr("visited")?.extract()?;
-                        walk.setattr("visited", visited + 1)?;
-                        if ceiling.is_some_and(|limit| visited + 1 > limit) {
-                            return Err(PyErr::from_value(
-                                fingerprint.getattr("_Stop")?.call1(("unknown",))?,
-                            ));
-                        }
-                        if !kind.is(&py.get_type::<pyo3::types::PyComplex>()) {
-                            walk.setattr("immutable", false)?;
-                        }
-                        write(py, &out, &bytes);
-                        continue;
-                    }
-                    // Known leaves retain their distinct tags. Other safe layouts are read here.
-                    let types = py.import("types")?;
-                    let known = kind.is(&py.get_type::<pyo3::types::PyType>())
-                        || kind.is(&py.import("abc")?.getattr("ABCMeta")?)
-                        || kind.is(&types.getattr("FunctionType")?)
-                        || kind.is(&types.getattr("BuiltinFunctionType")?);
-                    let known = known
-                        || kind.is(&py.import("functools")?.getattr("partial")?)
-                        || kind.is(&types.getattr("MethodType")?)
-                        || kind.is(&py.import("decimal")?.getattr("Decimal")?)
-                        || ["datetime", "date", "time", "timedelta"]
+                Task::SetItems(iterator, out, mut parts, frozen) => {
+                    if let Some(child) = iterator.bind(py).try_iter()?.next() {
+                        let child = child?.unbind();
+                        let part = Hash::new().state;
+                        parts.push(part.clone());
+                        stack.push(Task::SetItems(iterator, out, parts, frozen));
+                        stack.push(Task::Node(child, part));
+                    } else {
+                        let mut bytes: Vec<_> = parts
                             .iter()
-                            .any(|name| {
-                                kind.is(&py.import("datetime").unwrap().getattr(*name).unwrap())
+                            .map(|p| {
+                                let mut b = vec![0; 16];
+                                p.borrow().clone().finalize_variable(&mut b).unwrap();
+                                b
                             })
-                        || kind.is(&py.get_type::<pyo3::types::PyComplex>())
-                        || kind.is(&py.import("builtins")?.getattr("range")?)
-                        || value.is(&py.Ellipsis())
-                        || value.is(&py.NotImplemented());
-                    if !known {
-                        if let Ok(Some((identity, fields))) = object_fields(py, value) {
-                            let visited: usize = walk.getattr("visited")?.extract()?;
-                            walk.setattr("visited", visited + 1)?;
-                            if ceiling.is_some_and(|limit| visited + 1 > limit) {
-                                return Err(PyErr::from_value(
-                                    fingerprint.getattr("_Stop")?.call1(("unknown",))?,
-                                ));
-                            }
-                            walk.setattr("immutable", false)?;
-                            let marker = value.as_ptr() as usize;
-                            if let Some(depth) = active.get_item(marker)? {
-                                let depth: usize = depth.extract()?;
-                                write(py, &out, format!("@{};", active.len() - depth).as_bytes());
-                                continue;
-                            }
-                            active.set_item(marker, active.len())?;
-                            write(py, &out, format!("O{}:", identity.len()).as_bytes());
-                            write(py, &out, &identity);
-                            write(py, &out, format!("{}{{", fields.len()).as_bytes());
-                            stack.push(Task::ObjectClose(marker, out.clone_ref(py)));
-                            stack.push(Task::Fields(fields.into_iter(), out));
-                            continue;
+                            .collect();
+                        bytes.sort();
+                        write(
+                            py,
+                            &out,
+                            format!("{}{}(", if frozen { "z" } else { "e" }, bytes.len())
+                                .as_bytes(),
+                        );
+                        for part in bytes {
+                            write(py, &out, &part);
                         }
                     }
-                    let count: usize = fingerprint
-                        .getattr("STATS")?
-                        .getattr("python_nodes")?
-                        .extract()?;
-                    fingerprint
-                        .getattr("STATS")?
-                        .setattr("python_nodes", count + 1)?;
-                    let children = walk.call_method1("_encode", (value, out.bind(py)))?;
-                    if !children.is_none() {
-                        stack.push(Task::Children(children.unbind()));
-                    }
-                    continue;
                 }
-                let visited: usize = walk.getattr("visited")?.extract()?;
-                walk.setattr("visited", visited + 1)?;
-                if ceiling.is_some_and(|limit| visited + 1 > limit) {
-                    return Err(PyErr::from_value(
-                        fingerprint.getattr("_Stop")?.call1(("unknown",))?,
-                    ));
-                }
-                if bytes {
-                    let decoded = value.call_method1("decode", ("latin-1",))?;
-                    secret_text(py, &decoded, &fingerprint)?;
-                    let data = py.get_type::<PyBytes>().call1((value,))?;
-                    let data = data.downcast::<PyBytes>()?.as_bytes();
-                    let mutable = kind.is(&py.get_type::<PyByteArray>());
-                    if mutable {
-                        walk.setattr("immutable", false)?;
-                    }
-                    write(
-                        py,
-                        &out,
-                        format!("{}{}:", if mutable { "B" } else { "b" }, data.len()).as_bytes(),
-                    );
-                    write(py, &out, data);
-                } else if text {
-                    write(py, &out, &text_bytes(py, value, &fingerprint)?);
-                } else if value.is_none() {
-                    write(py, &out, b"N");
-                } else if kind.is(&py.get_type::<PyBool>()) {
-                    write(py, &out, if value.is_truthy()? { b"T" } else { b"F" });
-                } else if kind.is(&py.get_type::<PyInt>()) {
-                    let hex = py
-                        .import("builtins")?
-                        .getattr("format")?
-                        .call1((value, "x"))?
-                        .extract::<String>()?;
-                    write(py, &out, format!("i{hex};").as_bytes());
-                } else if kind.is(&py.get_type::<PyFloat>()) {
-                    let hex: String = value.call_method0("hex")?.extract()?;
-                    write(py, &out, format!("f{hex};").as_bytes());
-                } else {
-                    if list || dict || set {
-                        walk.setattr("immutable", false)?;
-                    }
-                    let marker = value.as_ptr() as usize;
-                    if let Some(depth) = active.get_item(marker)? {
-                        let depth: usize = depth.extract()?;
-                        write(py, &out, format!("@{};", active.len() - depth).as_bytes());
-                        continue;
-                    }
-                    active.set_item(marker, active.len())?;
-                    stack.push(Task::Close(marker, out.clone_ref(py)));
-                    // Python's string bulk path checks redaction before its budget check.
-                    // Keep that exact ordering, including normalization counters.
-                    if (list || tuple)
-                        && value.len()?
-                            >= fingerprint.getattr("FAST_PATH_MIN")?.extract::<usize>()?
-                    {
-                        let strings = value.try_iter()?.all(|item| {
-                            item.map(|v| v.get_type().is(&py.get_type::<PyString>()))
-                                .unwrap_or(false)
-                        });
-                        if strings {
-                            write(
-                                py,
-                                &out,
-                                format!("{}{}[", if list { "l" } else { "t" }, value.len()?)
-                                    .as_bytes(),
-                            );
-                            let mut body = Vec::new();
-                            for item in value.try_iter()? {
-                                body.extend(text_bytes(py, &item?, &fingerprint)?);
-                            }
-                            let visited: usize = walk.getattr("visited")?.extract()?;
-                            let visited = visited + value.len()?;
-                            walk.setattr("visited", visited)?;
+                Task::Node(value, out) => {
+                    let value = value.bind(py);
+                    let kind = value.get_type();
+                    let list = kind.is(&py.get_type::<PyList>());
+                    let tuple = kind.is(&py.get_type::<PyTuple>());
+                    let dict = kind.is(&py.get_type::<PyDict>());
+                    let set = kind.is(&py.get_type::<PySet>());
+                    let frozen = kind.is(&py.get_type::<PyFrozenSet>());
+                    let text = kind.is(&py.get_type::<PyString>());
+                    let bytes = kind.is(&py.get_type::<PyBytes>())
+                        || kind.is(&py.get_type::<PyByteArray>());
+                    let scalar = bytes
+                        || text
+                        || value.is_none()
+                        || kind.is(&py.get_type::<PyBool>())
+                        || kind.is(&py.get_type::<PyInt>())
+                        || kind.is(&py.get_type::<PyFloat>());
+                    if !(scalar || list || tuple || dict || set || frozen) {
+                        let method = kind.is(&py.import("types")?.getattr("MethodType")?);
+                        let partial = kind.is(&py.import("functools")?.getattr("partial")?);
+                        if method || partial {
+                            visited += 1;
                             if ceiling.is_some_and(|limit| visited > limit) {
                                 return Err(PyErr::from_value(
                                     fingerprint.getattr("_Stop")?.call1(("unknown",))?,
                                 ));
                             }
-                            write(py, &out, &body);
+                            immutable = false;
+                            if method {
+                                write(py, &out, b"Mt");
+                                let receiver = value.getattr("__self__")?;
+                                stack.push(Task::Raw(
+                                    tagged("T", &identity(py, receiver.get_type().as_any())?),
+                                    out.clone(),
+                                ));
+                                stack.push(Task::Node(value.getattr("__func__")?.unbind(), out));
+                            } else {
+                                write(py, &out, b"Pa");
+                                let kwargs =
+                                    value.getattr("keywords")?.downcast_into::<PyDict>()?;
+                                let keys = py
+                                    .import("builtins")?
+                                    .getattr("sorted")?
+                                    .call1((&kwargs,))?;
+                                let mut fields = Vec::new();
+                                for key in keys.try_iter()? {
+                                    let key = key?;
+                                    fields.push((
+                                        Some(key.clone().unbind()),
+                                        kwargs.get_item(&key)?.unwrap().unbind(),
+                                    ));
+                                }
+                                stack.push(Task::Raw(b"}".to_vec(), out.clone()));
+                                stack.push(Task::Fields(fields.into_iter(), out.clone()));
+                                stack.push(Task::Raw(
+                                    format!("{}{{", kwargs.len()).into_bytes(),
+                                    out.clone(),
+                                ));
+                                stack
+                                    .push(Task::Node(value.getattr("args")?.unbind(), out.clone()));
+                                stack.push(Task::Node(value.getattr("func")?.unbind(), out));
+                            }
                             continue;
                         }
+                        if let Some(bytes) = leaf_bytes(py, value)? {
+                            visited += 1;
+                            if ceiling.is_some_and(|limit| visited > limit) {
+                                return Err(PyErr::from_value(
+                                    fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                ));
+                            }
+                            if !kind.is(&py.get_type::<pyo3::types::PyComplex>()) {
+                                immutable = false;
+                            }
+                            write(py, &out, &bytes);
+                            continue;
+                        }
+                        // Known leaves retain their distinct tags. Other safe layouts are read here.
+                        let types = py.import("types")?;
+                        let known = kind.is(&py.get_type::<pyo3::types::PyType>())
+                            || kind.is(&py.import("abc")?.getattr("ABCMeta")?)
+                            || kind.is(&types.getattr("FunctionType")?)
+                            || kind.is(&types.getattr("BuiltinFunctionType")?);
+                        let known = known
+                            || kind.is(&py.import("functools")?.getattr("partial")?)
+                            || kind.is(&types.getattr("MethodType")?)
+                            || kind.is(&py.import("decimal")?.getattr("Decimal")?)
+                            || ["datetime", "date", "time", "timedelta"]
+                                .iter()
+                                .any(|name| {
+                                    kind.is(&py.import("datetime").unwrap().getattr(*name).unwrap())
+                                })
+                            || kind.is(&py.get_type::<pyo3::types::PyComplex>())
+                            || kind.is(&py.import("builtins")?.getattr("range")?)
+                            || value.is(&py.Ellipsis())
+                            || value.is(&py.NotImplemented());
+                        if !known {
+                            if let Ok(Some((identity, fields))) = object_fields(py, value) {
+                                visited += 1;
+                                if ceiling.is_some_and(|limit| visited > limit) {
+                                    return Err(PyErr::from_value(
+                                        fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                    ));
+                                }
+                                immutable = false;
+                                let marker = value.as_ptr() as usize;
+                                if let Some(&depth) = active.get(&marker) {
+                                    write(
+                                        py,
+                                        &out,
+                                        format!("@{};", active.len() - depth).as_bytes(),
+                                    );
+                                    continue;
+                                }
+                                active.insert(marker, active.len());
+                                write(py, &out, format!("O{}:", identity.len()).as_bytes());
+                                write(py, &out, &identity);
+                                write(py, &out, format!("{}{{", fields.len()).as_bytes());
+                                stack.push(Task::ObjectClose(marker, out.clone()));
+                                stack.push(Task::Fields(fields.into_iter(), out));
+                                continue;
+                            }
+                        }
+                        let count: usize = fingerprint
+                            .getattr("STATS")?
+                            .getattr("python_nodes")?
+                            .extract()?;
+                        fingerprint
+                            .getattr("STATS")?
+                            .setattr("python_nodes", count + 1)?;
+                        to_python!();
+                        let wrapped = Py::new(py, Hash { state: out.clone() })?;
+                        let children = walk.call_method1("_encode", (value, wrapped));
+                        from_python!();
+                        let children = children?;
+                        if !children.is_none() {
+                            stack.push(Task::Children(children.unbind()));
+                        }
+                        continue;
                     }
-                    if set || frozen {
-                        stack.push(Task::SetItems(
-                            value.try_iter()?.into_any().unbind(),
-                            out,
-                            Vec::new(),
-                            frozen,
+                    visited += 1;
+                    if ceiling.is_some_and(|limit| visited > limit) {
+                        return Err(PyErr::from_value(
+                            fingerprint.getattr("_Stop")?.call1(("unknown",))?,
                         ));
+                    }
+                    if bytes {
+                        let decoded = value.call_method1("decode", ("latin-1",))?;
+                        secret_text(py, &decoded, &fingerprint)?;
+                        let data = py.get_type::<PyBytes>().call1((value,))?;
+                        let data = data.downcast::<PyBytes>()?.as_bytes();
+                        let mutable = kind.is(&py.get_type::<PyByteArray>());
+                        if mutable {
+                            immutable = false;
+                        }
+                        write(
+                            py,
+                            &out,
+                            format!("{}{}:", if mutable { "B" } else { "b" }, data.len())
+                                .as_bytes(),
+                        );
+                        write(py, &out, data);
+                    } else if text {
+                        write(py, &out, &text_bytes(py, value, &fingerprint)?);
+                    } else if value.is_none() {
+                        write(py, &out, b"N");
+                    } else if kind.is(&py.get_type::<PyBool>()) {
+                        write(py, &out, if value.is_truthy()? { b"T" } else { b"F" });
+                    } else if kind.is(&py.get_type::<PyInt>()) {
+                        let hex = py
+                            .import("builtins")?
+                            .getattr("format")?
+                            .call1((value, "x"))?
+                            .extract::<String>()?;
+                        write(py, &out, format!("i{hex};").as_bytes());
+                    } else if kind.is(&py.get_type::<PyFloat>()) {
+                        let hex: String = value.call_method0("hex")?.extract()?;
+                        write(py, &out, format!("f{hex};").as_bytes());
                     } else {
-                        let tag = if list {
-                            "l"
-                        } else if tuple {
-                            "t"
-                        } else {
-                            "d"
-                        };
-                        let open = if dict { "{" } else { "[" };
-                        write(py, &out, format!("{tag}{}{open}", value.len()?).as_bytes());
-                        if dict {
-                            stack.push(Task::DictItems(
-                                value.call_method0("items")?.try_iter()?.into_any().unbind(),
+                        if list || dict || set {
+                            immutable = false;
+                        }
+                        let marker = value.as_ptr() as usize;
+                        if let Some(&depth) = active.get(&marker) {
+                            write(py, &out, format!("@{};", active.len() - depth).as_bytes());
+                            continue;
+                        }
+                        active.insert(marker, active.len());
+                        stack.push(Task::Close(marker, out.clone()));
+                        // Python's string bulk path checks redaction before its budget check.
+                        // Keep that exact ordering, including normalization counters.
+                        if (list || tuple)
+                            && value.len()?
+                                >= fingerprint.getattr("FAST_PATH_MIN")?.extract::<usize>()?
+                        {
+                            let strings = value.try_iter()?.all(|item| {
+                                item.map(|v| v.get_type().is(&py.get_type::<PyString>()))
+                                    .unwrap_or(false)
+                            });
+                            if strings {
+                                write(
+                                    py,
+                                    &out,
+                                    format!("{}{}[", if list { "l" } else { "t" }, value.len()?)
+                                        .as_bytes(),
+                                );
+                                let mut body = Vec::new();
+                                for item in value.try_iter()? {
+                                    body.extend(text_bytes(py, &item?, &fingerprint)?);
+                                }
+                                visited += value.len()?;
+                                if ceiling.is_some_and(|limit| visited > limit) {
+                                    return Err(PyErr::from_value(
+                                        fingerprint.getattr("_Stop")?.call1(("unknown",))?,
+                                    ));
+                                }
+                                write(py, &out, &body);
+                                continue;
+                            }
+                        }
+                        if set || frozen {
+                            stack.push(Task::SetItems(
+                                value.try_iter()?.into_any().unbind(),
                                 out,
+                                Vec::new(),
+                                frozen,
                             ));
                         } else {
-                            stack.push(Task::Items(value.try_iter()?.into_any().unbind(), out));
+                            let tag = if list {
+                                "l"
+                            } else if tuple {
+                                "t"
+                            } else {
+                                "d"
+                            };
+                            let open = if dict { "{" } else { "[" };
+                            write(py, &out, format!("{tag}{}{open}", value.len()?).as_bytes());
+                            if dict {
+                                stack.push(Task::DictItems(
+                                    value.call_method0("items")?.try_iter()?.into_any().unbind(),
+                                    out,
+                                ));
+                            } else {
+                                stack.push(Task::Items(value.try_iter()?.into_any().unbind(), out));
+                            }
                         }
                     }
                 }
             }
         }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        active = initial_active;
     }
-    let result = hash.borrow(py).hexdigest();
+    to_python!();
+    outcome?;
+    let result = Hash { state: hash }.hexdigest();
     Ok(result)
 }
 

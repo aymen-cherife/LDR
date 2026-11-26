@@ -211,3 +211,28 @@ def test_native_callable_and_exception_fields(value):
     before=fp.STATS.python_nodes
     assert result(value, True)==result(value,False)
     assert fp.STATS.python_nodes==before
+
+
+def test_native_walk_state_access_is_independent_of_node_count():
+    class CountingWalk(fp._Walk):
+        accesses = 0
+
+        def __getattribute__(self, name):
+            if name in ('visited', 'active', 'immutable', 'partial'):
+                type(self).accesses += 1
+            return super().__getattribute__(name)
+
+    walk = CountingWalk(fp.DEFAULT_BUDGET)
+    native.encode(walk, list(range(1000)))
+    assert CountingWalk.accesses < 20
+    assert walk.visited == 1001
+
+
+def test_native_clears_active_path_on_walk_failure():
+    import threading
+    value = [threading.Lock()]
+    walk = fp._Walk(fp.DEFAULT_BUDGET)
+    with pytest.raises(fp._Stop):
+        native.encode(walk, value)
+    assert walk.active == {}
+    assert walk.visited == 2
