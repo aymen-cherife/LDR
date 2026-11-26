@@ -67,7 +67,6 @@ def one(root: Path, command: list[str], env: dict) -> dict:
         "supervisor_peak_rss_bytes": supervisor["peak_rss_bytes"],
         "python_version": program["python"],
         "machine": status["machine"]["summary"],
-        "python_reader_nodes": status.get("native_reader", {}).get("python_nodes", 0),
     }
 
 

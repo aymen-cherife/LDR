@@ -124,34 +124,34 @@ def comparison(folder, baseline, work):
     return code or cleaned
 
 
-def controlled_comparison(python_reader, native_reader, work, fixture="rich"):
-    """Measure both readers against copies of one recording at the same path."""
+def controlled_comparison(baseline, work, fixture="rich"):
+    """Compare the baseline and current commit against the same prior recording."""
     import overhead
     import run_phases
 
+    revision = processes.check_output(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{baseline}^{{commit}}"],
+        cwd=REPO, text=True, stderr=STDOUT,
+    ).strip()
     root, _, traced = overhead.build(work, fixture)
-    # Avoid an editable install leaking the native extension across checkouts.
     traced = [overhead.bench_python(work), *traced[1:]]
-    overhead.clean(root)
-    for label, checkout, expected in (("python", python_reader, False), ("native", native_reader, True)):
-        env = overhead.environment(checkout, root)
-        probe = processes.check_output(
-            [traced[0], "-c", "import importlib.util; print(importlib.util.find_spec('ldr._native') is not None)"],
-            cwd=root, env=env, text=True,
-        ).strip()
-        if probe != str(expected):
-            raise RuntimeError(f"{label} checkout must have native module importable={expected}, got {probe}")
-    first_env = overhead.environment(python_reader, root)
-    run_phases.one(root, traced, first_env)
-    with tempfile.TemporaryDirectory(prefix="ldr-previous-") as scratch:
-        previous = Path(scratch) / "previous"
+    with tempfile.TemporaryDirectory(prefix="ldr-controlled-") as scratch:
+        scratch = Path(scratch)
+        checkout = scratch / "baseline"
+        processes.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(REPO), str(checkout)],
+                      check=True, capture_output=True, text=True)
+        processes.run(["git", "checkout", "--quiet", "--detach", revision], cwd=checkout,
+                      check=True, capture_output=True, text=True)
+        overhead.clean(root)
+        run_phases.one(root, traced, overhead.environment(checkout, root))
+        previous = scratch / "previous"
         shutil.copytree(root / ".ldr", previous)
-        for label, checkout in (("python", python_reader), ("native", native_reader)):
+        for label, path in (("baseline", checkout), ("current", REPO)):
             overhead.clean(root)
             shutil.copytree(previous, root / ".ldr")
-            env = overhead.environment(checkout, root)
+            env = overhead.environment(path, root)
             result = run_phases.one(root, traced, env)
-            commit = processes.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+            commit = processes.check_output(["git", "rev-parse", "HEAD"], cwd=path, text=True).strip()
             print(json.dumps({"checkout": label, "commit": commit, "fixture": fixture,
                               "run": "controlled second", "pythonhashseed": run_phases.HASH_SEED,
                               "platform": sys.platform, "mode": "default", **result}), flush=True)
@@ -159,14 +159,10 @@ def controlled_comparison(python_reader, native_reader, work, fixture="rich"):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("baseline", default="faa55d3", nargs="?", help="commit for same_records")
+    parser.add_argument("baseline", default="3976cd4", nargs="?", help="baseline commit for comparisons")
     parser.add_argument("--work", default=Path(tempfile.gettempdir()) / "ldr-overhead", type=Path,
                         help="benchmark fixture cache")
-    parser.add_argument("--python-reader", type=Path)
-    parser.add_argument("--native-reader", type=Path)
     args = parser.parse_args()
-    if bool(args.python_reader) != bool(args.native_reader):
-        parser.error("--python-reader and --native-reader must be supplied together")
     commit = processes.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
     folder = Path(tempfile.mkdtemp(prefix="ldr-final-check-"))
     suite, machine, phases = [folder / f"{name}.log" for name in ("suite", "machine", "rich")]
@@ -176,12 +172,15 @@ def main():
                                      "--only", "rich", "--work", args.work.resolve()))
     compare_code = comparison(folder, args.baseline, args.work.resolve())
     controlled_code = 0
-    if args.python_reader:
-        try:
-            controlled_comparison(args.python_reader.resolve(), args.native_reader.resolve(), args.work.resolve())
-        except Exception as error:
-            print(f"Controlled comparison failed: {error}", file=sys.stderr)
-            controlled_code = 1
+    controlled = folder / "controlled.log"
+    try:
+        with controlled.open("w", encoding="utf-8") as output:
+            from contextlib import redirect_stdout
+            with redirect_stdout(output):
+                controlled_comparison(args.baseline, args.work.resolve())
+    except Exception as error:
+        controlled.write_text(f"{type(error).__name__}: {error}\n", encoding="utf-8")
+        controlled_code = 1
 
     print(f"LDR final check · {commit} · baseline {args.baseline}")
     suite_summary(suite, suite_code)
@@ -189,6 +188,7 @@ def main():
                   if line.startswith("machine:")), "no facts line")
     print(f"Preflight (exit {machine_code}) | {facts}")
     timings_summary(phases, phases_code)
+    timings_summary(controlled, controlled_code)
     compare_summary(folder / "same_records.log", compare_code)
     print(f"Logs · {folder}")
     return int(any((suite_code, machine_code, phases_code, compare_code, controlled_code)))
