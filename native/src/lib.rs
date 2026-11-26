@@ -49,8 +49,8 @@ impl Hash {
 enum Task {
     Node(Py<PyAny>, Digest),
     Children(Py<PyAny>),
-    Items(Py<PyAny>, Digest),
-    DictItems(Py<PyAny>, Digest),
+    Items(Py<PyAny>, usize, Digest),
+    DictItems(Py<PyAny>, isize, usize, usize, Digest),
     SetItems(Py<PyAny>, Digest, Vec<Digest>, bool),
     Close(usize, Digest),
     Raw(Vec<u8>, Digest),
@@ -500,25 +500,56 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                         stack.push(Task::Node(value, out));
                     }
                 }
-                Task::Items(iterator, out) => {
-                    if let Some(child) = iterator.bind(py).try_iter()?.next() {
-                        let child = child?.unbind();
-                        stack.push(Task::Items(iterator, out.clone()));
-                        stack.push(Task::Node(child, out));
+                Task::Items(container, index, out) => {
+                    let bound = container.bind(py);
+                    if index < bound.len()? {
+                        let child = if let Ok(list) = bound.downcast::<PyList>() {
+                            list.get_item(index)?
+                        } else {
+                            bound.downcast::<PyTuple>()?.get_item(index)?
+                        };
+                        stack.push(Task::Items(container.clone_ref(py), index + 1, out.clone()));
+                        stack.push(Task::Node(child.unbind(), out));
                     }
                 }
-                Task::DictItems(iterator, out) => {
-                    if let Some(pair) = iterator.bind(py).try_iter()?.next() {
-                        let pair = pair?;
-                        let key = pair.get_item(0)?;
+                Task::DictItems(container, mut position, expected, remaining, out) => {
+                    let dictionary = container.bind(py).downcast::<PyDict>()?;
+                    if dictionary.len() != expected {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "dictionary changed size during iteration",
+                        ));
+                    }
+                    let mut key = std::ptr::null_mut();
+                    let mut value = std::ptr::null_mut();
+                    let present = unsafe {
+                        pyo3::ffi::PyDict_Next(
+                            dictionary.as_ptr(),
+                            &mut position,
+                            &mut key,
+                            &mut value,
+                        )
+                    };
+                    if present != 0 {
+                        if remaining == 0 {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                "dictionary keys changed during iteration",
+                            ));
+                        }
+                        let key = unsafe { Bound::from_borrowed_ptr(py, key) };
+                        let value = unsafe { Bound::from_borrowed_ptr(py, value) };
                         if secret.call1((&key,))?.is_truthy()? {
                             return Err(PyErr::from_value(
                                 fingerprint.getattr("_Stop")?.call1(("redacted",))?,
                             ));
                         }
-                        let value = pair.get_item(1)?.unbind();
-                        stack.push(Task::DictItems(iterator, out.clone()));
-                        stack.push(Task::Node(value, out.clone()));
+                        stack.push(Task::DictItems(
+                            container.clone_ref(py),
+                            position,
+                            expected,
+                            remaining - 1,
+                            out.clone(),
+                        ));
+                        stack.push(Task::Node(value.unbind(), out.clone()));
                         stack.push(Task::Node(key.unbind(), out));
                     }
                 }
@@ -789,11 +820,11 @@ fn encode(py: Python<'_>, walk: Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<
                             write(py, &out, format!("{tag}{}{open}", value.len()?).as_bytes());
                             if dict {
                                 stack.push(Task::DictItems(
-                                    value.call_method0("items")?.try_iter()?.into_any().unbind(),
+                                    value.clone().unbind(), 0, value.len()?, value.len()?,
                                     out,
                                 ));
                             } else {
-                                stack.push(Task::Items(value.try_iter()?.into_any().unbind(), out));
+                                stack.push(Task::Items(value.clone().unbind(), 0, out));
                             }
                         }
                     }

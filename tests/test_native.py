@@ -276,3 +276,10 @@ def test_argument_capture_batches_entry_and_preserves_mutations(monkeypatch):
     assert probe.entries == 1
     assert entry["first"] != exit_["first"]
     assert entry["second"] != exit_["second"]
+
+
+def test_direct_container_paths_do_not_construct_python_iterators():
+    from pathlib import Path
+    source = (Path(__file__).parents[1] / 'native/src/lib.rs').read_text()
+    items = source[source.index('Task::Items('):source.index('Task::SetItems(', source.index('Task::Items('))]
+    assert '.try_iter()' not in items
