@@ -48,3 +48,13 @@ def test_cycles_and_100000_levels():
     encoded, digest, visited = module.numeric_walk(deep)
     assert visited == 100001
     assert encoded == (b'l' + (1).to_bytes(8,'little')) * 100000 + b'i' + (1).to_bytes(8,'little',signed=True)
+
+
+def test_unicode_buffer_preserves_utf8_and_surrogates():
+    module = native()
+    from test_value_cache import corpus
+    values = ['', 'plain', 'é', '日本', '\U0001f600', '\ud800', '\udfff', 'a\ud800é\U0001f600\udfff']
+    values.extend(corpus())
+    values.extend(chr(code) for code in range(0xD800, 0xE000))
+    for value in values:
+        assert module.unicode_payload(value) == value.encode('utf8', 'surrogatepass')

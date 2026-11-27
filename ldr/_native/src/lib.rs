@@ -1,4 +1,6 @@
 //! Standalone numeric/container core. Not registered as LDR's runtime reader yet.
+mod unicode;
+
 use blake2::{
     digest::{Update, VariableOutput},
     Blake2bVar,
@@ -124,5 +126,6 @@ fn numeric_walk(
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(numeric_walk, module)?)?;
+    module.add_function(wrap_pyfunction!(unicode::unicode_payload, module)?)?;
     Ok(())
 }
