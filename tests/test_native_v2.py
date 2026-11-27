@@ -58,3 +58,146 @@ def test_unicode_buffer_preserves_utf8_and_surrogates():
     values.extend(chr(code) for code in range(0xD800, 0xE000))
     for value in values:
         assert module.unicode_payload(value) == value.encode('utf8', 'surrogatepass')
+
+
+def reader():
+    from ldr.native_bridge import Reader
+    return Reader(native())
+
+
+def python_wire(value, partial_ok=True):
+    class Sink:
+        def __init__(self): self.data=bytearray()
+        def update(self,data): self.data.extend(data)
+    sink=Sink(); walk=fp._Walk(fp.DEFAULT_BUDGET,partial_ok)
+    status='complete'
+    try: walk.encode(value,sink)
+    except fp._Stop as exc: status=exc.status
+    return bytes(sink.data),walk.visited,status
+
+
+def test_reader_strings_and_redaction_policy():
+    from test_value_cache import values
+    from ldr import redact
+    engine=reader()
+    for value in values():
+        expected,count,status=python_wire(value)
+        result=engine.walk(value)
+        assert (result['bytes'],result['visited'],result['status'])==(expected,count,status)
+    secret='native-policy-change-632741'
+    try:
+        redact.load_environment({'API_KEY':secret})
+        assert engine.walk(secret)['status']==fp.REDACTED
+        redact.load_environment({})
+        assert engine.walk(secret)['status']=='complete'
+    finally: redact.load_environment()
+
+
+def test_reader_layout_watchers_and_rich():
+    from rich.theme import ThemeStack,Theme
+    from rich.style import Style
+    from rich.text import Text
+    engine=reader()
+    class Base:
+        __slots__=('base',)
+    class Item(Base):
+        __slots__=('slot','missing','__dict__')
+    obj=Item(); obj.base=1; obj.slot='é\ud800'; obj.extra=[2,3]
+    values=[obj,ThemeStack(Theme({'x':Style(color='red')})),Theme({}),Style(bold=True),Text('text')]
+    for value in values:
+        expected,count,status=python_wire(value)
+        actual=engine.walk(value)
+        assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)
+    Base.base=property(lambda self: (_ for _ in ()).throw(AssertionError('property ran')))
+    expected,count,status=python_wire(obj)
+    actual=engine.walk(obj)
+    assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)
+    assert engine.stats()['watchers']==1
+
+
+def test_reader_cache_lifetime_class_reassignment_and_temp_paths():
+    import weakref,gc,tempfile,os
+    engine=reader()
+    class First:
+        __slots__=('a',)
+    class Second:
+        __slots__=('a',)
+    value=First();value.a=3
+    engine.walk(value);value.__class__=Second
+    assert engine.walk(value)['bytes']==python_wire(value)[0]
+    def populate():
+        class Temporary: pass
+        instance=Temporary();instance.x='x'
+        engine.walk(instance)
+        return weakref.ref(Temporary)
+    reference=populate();gc.collect();assert reference() is None
+    for separator in [' ', '\u001c', '\u0085', '\u2003', '\u3000', "'", '"', '']:
+        value='wrote '+os.path.join(tempfile.gettempdir(),'tmpnative','é\ud800')+separator+'done'
+        assert engine.walk(value)['bytes']==python_wire(value)[0]
+
+
+def test_reader_nested_fallback_cycles_and_secret_runs():
+    import enum,datetime,functools,threading
+    engine=reader()
+    class Mode(enum.Enum): A=1
+    class Hook:
+        def __getattr__(self,name): raise AssertionError('hook called')
+    root=[];child=Hook();child.root=root;root.append(child)
+    values=[root,Mode.A,{1,frozenset({2,3})},[{'x':Mode.A},datetime.date(2026,1,1)],
+            functools.partial(pow,2,exp=3),threading.Lock(),['plain']*39+['ghp_'+'a'*36]]
+    for value in values:
+        expected,count,status=python_wire(value)
+        actual=engine.walk(value)
+        if (actual['bytes'],actual['visited'],actual['status'])!=(expected,count,status):
+            raise AssertionError('native parity failed for '+fp.type_identity(type(value)))
+
+
+def test_reader_does_not_materialize_managed_dict_and_handles_shadowing():
+    import gc
+    engine=reader()
+    class Plain: pass
+    value=Plain();value.x=1
+    before=any(type(item) is dict for item in gc.get_referents(value))
+    engine.walk(value)
+    after=any(type(item) is dict for item in gc.get_referents(value))
+    assert before==after
+    class Base:
+        __slots__=('x',)
+    class Child(Base):
+        __slots__=()
+        @property
+        def x(self): raise AssertionError('property ran')
+    value=Child();Base.__dict__['x'].__set__(value,7)
+    expected,count,status=python_wire(value)
+    actual=engine.walk(value)
+    assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)
+    assert actual['delegated']>=1
+
+
+def test_reader_in_place_slot_declaration_edits_and_subclass_keys():
+    engine=reader()
+    class Item:
+        __slots__=['__hidden']
+    value=Item();value._Item__hidden=3
+    engine.walk(value)
+    Item.__slots__[0]='_Item__hidden'
+    expected,count,status=python_wire(value)
+    actual=engine.walk(value)
+    assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)
+    class Name(str): pass
+    value={Name('api_key'):'synthetic-secret'}
+    expected,count,status=python_wire(value)
+    actual=engine.walk(value)
+    assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)
+
+
+def test_reader_unknown_key_policy_and_delegated_normalization():
+    engine=reader()
+    class Key:
+        @property
+        def __class__(self): return str
+    value={Key():1}
+    actual=engine.walk(value)
+    assert actual['status']==fp.FAILED
+    assert actual['delegated']==1
+    assert engine.walk('label=/tmp/tmpnative/é')['normalized']==1

@@ -6,10 +6,23 @@ use std::borrow::Cow;
 /// Borrow CPython's UTF-8 cache where available. Surrogates cannot populate
 /// that cache, so encode those strings from CPython's canonical code units.
 /// The caller holds the GIL and an owning reference for the returned lifetime.
-unsafe fn payload<'a>(py: Python<'_>, value: &'a Bound<'_, PyAny>) -> PyResult<Cow<'a, [u8]>> {
+pub unsafe fn payload<'a>(py: Python<'_>, value: &'a Bound<'_, PyAny>) -> PyResult<Cow<'a, [u8]>> {
     let object = value.as_ptr();
     if ffi::Py_TYPE(object) != std::ptr::addr_of_mut!(ffi::PyUnicode_Type) {
         return Err(PyTypeError::new_err("expected an exact str"));
+    }
+    payload_any(py, value)
+}
+
+// Exact byte access for str-subclass dictionary keys: the name policy reads
+// their Unicode value, while value encoding still delegates the subclass node.
+pub unsafe fn payload_any<'a>(
+    py: Python<'_>,
+    value: &'a Bound<'_, PyAny>,
+) -> PyResult<Cow<'a, [u8]>> {
+    let object = value.as_ptr();
+    if ffi::PyUnicode_Check(object) == 0 {
+        return Err(PyTypeError::new_err("expected Unicode"));
     }
     let mut length = 0;
     let utf8 = ffi::PyUnicode_AsUTF8AndSize(object, &mut length);
