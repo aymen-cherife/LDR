@@ -18,6 +18,7 @@ _TYPE_DICT = type.__dict__["__dict__"].__get__
 _TYPE_MRO = type.__dict__["__mro__"].__get__
 _TYPE_NAME = type.__dict__["__name__"].__get__
 _TYPE_QUALNAME = type.__dict__["__qualname__"].__get__
+_TYPE_FLAGS = type.__dict__["__flags__"].__get__
 _TYPE_MODULE = type.__dict__["__module__"].__get__
 _BASE_EXC_ARGS = BaseException.__dict__["args"].__get__
 
@@ -222,16 +223,22 @@ def read(value: Any, *, include_unset: bool = False, unset_marker: Any = UNSET, 
         if reader.exception:
             fields.append(("args", _BASE_EXC_ARGS(value)))
 
-        if include_unset:
-            # Member descriptors describe physical slots even when __slots__ is edited.
-            for owner, namespace in zip(reversed(reader.owners), reversed(namespaces)):
-                klass = owner.owner()
-                if klass is None:
-                    return None
+        # Class objects retain the declared-slot reader, including metaclasses.
+        real_layout = include_unset and not any(base is type for base in _TYPE_MRO(cls))
+        replaced = False
+        for owner, namespace in zip(reversed(reader.owners), reversed(namespaces)):
+            klass = owner.owner()
+            if klass is None:
+                return None
+            if real_layout and _TYPE_FLAGS(klass) & (1 << 9) and owner.slots is not _ABSENT:
+                # Only slots created on this Python heap class. A descriptor
+                # copied from a builtin/extension owner is not a Python slot.
                 declared = {stored: name for name, stored, _, _ in owner.members}
                 prefix = "_" + type_label(klass).lstrip("_") + "__"
                 for stored, descriptor in namespace.items():
-                    if stored in ("__dict__", "__weakref__") or type(descriptor) is not types.MemberDescriptorType:
+                    if (stored in ("__dict__", "__weakref__")
+                            or type(descriptor) is not types.MemberDescriptorType
+                            or descriptor.__objclass__ is not klass):
                         continue
                     name = declared.get(stored)
                     if name is None:
@@ -241,9 +248,8 @@ def read(value: Any, *, include_unset: bool = False, unset_marker: Any = UNSET, 
                         fields.append((name, descriptor.__get__(value)))
                     except AttributeError:
                         fields.append((name, unset_marker))
-        else:
-            replaced = False
-            for owner, namespace in zip(reversed(reader.owners), reversed(namespaces)):
+            else:
+                # Preserve v1 handling for C owners and class objects.
                 for name, stored, original, member in owner.members:
                     descriptor = namespace.get(stored)
                     if id(descriptor) != original:
@@ -253,11 +259,9 @@ def read(value: Any, *, include_unset: bool = False, unset_marker: Any = UNSET, 
                         try:
                             fields.append((name, descriptor.__get__(value)))
                         except AttributeError:
-                            if include_unset:
-                                fields.append((name, unset_marker))
-                            continue  # slot declared but never assigned
-            if replaced:
-                _discover(cls, _TYPE_MRO(cls), _names(cls))
+                            continue
+        if replaced:
+            _discover(cls, _TYPE_MRO(cls), _names(cls))
         state = _read_dict(value, reader, namespaces)
         if state is not None:
             fields.extend((key, item) for key, item in tuple(state.items()) if type(key) is str)

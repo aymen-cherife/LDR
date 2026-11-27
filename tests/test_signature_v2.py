@@ -391,3 +391,59 @@ def test_pytest_run_reports_previous_v1_mismatch(tmp_path):
     status = json.loads((tmp_path / '.ldr' / 'last.json').read_text())['status']
     assert not status.get('reference')
     assert status['previous_unavailable'] == 'signature format v1 is incompatible with v2'
+
+
+def test_class_objects_and_c_members_keep_v1_fields(tmp_path):
+    import enum
+    import io
+    from ldr.structure import read
+
+    class Meta(type):
+        pass
+
+    class Example(metaclass=Meta):
+        pass
+
+    class Choice(enum.Enum):
+        ONE = 1
+
+    with (tmp_path / 'data').open('wb') as stream:
+        values = [Choice, Example, io.StringIO(), stream, stream.raw]
+        for value in values:
+            before = read(value)
+            after = read(value, include_unset=True)
+            assert (before is None) == (after is None), type(value)
+            if before is not None:
+                assert [name for name, _ in before.fields] == [name for name, _ in after.fields], type(value)
+                assert all(left is right for (_, left), (_, right) in zip(before.fields, after.fields))
+
+
+def test_python_slots_on_c_subclass_exclude_c_members():
+    import io
+    from ldr.structure import read, UNSET
+
+    class Stream(io.BytesIO):
+        __slots__ = ('present', 'unset')
+
+    value = Stream()
+    value.present = 7
+    before = read(value)
+    after = read(value, include_unset=True)
+    assert after.fields == [('present', 7), ('unset', UNSET)] + [pair for pair in before.fields if pair[0] != 'present']
+
+
+def test_c_member_copied_to_python_class_is_not_a_python_slot(tmp_path):
+    import io
+    from ldr.structure import read
+
+    class Example(io.FileIO):
+        __slots__ = ()
+        copied = io.FileIO.__dict__['_blksize']
+
+    path = tmp_path / 'data'
+    path.write_bytes(b'')
+    value = Example(path)
+    try:
+        assert read(value, include_unset=True).fields == read(value).fields
+    finally:
+        value.close()
