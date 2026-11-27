@@ -249,34 +249,23 @@ class _Walk:
         self.immutable = True
         self.active: dict[int, int] = {}
         self.visited = 0
-        self._count_nodes = True
 
     def encode(self, value: Any, out: hashlib.blake2b) -> None:
-        stack = [(iter(((value, out),)), True)]
+        stack = [iter(((value, out),))]
         while stack:
-            iterator, counted = stack[-1]
-            self._count_nodes = counted
-            child = next(iterator, None)
+            child = next(stack[-1], None)
             if child is None:
                 stack.pop()
                 continue
-            if len(child) == 3:
-                item, target, child_counted = child
-                child_counted = counted and child_counted
-            else:
-                item, target = child
-                child_counted = counted
-            self._count_nodes = child_counted
+            item, target = child
             children = self._encode(item, target)
             if children is not None:
-                stack.append((children, child_counted))
-        self._count_nodes = True
+                stack.append(children)
 
     def _encode(self, value: Any, out: hashlib.blake2b):
-        if self._count_nodes:
-            self.visited += 1
+        self.visited += 1
         budget = self.budget
-        if self._count_nodes and budget.max_nodes is not None and self.visited > budget.max_nodes:
+        if budget.max_nodes is not None and self.visited > budget.max_nodes:
             raise _Stop(UNKNOWN)
         kind = type(value)
         if value is None:
@@ -364,8 +353,7 @@ class _Walk:
 
     def _object(self, value: Any, out: hashlib.blake2b):
         unset = object()
-        extra_slots: set[int] = set()
-        reading = read(value, include_unset=True, unset_marker=unset, extra_slots=extra_slots)
+        reading = read(value, include_unset=True, unset_marker=unset)
         if reading is None:
             if not self.partial_ok:
                 raise _Stop(UNSUPPORTED)
@@ -381,7 +369,7 @@ class _Walk:
         try:
             self._text(b"O", reading.identity.encode("utf-8", "surrogatepass"), out)
             out.update(_u64(len(reading.fields)))
-            for index, (name, item) in enumerate(reading.fields):
+            for name, item in reading.fields:
                 if name is None:
                     out.update(b"p")
                 else:
@@ -389,13 +377,13 @@ class _Walk:
                         raise _Stop(REDACTED)
                     self._text(b"n", name.encode("utf-8", "surrogatepass"), out)
                 if item is unset:
+                    self.visited += 1
+                    if self.budget.max_nodes is not None and self.visited > self.budget.max_nodes:
+                        raise _Stop(UNKNOWN)
                     out.update(b"u")
                 else:
                     out.update(b"v")
-                    if index in extra_slots:
-                        yield item, out, False
-                    else:
-                        yield item, out
+                    yield item, out
         finally:
             del self.active[marker]
 
@@ -425,9 +413,8 @@ class _Walk:
             body = b"".join(pieces)
         else:
             return False
-        if self._count_nodes:
-            self.visited += len(value)
-        if self._count_nodes and self.budget.max_nodes is not None and self.visited > self.budget.max_nodes:
+        self.visited += len(value)
+        if self.budget.max_nodes is not None and self.visited > self.budget.max_nodes:
             raise _Stop(UNKNOWN)
         out.update(body)
         return True

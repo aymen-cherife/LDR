@@ -26,7 +26,7 @@ def test_v2_scalar_wire_format():
     assert encoded('é\ud800')[0] == b's' + struct.pack('<Q', 5) + 'é\ud800'.encode('utf8', 'surrogatepass')
 
 
-def test_unset_slots_are_tagged_without_counting_a_node():
+def test_unset_slots_are_tagged_and_counted_as_nodes():
     class Slots:
         __slots__ = ('value',)
     obj = Slots()
@@ -34,7 +34,10 @@ def test_unset_slots_are_tagged_without_counting_a_node():
     obj.value = None
     after, count_after = encoded(obj)
     assert before != after
-    assert count == 1 and count_after == 2
+    assert count == 2 and count_after == 2
+    assert fp.fingerprint(obj, fp.Budget(max_nodes=1)) == fp.UNKNOWN
+    del obj.value
+    assert fp.fingerprint(obj, fp.Budget(max_nodes=1)) == fp.UNKNOWN
 
 
 def test_versioned_invocation():
@@ -116,8 +119,8 @@ def test_rich_objects_readable_state_changes():
         assert fp.fingerprint(left, partial_ok=True) != fp.fingerprint(right, partial_ok=True), type(left)
 
 
-def test_v1_and_v2_visit_same_nodes():
-    # Node counts recorded from 3976cd4 for these values.
+def test_node_counts_match_v1_when_fields_match():
+    # Counts match 3976cd4 except for the additional unset slot.
     cycle = []
     cycle.append(cycle)
     class Slots:
@@ -125,7 +128,7 @@ def test_v1_and_v2_visit_same_nodes():
         def __init__(self):
             self.present = [1, 2]
     values = [None, 2**100, [1, 2, 3], {'x': [1, 2]}, {'a', 'b'}, cycle, Slots(), ['x'] * 40]
-    for value, expected in zip(values, [1, 1, 4, 5, 3, 2, 4, 41], strict=True):
+    for value, expected in zip(values, [1, 1, 4, 5, 3, 2, 5, 41], strict=True):
         walk = fp._Walk(fp.DEFAULT_BUDGET)
         walk.encode(value, hashlib.blake2b(digest_size=16))
         assert walk.visited == expected
@@ -182,7 +185,7 @@ def test_stored_object_equal_to_unset_marker_is_still_read():
     item.value = UNSET
     present, present_nodes = encoded(item)
     assert empty != present
-    assert (empty_nodes, present_nodes) == (1, 2)
+    assert (empty_nodes, present_nodes) == (2, 2)
 
 
 def test_explicit_reference_version_mismatch_is_explained(tmp_path):
@@ -282,16 +285,16 @@ def test_previous_format_then_new_format_is_compared(tmp_path):
     assert payload['status']['reference']['compared'] > 0
 
 
-def test_added_real_slot_contents_do_not_change_v1_node_accounting():
+def test_added_real_slot_contents_and_descendants_are_counted():
     class Slots:
         __slots__ = ['item']
     value = Slots()
     value.item = [1, 2]
     assert encoded(value)[1] == 4
     Slots.__slots__.clear()
-    # v1 reads the edited declaration and visits the root alone. v2 still hashes
-    # the real member descriptor, but must retain v1's accounting.
-    assert encoded(value)[1] == 1
+    # v2 still reads the actual descriptor and counts the complete subtree.
+    assert encoded(value)[1] == 4
+    assert fp.fingerprint(value, fp.Budget(max_nodes=3)) == fp.UNKNOWN
 
 
 def test_all_value_cache_fixtures_detect_changes_or_redaction():
