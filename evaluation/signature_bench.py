@@ -1,4 +1,4 @@
-"""Time Python v2 walks on live references retained from the real Rich nine-file run.
+"""Compare Python and native v2 walks on live references retained from the real Rich nine-file run.
 
 Run directly with Python. A normal recording supplies per-test outcomes; a second
 recording retains every actual walk input and benchmarks those references after
@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -61,6 +63,101 @@ class Samples:
                 'statuses': dict(statuses), 'top_types': [
                     {'type': name, 'values': row[0], 'nodes': row[1], 'seconds': row[2] / 1e9}
                     for name, row in top], 'peak_rss_bytes': peak_memory()}
+
+
+    def compare(self, reader):
+        """Check wire parity separately, then time each reader once on these references.
+
+        The validation pass warms both class-layout caches. It is not included
+        in either timing; no value is copied or reconstructed between passes.
+        """
+        for index, (value, budget, partial_ok) in enumerate(self.values):
+            expected = python_wire(value, budget, partial_ok)
+            actual = reader.walk(value, budget=budget, partial_ok=partial_ok)
+            for key in ('bytes', 'visited', 'status', 'partial', 'immutable', 'normalized'):
+                if actual[key] != expected[key]:
+                    raise AssertionError(f'wire parity failed at value {index}, '
+                                         f'{fp.type_identity(type(value))}, field {key}; '
+                                         f'Python nodes={expected["visited"]}, native nodes={actual["visited"]}')
+            if actual['digest'] != hashlib.blake2b(expected['bytes'], digest_size=16).hexdigest():
+                raise AssertionError(f'digest parity failed at value {index}')
+            if not 0 <= actual['delegated'] <= actual['visited']:
+                raise AssertionError(f'invalid delegation count at value {index}')
+        return {'parity_values': len(self.values), 'python': self.measure(),
+                'native': self.measure_native(reader)}
+
+    def measure_native(self, reader):
+        by_type = collections.defaultdict(lambda: [0, 0, 0])
+        statuses = collections.Counter()
+        total_ns = nodes = delegated = 0
+        for value, budget, partial_ok in self.values:
+            label = fp.type_identity(type(value))
+            reader.refresh()  # policy preparation is outside the walk timer
+            core = reader.core
+            normalized_before = fp.STATS.tmp_normalized
+            started = perf_counter_ns()
+            result = core.walk(value, partial_ok)
+            elapsed = perf_counter_ns() - started
+            fp.STATS.tmp_normalized = normalized_before
+            total_ns += elapsed
+            nodes += result['visited']
+            delegated += result['delegated']
+            row = by_type[label]
+            row[0] += 1
+            row[1] += result['visited']
+            row[2] += elapsed
+            statuses[result['status']] += 1
+        top = sorted(by_type.items(), key=lambda pair: pair[1][2], reverse=True)[:10]
+        return {'reader': 'native-v2', 'values': len(self.values), 'nodes': nodes,
+                'seconds': total_ns / 1e9, 'ns_per_node': total_ns / nodes if nodes else None,
+                'delegated_nodes': delegated, 'native_nodes': nodes-delegated,
+                'native_share': (nodes-delegated)/nodes if nodes else None,
+                'statuses': dict(statuses), 'top_types': [
+                    {'type': name, 'values': row[0], 'nodes': row[1], 'seconds': row[2]/1e9}
+                    for name, row in top], 'peak_rss_bytes': peak_memory()}
+
+
+class Wire:
+    def __init__(self):
+        self.data = bytearray()
+    def update(self, data):
+        self.data.extend(data)
+
+
+def python_wire(value, budget, partial_ok):
+    output = Wire()
+    walk = fp._Walk(budget, partial_ok)
+    normalized = fp.STATS.tmp_normalized
+    status = 'complete'
+    try:
+        walk.encode(value, output)
+    except fp._Stop as error:
+        status = error.status
+    except RecursionError:
+        status = fp.UNKNOWN
+    except Exception:
+        status = fp.FAILED
+    finally:
+        normalized_count = fp.STATS.tmp_normalized-normalized
+        fp.STATS.tmp_normalized = normalized
+    return {'bytes': output.data, 'visited': walk.visited, 'status': status,
+            'partial': walk.partial, 'immutable': walk.immutable, 'normalized': normalized_count}
+
+
+def native_reader():
+    from ldr.native_bridge import Reader
+    module = importlib.import_module('ldr._native')
+    if not hasattr(module, 'ReaderCore'):
+        # Development builds stay out of the Python recorder until runtime
+        # selection is implemented. Load the per-interpreter prototype here.
+        binary = REPO / 'ldr' / '_native' / 'target' / f'py{sys.version_info.major}{sys.version_info.minor}' / 'release' / 'lib_native.so'
+        if not binary.exists():
+            raise RuntimeError('native module not built')
+        spec = importlib.util.spec_from_file_location('ldr._native', binary)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules['ldr._native'] = module
+        spec.loader.exec_module(module)
+    return Reader(module)
 
 
 def peak_memory():
@@ -120,7 +217,10 @@ def install(output_path, keep):
         if keep:
             normalized_before = fp.STATS.tmp_normalized
             try:
-                row['benchmark'] = samples.measure()
+                comparison = samples.compare(native_reader())
+                row['benchmark'] = comparison['python']
+                row['native_benchmark'] = comparison['native']
+                row['parity_values'] = comparison['parity_values']
             finally:
                 fp.STATS.tmp_normalized = normalized_before
         Path(output_path).write_text(json.dumps(row), encoding='utf8')
@@ -165,6 +265,8 @@ def main():
                           'normal_wall_seconds': rows[0]['recording_wall_seconds'],
                           'retained_wall_seconds': rows[1]['recording_wall_seconds'],
                           'benchmark': rows[1]['benchmark'],
+                          'native_benchmark': rows[1]['native_benchmark'],
+                          'parity_values': rows[1]['parity_values'],
                           'total_wall_seconds': perf_counter() - started}), flush=True)
         return int(any(row['exit_code'] for row in rows) or bool(differences))
 

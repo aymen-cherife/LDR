@@ -37,6 +37,10 @@ pub struct Layout {
     pub identity: Vec<u8>,
     pub slots: Vec<(Arc<Vec<u8>>, isize)>,
     pub _weak: Py<PyAny>,
+    pub meta_object: bool,
+    pub has_dict: bool,
+    pub tuple: bool,
+    pub tuple_names: Option<Vec<Arc<Vec<u8>>>>,
     declarations: Vec<(usize, Vec<Option<Py<PyAny>>>)>,
 }
 #[repr(C)]
@@ -73,7 +77,13 @@ pub fn watcher_count() -> i32 {
         0
     }
 }
-pub unsafe fn get(py: Python<'_>, kind: *mut ffi::PyTypeObject) -> PyResult<Option<Arc<Layout>>> {
+pub unsafe fn get<P: FnMut()>(
+    py: Python<'_>,
+    kind: *mut ffi::PyTypeObject,
+    enum_meta: *mut ffi::PyTypeObject,
+    dict_getter: usize,
+    mut protect: P,
+) -> PyResult<Option<Arc<Layout>>> {
     if WATCHER.load(Ordering::Relaxed) < 0 {
         let id = PyType_AddWatcher(changed);
         if id < 0 {
@@ -109,22 +119,96 @@ pub unsafe fn get(py: Python<'_>, kind: *mut ffi::PyTypeObject) -> PyResult<Opti
         }
         cache.1.remove(&(kind as usize));
     }
-    // Only ordinary Python classes; metaclasses, container subclasses, C bases,
-    // and custom attribute hooks use the exact Python node reader.
-    if ffi::Py_TYPE(kind.cast()) != std::ptr::addr_of_mut!(ffi::PyType_Type)
-        || (*kind).tp_flags & 512 == 0
-        || (*kind).tp_getattro.map(|f| f as usize)
-            != Some(ffi::PyObject_GenericGetAttr as *const () as usize)
+    let meta_object = kind == enum_meta;
+    let meta = ffi::Py_TYPE(kind.cast());
+    if (*kind).tp_flags & 512 == 0
+        || (!meta_object
+            && ((meta != std::ptr::addr_of_mut!(ffi::PyType_Type) && meta != enum_meta)
+                || (*kind).tp_getattro.map(|f| f as usize)
+                    != Some(ffi::PyObject_GenericGetAttr as *const () as usize)))
     {
         return Ok(None);
     }
     let mro = (*kind).tp_mro;
+    let mut tuple = false;
+    let mut tuple_names = None;
+    let mut has_dict = false;
+    for i in 0..ffi::PyTuple_Size(mro) {
+        let owner = ffi::PyTuple_GetItem(mro, i) as *mut ffi::PyTypeObject;
+        if owner == std::ptr::addr_of_mut!(ffi::PyTuple_Type) {
+            tuple = true
+        }
+        let namespace = Bound::<PyAny>::from_owned_ptr(py, ffi::PyType_GetDict(owner));
+        let ns = namespace.as_ptr();
+        if !meta_object && !has_dict {
+            let descriptor = ffi::PyDict_GetItemString(ns, c"__dict__".as_ptr());
+            if !descriptor.is_null()
+                && ffi::Py_TYPE(descriptor) == std::ptr::addr_of_mut!(ffi::PyGetSetDescr_Type)
+            {
+                let getset = (*(descriptor as *mut ffi::PyGetSetDescrObject)).d_getset;
+                if (*getset).get.map(|f| f as *const () as usize) != Some(dict_getter) {
+                    return Ok(None);
+                }
+                has_dict = true;
+            }
+        }
+        if !meta_object && tuple_names.is_none() {
+            let names = ffi::PyDict_GetItemString(ns, c"_fields".as_ptr());
+            if !names.is_null() && ffi::Py_TYPE(names) == std::ptr::addr_of_mut!(ffi::PyTuple_Type)
+            {
+                let mut fields = Vec::new();
+                let mut valid = true;
+                for j in 0..ffi::PyTuple_Size(names) {
+                    let name = ffi::PyTuple_GetItem(names, j);
+                    if ffi::Py_TYPE(name) != std::ptr::addr_of_mut!(ffi::PyUnicode_Type) {
+                        valid = false;
+                        break;
+                    }
+                    fields.push(Arc::new(bytes(py, name)?));
+                }
+                if valid {
+                    tuple_names = Some(fields)
+                }
+            }
+        }
+    }
+    if meta_object {
+        for i in 0..ffi::PyTuple_Size(mro) {
+            let owner = ffi::PyTuple_GetItem(mro, i) as *mut ffi::PyTypeObject;
+            if owner == std::ptr::addr_of_mut!(ffi::PyType_Type)
+                || owner == std::ptr::addr_of_mut!(ffi::PyBaseObject_Type)
+            {
+                continue;
+            }
+            let namespace = Bound::<PyAny>::from_owned_ptr(py, ffi::PyType_GetDict(owner));
+            if !ffi::PyDict_GetItemString(namespace.as_ptr(), c"__slots__".as_ptr()).is_null()
+                || !ffi::PyDict_GetItemString(namespace.as_ptr(), c"__dict__".as_ptr()).is_null()
+            {
+                return Ok(None);
+            }
+            if PyType_Watch(WATCHER.load(Ordering::Relaxed), owner.cast()) < 0 {
+                return Err(PyErr::fetch(py));
+            }
+            let key = ffi::PyUnicode_InternFromString(c"__class__".as_ptr());
+            _PyType_Lookup(owner, key);
+            ffi::Py_DECREF(key);
+        }
+    }
     let mut slots = Vec::new();
     let mut declared_state = false;
     let mut declarations = Vec::new();
-    for index in (0..ffi::PyTuple_Size(mro)).rev() {
+    for index in (0..if meta_object {
+        0
+    } else {
+        ffi::PyTuple_Size(mro)
+    })
+        .rev()
+    {
         let owner = ffi::PyTuple_GetItem(mro, index) as *mut ffi::PyTypeObject;
-        if owner == std::ptr::addr_of_mut!(ffi::PyBaseObject_Type) {
+        if owner == std::ptr::addr_of_mut!(ffi::PyBaseObject_Type)
+            || owner == std::ptr::addr_of_mut!(ffi::PyTuple_Type)
+            || owner == std::ptr::addr_of_mut!(ffi::PyLong_Type)
+        {
             continue;
         }
         if (*owner).tp_flags & 512 == 0 {
@@ -137,7 +221,8 @@ pub unsafe fn get(py: Python<'_>, kind: *mut ffi::PyTypeObject) -> PyResult<Opti
         let class_name = ffi::PyUnicode_InternFromString(c"__class__".as_ptr());
         _PyType_Lookup(owner, class_name);
         ffi::Py_DECREF(class_name);
-        let ns = (*owner).tp_dict;
+        let namespace = Bound::<PyAny>::from_owned_ptr(py, ffi::PyType_GetDict(owner));
+        let ns = namespace.as_ptr();
         let declaration = ffi::PyDict_GetItemString(ns, c"__slots__".as_ptr());
         if declaration.is_null() {
             continue;
@@ -206,7 +291,7 @@ pub unsafe fn get(py: Python<'_>, kind: *mut ffi::PyTypeObject) -> PyResult<Opti
                 return Ok(None);
             }
             let member = (*descriptor).d_member as *mut Member;
-            if (*member).kind != 6 && (*member).kind != 16 {
+            if (*member).kind != 16 {
                 return Ok(None);
             }
             let name = bytes(py, key)?;
@@ -223,10 +308,11 @@ pub unsafe fn get(py: Python<'_>, kind: *mut ffi::PyTypeObject) -> PyResult<Opti
             slots.push((Arc::new(name), (*member).offset));
         }
     }
-    if !declared_state && (*kind).tp_dictoffset == 0 && (*kind).tp_flags & 16 == 0 {
+    if !meta_object && !tuple && !declared_state && !has_dict {
         return Ok(None);
     }
-    let module = ffi::PyDict_GetItemString((*kind).tp_dict, c"__module__".as_ptr());
+    let namespace = Bound::<PyAny>::from_owned_ptr(py, ffi::PyType_GetDict(kind));
+    let module = ffi::PyDict_GetItemString(namespace.as_ptr(), c"__module__".as_ptr());
     if module.is_null() || ffi::Py_TYPE(module) != std::ptr::addr_of_mut!(ffi::PyUnicode_Type) {
         return Ok(None);
     }
@@ -237,6 +323,8 @@ pub unsafe fn get(py: Python<'_>, kind: *mut ffi::PyTypeObject) -> PyResult<Opti
         return Ok(None);
     }
     identity.extend_from_slice(&unicode::payload(py, &qualname)?);
+    let version = (*kind).tp_version_tag;
+    protect();
     let callback = Py::new(
         py,
         Gone {
@@ -247,9 +335,17 @@ pub unsafe fn get(py: Python<'_>, kind: *mut ffi::PyTypeObject) -> PyResult<Opti
     if weak.is_null() {
         return Err(PyErr::fetch(py));
     }
+    if version != (*kind).tp_version_tag {
+        ffi::Py_DECREF(weak);
+        return Ok(None);
+    }
     let layout = Arc::new(Layout {
         identity,
         slots,
+        meta_object,
+        has_dict,
+        tuple,
+        tuple_names,
         _weak: Py::from_owned_ptr(py, weak),
         declarations,
     });

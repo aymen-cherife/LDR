@@ -24,7 +24,7 @@ enum Task {
     Leave(usize),
     Sequence(*mut ffi::PyObject, isize, isize, bool, usize),
     Dict(*mut ffi::PyObject, isize, usize, isize, isize),
-    Field(Arc<Vec<u8>>, *mut ffi::PyObject, usize),
+    Field(Option<Arc<Vec<u8>>>, *mut ffi::PyObject, usize),
     Resume(Py<PyAny>, usize),
     Set(*mut ffi::PyObject, isize, Vec<usize>, usize, bool),
 }
@@ -48,9 +48,13 @@ pub struct ReaderCore {
     policy: Policy,
     fallback: Py<PyAny>,
     special: Vec<Py<PyAny>>,
+    enum_meta: Py<PyAny>,
+    dict_getter: usize,
+    fast_min: usize,
+    string_buffer: Vec<u8>,
     buffers: Vec<Vec<u8>>,
     names: HashMap<usize, (Py<PyAny>, Arc<Vec<u8>>)>,
-    fields: Vec<(Arc<Vec<u8>>, *mut ffi::PyObject)>,
+    fields: Vec<(Option<Arc<Vec<u8>>>, *mut ffi::PyObject)>,
     dict_buffer: Vec<(*mut ffi::PyObject, *mut ffi::PyObject)>,
     tasks: Vec<Task>,
     active: HashMap<usize, usize>,
@@ -66,12 +70,30 @@ impl ReaderCore {
         patterns: Vec<String>,
         fallback: Py<PyAny>,
         special: Vec<Py<PyAny>>,
+        enum_meta: Py<PyAny>,
+        dict_getter: Py<PyAny>,
+        fast_min: usize,
     ) -> PyResult<Self> {
+        let getter = unsafe {
+            if ffi::Py_TYPE(dict_getter.as_ptr()) != std::ptr::addr_of_mut!(ffi::PyGetSetDescr_Type)
+            {
+                return Err(PyValueError::new_err("invalid dictionary descriptor"));
+            }
+            let spec = (*(dict_getter.as_ptr() as *mut ffi::PyGetSetDescrObject)).d_getset;
+            (*spec)
+                .get
+                .map(|f| f as *const () as usize)
+                .ok_or_else(|| PyValueError::new_err("missing dictionary getter"))?
+        };
         Ok(Self {
             policy: Policy::new(prefixes, secrets, arguments, patterns)
                 .map_err(PyValueError::new_err)?,
             fallback,
             special,
+            enum_meta,
+            dict_getter: getter,
+            fast_min,
+            string_buffer: Vec::new(),
             buffers: Vec::new(),
             names: HashMap::default(),
             fields: Vec::new(),
@@ -109,7 +131,6 @@ impl ReaderCore {
         }
         let mut next_buffer = 1;
         let mut keepers = Vec::<Py<PyAny>>::new();
-        let mut prechecked = HashMap::default();
         let mut delegated_controls = HashMap::default();
         unsafe {
             while let Some(task) = tasks.pop() {
@@ -119,21 +140,25 @@ impl ReaderCore {
                         active.remove(&address);
                     }
                     Task::Field(name, item, target) => {
-                        if !item.is_null() {
-                            let key = Arc::as_ptr(&name) as usize;
-                            let secret = if let Some((_, found)) = self.secret_names.get(&key) {
-                                *found
-                            } else {
-                                let found = self.policy.secret_name(&name);
-                                self.secret_names.insert(key, (name.clone(), found));
-                                found
-                            };
-                            if secret {
-                                status = "redacted".into();
-                                break;
+                        if let Some(ref name) = name {
+                            if !item.is_null() {
+                                let key = Arc::as_ptr(name) as usize;
+                                let secret = if let Some((_, found)) = self.secret_names.get(&key) {
+                                    *found
+                                } else {
+                                    let found = self.policy.secret_name(&name);
+                                    self.secret_names.insert(key, (name.clone(), found));
+                                    found
+                                };
+                                if secret {
+                                    status = "redacted".into();
+                                    break;
+                                }
                             }
+                            text(&mut self.buffers[target], b'n', name);
+                        } else {
+                            self.buffers[target].push(b'p')
                         }
-                        text(&mut self.buffers[target], b'n', &name);
                         if item.is_null() {
                             visited += 1;
                             self.buffers[target].push(b'u')
@@ -315,12 +340,7 @@ impl ReaderCore {
                         } else if kind == std::ptr::addr_of_mut!(ffi::PyUnicode_Type) {
                             let object = Bound::from_borrowed_ptr(py, obj);
                             let data = unicode::payload(py, &object)?;
-                            let decision = if let Some(checked) = prechecked.get(&(obj as usize)) {
-                                delegated += 1;
-                                Some(*checked)
-                            } else {
-                                self.policy.secret(&data)
-                            };
+                            let decision = self.policy.secret(&data);
                             match decision {
                                 Some(true) => {
                                     status = "redacted".into();
@@ -373,7 +393,7 @@ impl ReaderCore {
                                     };
                                     self.buffers[target].push(if tuple { b't' } else { b'l' });
                                     size(&mut self.buffers[target], count as usize);
-                                    let string_run = count >= 32
+                                    let string_run = count as usize >= self.fast_min
                                         && (0..count).all(|i| {
                                             ffi::Py_TYPE(if tuple {
                                                 ffi::PyTuple_GetItem(obj, i)
@@ -382,46 +402,116 @@ impl ReaderCore {
                                             }) == std::ptr::addr_of_mut!(ffi::PyUnicode_Type)
                                         });
                                     if string_run {
+                                        self.string_buffer.clear();
                                         let mut secret = false;
+                                        let mut string_delegated = 0;
+                                        let mut string_normalized = 0;
                                         for i in 0..count {
                                             let item = if tuple {
                                                 ffi::PyTuple_GetItem(obj, i)
                                             } else {
                                                 ffi::PyList_GetItem(obj, i)
                                             };
+                                            if item.is_null() {
+                                                ffi::PyErr_Clear();
+                                                status = "failed".into();
+                                                break;
+                                            }
                                             let object = Bound::from_borrowed_ptr(py, item);
                                             let data = unicode::payload(py, &object)?;
                                             let found = match self.policy.secret(&data) {
-                                                Some(v) => v,
+                                                Some(found) => found,
                                                 None => {
-                                                    let checked: bool = self
-                                                        .fallback
+                                                    for address in active.keys() {
+                                                        keepers.push(Py::from_borrowed_ptr(
+                                                            py,
+                                                            *address as *mut ffi::PyObject,
+                                                        ));
+                                                    }
+                                                    for pending in &tasks {
+                                                        match pending {
+                                                            Task::Value(p, _)
+                                                            | Task::Field(_, p, _)
+                                                                if !p.is_null() =>
+                                                            {
+                                                                keepers.push(Py::from_borrowed_ptr(
+                                                                    py, *p,
+                                                                ))
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    string_delegated += 1;
+                                                    self.fallback
                                                         .bind(py)
-                                                        .call_method1("secret_text", (object,))?
-                                                        .extract()?;
-                                                    prechecked.insert(item as usize, checked);
-                                                    checked
+                                                        .call_method1(
+                                                            "secret_text",
+                                                            (object.clone(),),
+                                                        )?
+                                                        .extract()?
                                                 }
                                             };
                                             if found {
                                                 secret = true;
                                                 break;
                                             }
+                                            let (bytes, number) = self.policy.normalize(&data);
+                                            string_normalized += number;
+                                            text(&mut self.string_buffer, b's', &bytes);
+                                        }
+                                        normalized += string_normalized;
+                                        if status != "complete" {
+                                            break;
                                         }
                                         if secret {
-                                            if !prechecked.is_empty() {
-                                                delegated += 1;
+                                            if string_delegated > 0 {
+                                                delegated += 1
                                             }
                                             status = "redacted".into();
                                             break;
                                         }
+                                        delegated += string_delegated;
+                                        visited += count as usize;
+                                        self.buffers[target].extend_from_slice(&self.string_buffer);
+                                    } else {
+                                        tasks.push(Task::Sequence(obj, 0, count, tuple, target));
                                     }
-                                    tasks.push(Task::Sequence(obj, 0, count, tuple, target));
                                 }
-                            } else if let Some(layout) = layout::get(py, kind)? {
-                                if let Some(mut state) =
-                                    layout::dictionary(obj, std::mem::take(&mut self.dict_buffer))
+                            } else if let Some(layout) = layout::get(
+                                py,
+                                kind,
+                                self.enum_meta.as_ptr().cast(),
+                                self.dict_getter,
+                                || {
+                                    keepers.push(Py::from_borrowed_ptr(py, obj));
+                                    keepers.push(Py::from_borrowed_ptr(py, kind.cast()));
+                                    for address in active.keys() {
+                                        keepers.push(Py::from_borrowed_ptr(
+                                            py,
+                                            *address as *mut ffi::PyObject,
+                                        ));
+                                    }
+                                    for pending in &tasks {
+                                        match pending {
+                                            Task::Value(p, _) | Task::Field(_, p, _)
+                                                if !p.is_null() =>
+                                            {
+                                                keepers.push(Py::from_borrowed_ptr(py, *p))
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                },
+                            )? {
+                                if ffi::Py_TYPE(obj) != kind {
+                                    delegate = Some((obj, target));
+                                } else if let Some(mut state) = if layout.meta_object
+                                    || !layout.has_dict
                                 {
+                                    Some(std::mem::take(&mut self.dict_buffer))
+                                } else {
+                                    layout::dictionary(obj, std::mem::take(&mut self.dict_buffer))
+                                } {
                                     let address = obj as usize;
                                     if let Some(depth) = active.get(&address) {
                                         self.buffers[target].push(b'@');
@@ -432,9 +522,20 @@ impl ReaderCore {
                                     active.insert(address, active.len());
                                     tasks.push(Task::Leave(address));
                                     let mut fields = std::mem::take(&mut self.fields);
+                                    if layout.tuple {
+                                        let count = ffi::PyTuple_Size(obj);
+                                        for i in 0..count {
+                                            let name = layout
+                                                .tuple_names
+                                                .as_ref()
+                                                .filter(|names| names.len() == count as usize)
+                                                .map(|names| names[i as usize].clone());
+                                            fields.push((name, ffi::PyTuple_GetItem(obj, i)));
+                                        }
+                                    }
                                     for (name, offset) in &layout.slots {
                                         fields.push((
-                                            name.clone(),
+                                            Some(name.clone()),
                                             *(obj.cast::<u8>().offset(*offset)
                                                 as *mut *mut ffi::PyObject),
                                         ))
@@ -458,7 +559,7 @@ impl ReaderCore {
                                                 );
                                                 bytes
                                             };
-                                            fields.push((name, item));
+                                            fields.push((Some(name), item));
                                         }
                                     }
                                     self.dict_buffer = state;

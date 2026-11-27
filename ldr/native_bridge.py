@@ -1,8 +1,9 @@
 """Prototype boundary for nodes the native reader cannot yet encode exactly."""
 import re
-import functools,decimal,datetime,types,abc
+import functools,decimal,datetime,types,abc,enum
 SPECIAL_TYPES=(functools.partial,types.MethodType,types.FunctionType,types.BuiltinFunctionType,decimal.Decimal,datetime.date,datetime.time,datetime.datetime,datetime.timedelta,type,abc.ABCMeta,range,type(Ellipsis),type(NotImplemented))
 from . import fingerprint as fp, redact
+ENUM_META=enum.EnumType
 
 
 class Sink:
@@ -46,17 +47,21 @@ class Fallback:
         return (self.sink.take(),iterator,child,status,self.walk.visited,self.walk.active,self.walk.partial,self.walk.immutable,fp.STATS.tmp_normalized-self.normalized_before)
 
 
+DICT_GETTER=Fallback.__dict__['__dict__']
+
+
 class Reader:
     def __init__(self,module):
-        self.module=module;self.token=None;self.core=None
+        self.module=module;self.token=None;self.core=None;self.fast_min=None
     def refresh(self):
         token=redact.text_policy()
-        if self.core is None or not redact.same_text_policy(self.token):
+        if self.core is None or not redact.same_text_policy(self.token) or self.fast_min!=fp.FAST_PATH_MIN:
             patterns=[('(?i)' if pattern.flags & re.IGNORECASE and not pattern.pattern.startswith('(?i)') else '')+pattern.pattern for _,pattern,_ in redact._SHAPES]
             self.core=self.module.ReaderCore(fp._TMP_PREFIXES,
                 [s.encode('utf8','surrogatepass') for s,_ in redact._environment[0]],
-                [(s.encode('utf8','surrogatepass'),len(s)>=8) for s in redact._argv_secrets[1]],patterns,Fallback(),SPECIAL_TYPES)
+                [(s.encode('utf8','surrogatepass'),len(s)>=8) for s in redact._argv_secrets[1]],patterns,Fallback(),SPECIAL_TYPES,ENUM_META,DICT_GETTER,fp.FAST_PATH_MIN)
             self.token=token
+            self.fast_min=fp.FAST_PATH_MIN
     def walk(self,value,budget=None,partial_ok=True):
         self.refresh()
         normalized=fp.STATS.tmp_normalized

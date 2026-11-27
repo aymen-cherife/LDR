@@ -201,3 +201,52 @@ def test_reader_unknown_key_policy_and_delegated_normalization():
     assert actual['status']==fp.FAILED
     assert actual['delegated']==1
     assert engine.walk('label=/tmp/tmpnative/é')['normalized']==1
+
+
+def test_reader_theme_color_dependencies_are_native():
+    from rich.color import Color
+    from rich.theme import Theme,ThemeStack
+    engine=reader()
+    color=Color.parse('red')
+    result=engine.walk(color)
+    assert result['delegated']==0
+    assert result['bytes']==python_wire(color)[0]
+    # The builtin dict.get bound method remains a separate delegated leaf.
+    result=engine.walk(ThemeStack(Theme({'x':__import__('rich.style',fromlist=['Style']).Style(color='red')},inherit=False)))
+    assert result['delegated']==1
+
+
+def test_reader_redaction_python_ascii_whitespace():
+    engine=reader()
+    for code in range(0x1c,0x20):
+        for value in ['Bearer'+chr(code)+'abcdefghijklmnop', 'https://user:'+chr(code)+'password@example.test/', '?token='+chr(code)+'value']:
+            expected,count,status=python_wire(value)
+            actual=engine.walk(value)
+            if (actual['bytes'],actual['visited'],actual['status'])!=(expected,count,status):
+                raise AssertionError('Python whitespace policy mismatch')
+
+
+def test_reader_shadowed_instance_dict_keeps_python_handling():
+    engine=reader()
+    class Hidden:
+        @property
+        def __dict__(self): raise AssertionError('property ran')
+    value=Hidden();value.hidden=7
+    expected,count,status=python_wire(value)
+    actual=engine.walk(value)
+    assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)
+    assert actual['delegated']==1
+
+
+def test_reader_bulk_redaction_normalization_counts_and_fast_mode(monkeypatch):
+    engine=reader()
+    value=['/tmp/tmpnative/file']*40+['ghp_'+'a'*36]
+    before=fp.STATS.tmp_normalized
+    expected,count,status=python_wire(value)
+    normalized=fp.STATS.tmp_normalized-before
+    actual=engine.walk(value)
+    assert (actual['bytes'],actual['visited'],actual['status'],actual['normalized'])==(expected,count,status,normalized)
+    monkeypatch.setattr(fp,'FAST_PATH_MIN',10**12)
+    expected,count,status=python_wire(value)
+    actual=engine.walk(value)
+    assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)

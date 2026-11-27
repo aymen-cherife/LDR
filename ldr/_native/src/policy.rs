@@ -42,7 +42,7 @@ impl Policy {
     ) -> Result<Self, String> {
         let patterns = patterns
             .into_iter()
-            .map(|s| Regex::new(&s.replace("\\Z", "\\z")).map_err(|e| e.to_string()))
+            .map(|s| Regex::new(&python_pattern(&s)).map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self{prefixes:prefixes.into_iter().map(String::into_bytes).collect(),secrets,arguments,patterns,
             names:regex::Regex::new(r"(?i)(?:^|_)(?:password|passwd|secret|cl[iİı]ent_?secret|ap[iİı]_?key|ap[iİı]_?token|auth_?token|access_?token|refresh_?token|author[iİı]zat[iİı]on|cook[iİı]e|sess[iİı]on_?[iİı]d|pr[iİı]vate_?key|connect[iİı]on_?str[iİı]ng|credent[iİı]als?)(?:$|_)").unwrap()})
@@ -180,4 +180,44 @@ fn boundary(s: &[u8], i: usize) -> bool {
         _ => 0,
     };
     matches!(c,9..=13|28..=32|0x85|0xa0|0x1680|0x2000..=0x200a|0x2028|0x2029|0x202f|0x205f|0x3000)
+}
+
+// CPython treats ASCII U+001C..U+001F as whitespace; Unicode White_Space
+// (and Rust regex \s) does not. Translate the policy's character classes,
+// keeping their negation and surrounding lookarounds unchanged.
+fn python_pattern(source: &str) -> String {
+    let source = source
+        .replace(r"[\s\S]", "(?s:.)")
+        .replace(r"[\S\s]", "(?s:.)");
+    let mut result = String::new();
+    let mut chars = source.chars();
+    let mut class = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                if next == 's' {
+                    result.push_str(if class {
+                        r"\s\x1c-\x1f"
+                    } else {
+                        r"[\s\x1c-\x1f]"
+                    })
+                } else if next == 'Z' {
+                    result.push_str(r"\z")
+                } else {
+                    result.push('\\');
+                    result.push(next)
+                }
+            } else {
+                result.push('\\')
+            }
+        } else {
+            if c == '[' {
+                class = true
+            } else if c == ']' {
+                class = false
+            }
+            result.push(c)
+        }
+    }
+    result
 }

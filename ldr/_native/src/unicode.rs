@@ -24,23 +24,26 @@ pub unsafe fn payload_any<'a>(
     if ffi::PyUnicode_Check(object) == 0 {
         return Err(PyTypeError::new_err("expected Unicode"));
     }
-    let mut length = 0;
-    let utf8 = ffi::PyUnicode_AsUTF8AndSize(object, &mut length);
-    if !utf8.is_null() {
+    let count = ffi::PyUnicode_GET_LENGTH(object) as usize;
+    let kind = ffi::PyUnicode_KIND(object);
+    let data = ffi::PyUnicode_DATA(object);
+    let surrogate = match kind {
+        1 => false,
+        2 => (0..count).any(|i| (0xd800..=0xdfff).contains(&(*data.cast::<u16>().add(i) as u32))),
+        4 => (0..count).any(|i| (0xd800..=0xdfff).contains(&*data.cast::<u32>().add(i))),
+        _ => unreachable!("invalid CPython Unicode kind"),
+    };
+    if !surrogate {
+        let mut length = 0;
+        let utf8 = ffi::PyUnicode_AsUTF8AndSize(object, &mut length);
+        if utf8.is_null() {
+            return Err(PyErr::fetch(py));
+        }
         return Ok(Cow::Borrowed(std::slice::from_raw_parts(
             utf8.cast(),
             length as usize,
         )));
     }
-    // Do not turn allocation failures or other interpreter errors into an
-    // encoding fallback. Only surrogate-containing strings take this path.
-    if ffi::PyErr_ExceptionMatches(ffi::PyExc_UnicodeEncodeError) == 0 {
-        return Err(PyErr::fetch(py));
-    }
-    ffi::PyErr_Clear();
-    let count = ffi::PyUnicode_GET_LENGTH(object) as usize;
-    let kind = ffi::PyUnicode_KIND(object);
-    let data = ffi::PyUnicode_DATA(object);
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
         let code = match kind {
