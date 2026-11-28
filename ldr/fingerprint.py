@@ -611,7 +611,7 @@ def _fingerprint_details(
             walk = _NativeWalkResult(result)
             STATS.tmp_normalized += result["normalized"]
             if result["status"] != "complete":
-                raise _Stop(result["status"])
+                raise _Stop(STATUSES[STATUSES.index(result["status"])])
             token = result["digest"]
         STATS.last_visited = walk.visited
         return token + (PARTIAL_MARK if walk.partial else ""), (

@@ -90,18 +90,20 @@ class Samples:
         by_type = collections.defaultdict(lambda: [0, 0, 0])
         statuses = collections.Counter()
         total_ns = nodes = delegated = 0
+        delegated_types = collections.Counter()
         for value, budget, partial_ok in self.values:
             label = fp.type_identity(type(value))
             reader.refresh()  # policy preparation is outside the walk timer
             core = reader.core
             normalized_before = fp.STATS.tmp_normalized
             started = perf_counter_ns()
-            result = core.walk(value, partial_ok)
+            result = core.capture(value, partial_ok, budget.max_nodes)
             elapsed = perf_counter_ns() - started
             fp.STATS.tmp_normalized = normalized_before
             total_ns += elapsed
             nodes += result['visited']
             delegated += result['delegated']
+            delegated_types.update({fp.type_identity(kind):count for kind,count in result['delegated_by_type'].items()})
             row = by_type[label]
             row[0] += 1
             row[1] += result['visited']
@@ -111,6 +113,7 @@ class Samples:
         return {'reader': 'native-v2', 'values': len(self.values), 'nodes': nodes,
                 'seconds': total_ns / 1e9, 'ns_per_node': total_ns / nodes if nodes else None,
                 'delegated_nodes': delegated, 'native_nodes': nodes-delegated,
+                'delegated_by_type': dict(delegated_types.most_common()),
                 'native_share': (nodes-delegated)/nodes if nodes else None,
                 'statuses': dict(statuses), 'top_types': [
                     {'type': name, 'values': row[0], 'nodes': row[1], 'seconds': row[2]/1e9}
@@ -215,14 +218,14 @@ def install(output_path, keep):
     """Called by a temporary sitecustomize only in LDR's program process."""
     import pytest
     samples = Samples()
-    original_encode, original_main = fp._Walk.encode, pytest.main
+    original_details, original_main = fp._fingerprint_details, pytest.main
 
-    def captured(walk, value, output):
-        samples.capture(value, walk.budget, walk.partial_ok)
-        return original_encode(walk, value, output)
+    def captured(value, budget, partial_ok, sketch=False):
+        samples.capture(value, budget, partial_ok)
+        return original_details(value, budget, partial_ok, sketch)
 
     if keep:
-        fp._Walk.encode = captured
+        fp._fingerprint_details = captured
 
     def main(*args, **kwargs):
         results = Results()
@@ -231,7 +234,7 @@ def install(output_path, keep):
         try:
             code = original_main(*args, **kwargs)
         finally:
-            fp._Walk.encode = original_encode
+            fp._fingerprint_details = original_details
             pytest.main = original_main
         # pytest has completed all test teardown. Stop recording before timing.
         for plugin in plugins:
@@ -258,6 +261,8 @@ def main():
     import overhead
     work = Path(tempfile.gettempdir()) / 'ldr-c2b'
     root, _, traced = overhead.build(work, 'rich')
+    marker=traced.index('--')
+    traced=traced[:marker]+['--timeout=0']+traced[marker:]
     started = perf_counter()
     with tempfile.TemporaryDirectory(prefix='ldr-signature-bench-') as scratch:
         scratch = Path(scratch)

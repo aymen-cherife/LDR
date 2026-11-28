@@ -83,3 +83,56 @@ def test_peak_memory_on_windows_without_resource(monkeypatch):
         types.SimpleNamespace(GetCurrentProcess=current) if name == "kernel32"
         else types.SimpleNamespace(GetProcessMemoryInfo=memory)), raising=False)
     assert bench.peak_memory() == 123456
+
+
+def test_native_measure_honors_the_same_ceiling():
+    import sys
+    sys.path.insert(0,str(Path(__file__).parent))
+    from test_native_v2 import reader
+    from ldr import fingerprint as fp
+    bench=module();samples=bench.Samples()
+    samples.capture([0,'x']*100,fp.Budget(32),True)
+    result=samples.compare(reader())
+    assert result['native']['nodes']==result['python']['nodes']==33
+    assert result['native']['statuses']==result['python']['statuses']
+    assert 'delegated_by_type' in result['native']
+
+
+def test_retention_captures_native_boundary_without_a_python_walk(tmp_path,monkeypatch):
+    import pytest
+    import json
+    from ldr import fingerprint as fp
+    bench=module()
+    class Native:
+        def capture(self,value,budget,partial_ok):
+            return {'digest':'a'*32,'visited':3,'partial':False,'immutable':False,
+                    'normalized':0,'status':'complete'}
+    monkeypatch.setattr(fp,'_native_reader',Native())
+    value=[1,2]
+    monkeypatch.setattr(pytest,'main',lambda **kw: (fp._fingerprint_details(value,fp.Budget(),True) and 0))
+    seen=[]
+    def compare(self,reader):
+        seen.extend(self.values)
+        return {'python':{},'native':{},'parity_values':len(self.values)}
+    monkeypatch.setattr(bench.Samples,'compare',compare)
+    monkeypatch.setattr(bench,'native_reader',lambda:None)
+    destination=tmp_path/'results.json'
+    bench.install(destination,True)
+    assert pytest.main()==0
+    assert seen[0][0] is value and len(seen)==1
+    assert json.loads(destination.read_text())['parity_values']==1
+
+
+def test_benchmark_disables_the_existing_timeout(tmp_path,monkeypatch):
+    import sys,types,pytest
+    bench=module()
+    traced=[sys.executable,'-m','ldr','pytest','tests/a.py','--']
+    fake=types.SimpleNamespace(build=lambda *args:(tmp_path,None,traced),
+        environment=lambda *args:{'PYTHONPATH':str(tmp_path)},clean=lambda *args:None)
+    monkeypatch.setitem(sys.modules,'overhead',fake)
+    class Observed(Exception): pass
+    def run(command,**kwargs):
+        assert '--timeout=0' in command[:command.index('--')]
+        raise Observed
+    monkeypatch.setattr(bench.processes,'run',run)
+    with pytest.raises(Observed): bench.main()

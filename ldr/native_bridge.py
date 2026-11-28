@@ -23,6 +23,21 @@ class Fallback:
         return fp.is_secret_name(value)
     def secret_text(self,value):
         return fp._looks_secret(value)
+    def bulk_leaf(self,value,kind):
+        before=fp.STATS.tmp_normalized
+        status='complete';data=b''
+        try:
+            if kind is int: data=fp._integer(value)
+            elif kind is float: data=b'f'+fp._float(value)
+            elif kind is bool: data=b'T' if value else b'F'
+            else:
+                if fp._looks_secret(value): raise fp._Stop(fp.REDACTED)
+                encoded=fp.normalize_temp_paths(value).encode('utf8','surrogatepass')
+                data=b's'+fp._u64(len(encoded))+encoded
+        except fp._Stop as error: status=error.status
+        except RecursionError: status=fp.UNKNOWN
+        except Exception: status=fp.FAILED
+        return data,status,fp.STATS.tmp_normalized-before
     def start(self,value,active,visited,partial_ok,max_nodes=None):
         self.walk.budget=fp.Budget(max_nodes)
         self.normalized_before=fp.STATS.tmp_normalized
@@ -101,7 +116,15 @@ class Readers:
         reader=getattr(self.local,'reader',None)
         if reader is None:
             reader=self.local.reader=Reader(self.module)
-        return reader.capture(value,budget,partial_ok)
+        if getattr(self.local,'active',False):
+            # A fallback may re-enter fingerprinting through a user callback.
+            # Its independent value needs an independent borrowed Rust stack.
+            return Reader(self.module).capture(value,budget,partial_ok)
+        self.local.active=True
+        try:
+            return reader.capture(value,budget,partial_ok)
+        finally:
+            self.local.active=False
 
 
 def select_reader(module=None):
@@ -122,7 +145,9 @@ def select_reader(module=None):
         engine=Reader(module)
         _self_check(engine)
         return Readers(module,engine),None
-    except Exception as error:
+    except BaseException as error:
+        if isinstance(error,(KeyboardInterrupt,SystemExit,GeneratorExit)):
+            raise
         return None,f'native load/self-check failed: {type(error).__name__}: {error}'
 
 
@@ -142,6 +167,8 @@ def _self_check(engine):
     stats={name:getattr(fp.STATS,name) for name in fp.STATS.__slots__}
     try:
         for value in values:
+            # Exercise inline storage first; Python's oracle materializes __dict__.
+            actual=engine.capture(value)
             out=hashlib.blake2b(digest_size=fp.DIGEST_BYTES)
             walk=fp._Walk(fp.DEFAULT_BUDGET,True)
             normalized=fp.STATS.tmp_normalized
@@ -151,7 +178,6 @@ def _self_check(engine):
             expected={'digest':out.hexdigest(),'visited':walk.visited,'status':status,
                       'partial':walk.partial,'immutable':walk.immutable,
                       'normalized':fp.STATS.tmp_normalized-normalized,'over_ceiling':False}
-            actual=engine.capture(value)
             for field,wanted in expected.items():
                 if actual[field]!=wanted:
                     raise ValueError(f'self-check {type(value).__name__}: {field} differs')

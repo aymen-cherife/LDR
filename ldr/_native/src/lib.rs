@@ -139,7 +139,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn watcher_count() -> i32 { layout::watcher_count() }
+fn watcher_count() -> i32 {
+    layout::watcher_count()
+}
 
 #[pyfunction]
-fn _test_panic() { panic!("injected native panic"); }
+fn _test_panic() {
+    panic!("injected native panic");
+}

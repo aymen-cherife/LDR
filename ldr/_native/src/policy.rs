@@ -49,6 +49,7 @@ impl Policy {
     }
     // None is a policy case delegated to the exact Python detector, never guessed.
     pub fn secret(&self, data: &[u8]) -> Option<bool> {
+        if !data.is_ascii() { return None; }
         for s in &self.secrets {
             if !s.is_empty() && data.windows(s.len()).any(|v| v == s) {
                 return Some(true);
@@ -59,36 +60,22 @@ impl Policy {
                 return Some(true);
             }
         }
-        let text = String::from_utf8_lossy(data);
-        let lower = if data.is_ascii() {
-            None
-        } else {
-            Some(text.to_lowercase())
-        };
-        if !MARKERS.iter().any(|s| {
-            if let Some(ref lower) = lower {
-                lower.contains(s)
-            } else {
+        if !data.is_ascii()
+            || self
+                .prefixes
+                .iter()
+                .any(|p| !p.is_empty() && data.windows(p.len()).any(|s| s == p))
+            || MARKERS.iter().any(|s| {
                 data.windows(s.len())
                     .any(|v| v.eq_ignore_ascii_case(s.as_bytes()))
-            }
-        }) {
-            return Some(false);
-        }
-        // Rust and CPython regex engines have different Unicode boundary tables.
-        // Only ASCII shape matching is claimed native; all other cases delegate.
-        if !data.is_ascii() {
+            })
+        {
+            // The blueprint assigns these decisions to Python's own policy.
             return None;
-        }
-        for p in &self.patterns {
-            match p.is_match(&text) {
-                Ok(true) => return Some(true),
-                Ok(false) => {}
-                Err(_) => return None,
-            }
         }
         Some(false)
     }
+
     pub fn secret_name(&self, data: &[u8]) -> bool {
         let text = String::from_utf8_lossy(data);
         if !text.as_bytes().windows(2).any(|w| {

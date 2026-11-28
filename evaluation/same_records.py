@@ -1,4 +1,4 @@
-"""Compare the evidence of two successive runs of orders or toolz.
+"""Compare the evidence of two successive runs of orders, toolz or attrs.
 
 --a can be a checkout or a saved JSON dump. With no --b, print the dump.
 With both sides, print every changed record and all five verdict counts.
@@ -37,13 +37,13 @@ VERSION = {"first": ("13", "c1_old"), "second": ("17", "c1_new")}
 VERDICTS = ("same", "changed", "new", "missing", "not compared")
 
 
-def source(version, *, pytest):
+def source(version, *, pytest, library="toolz"):
     value, path = VERSION[version]
     common = COMMON.replace("VALUE", value).replace("PATH", path)
     common += f"\ndef {path}(value):\n    return value\n"
     if pytest:
         stage = "removed" if version == "first" else "added"
-        return common + f"""
+        result = common + f"""
 from toolz import merge, take
 
 def test_c1_toolz_operations():
@@ -59,6 +59,10 @@ def test_c1_shared():
 def test_c1_{stage}():
     assert c1_same(5) == 5
 """
+        if library == "attrs":
+            result = result.replace("from toolz import merge, take", "from attrs import define, evolve")
+            result = result.replace("def test_c1_toolz_operations():\n    assert merge(dict(a=1), dict(b=2)) == dict(a=1, b=2)\n    assert list(take(2, [1, 2, 3])) == [1, 2]", "def test_c1_attrs_operations():\n    @define\n    class Item:\n        number: int\n    assert evolve(Item(1), number=2).number == 2")
+        return result
     return common + '\nc1_same(3)\nc1_changed(7)\nc1_path()\nc1_incomparable("test-fixture")\n'
 
 
@@ -66,18 +70,25 @@ def run_and_dump(name, fixture, checkout):
     root, _, traced = fixture
     env = overhead.environment(Path(checkout).resolve(), root)
     env["PYTHONHASHSEED"] = "0"
-    is_pytest = name == "toolz"
-    path = root / ("toolz/tests/test_ldr_c1_records.py" if is_pytest else "app.py")
+    is_pytest = name in ("toolz", "attrs")
+    path = root / ({"toolz":"toolz/tests/test_ldr_c1_records.py", "attrs":"tests/test_ldr_c3_records.py"}.get(name,"app.py"))
     if is_pytest:
         # The upstream suite samples randomness and hashes identity-based objects.
-        # Use actual Toolz code with deterministic inputs for byte-level comparison.
-        traced = traced[:4] + [path.relative_to(root).as_posix()] + traced[5:]
+        # Use actual library code with deterministic inputs for byte-level comparison.
+        traced = traced[:4] + [path.relative_to(root).as_posix()] + traced[traced.index("--"): ]
+    # A record-equivalence gate must finish reading its input, not hit the
+    # launcher's existing five-minute alarm. This is an existing CLI option.
+    if "--" in traced:
+        marker=traced.index("--")
+        traced=traced[:marker]+["--timeout=0"]+traced[marker:]
+    else:
+        traced=[*traced,"--timeout=0"]
     original = path.read_bytes() if path.exists() else None
     prefix = b"" if is_pytest else original
     overhead.clean(root)
     try:
         for version in ("first", "second"):
-            path.write_bytes(prefix + source(version, pytest=is_pytest).encode())
+            path.write_bytes(prefix + source(version, pytest=is_pytest, library=name).encode())
             overhead.timed(traced, root, env)
         return dump(root, include_records=True, include_verdicts=True)
     finally:
@@ -139,7 +150,7 @@ def main() -> int:
     parser.add_argument("--a", required=True, type=Path)
     parser.add_argument("--b", type=Path)
     parser.add_argument("--work", default=os.path.join(tempfile.gettempdir(), "ldr-overhead"))
-    parser.add_argument("--only", nargs="+", choices=("orders", "toolz"), default=("orders", "toolz"))
+    parser.add_argument("--only", nargs="+", choices=("orders", "toolz", "attrs"), default=("orders", "toolz"))
     args = parser.parse_args()
     saved = json.loads(args.a.read_text(encoding="utf-8-sig")) if args.a.is_file() else {}
     results = {}

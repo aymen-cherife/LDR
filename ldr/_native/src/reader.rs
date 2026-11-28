@@ -26,7 +26,7 @@ enum Task {
     Dict(*mut ffi::PyObject, isize, usize, isize, isize),
     Field(Option<Arc<Vec<u8>>>, *mut ffi::PyObject, usize),
     Resume(Py<PyAny>, usize),
-    Set(*mut ffi::PyObject, isize, Vec<usize>, usize, bool),
+    Set(*mut ffi::PyObject, isize, Vec<usize>, usize, bool, isize),
 }
 fn size(out: &mut Vec<u8>, n: usize) {
     out.extend_from_slice(&(n as u64).to_le_bytes())
@@ -59,6 +59,7 @@ pub struct ReaderCore {
     tasks: Vec<Task>,
     active: HashMap<usize, usize>,
     secret_names: HashMap<usize, (Arc<Vec<u8>>, bool)>,
+    delegations: HashMap<usize, (Py<PyAny>, usize)>,
 }
 #[pymethods]
 impl ReaderCore {
@@ -101,6 +102,7 @@ impl ReaderCore {
             tasks: Vec::new(),
             active: HashMap::default(),
             secret_names: HashMap::default(),
+            delegations: HashMap::default(),
         })
     }
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -109,16 +111,36 @@ impl ReaderCore {
         Ok(d.unbind())
     }
     #[pyo3(signature = (value, partial_ok, max_nodes=None))]
-    fn walk(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>, partial_ok: bool, max_nodes: Option<usize>) -> PyResult<Py<PyDict>> {
+    fn walk(
+        &mut self,
+        py: Python<'_>,
+        value: &Bound<'_, PyAny>,
+        partial_ok: bool,
+        max_nodes: Option<usize>,
+    ) -> PyResult<Py<PyDict>> {
         self.run(py, value, partial_ok, max_nodes, true)
     }
     #[pyo3(signature = (value, partial_ok, max_nodes=None))]
-    fn capture(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>, partial_ok: bool, max_nodes: Option<usize>) -> PyResult<Py<PyDict>> {
+    fn capture(
+        &mut self,
+        py: Python<'_>,
+        value: &Bound<'_, PyAny>,
+        partial_ok: bool,
+        max_nodes: Option<usize>,
+    ) -> PyResult<Py<PyDict>> {
         self.run(py, value, partial_ok, max_nodes, false)
     }
 }
 impl ReaderCore {
-    fn run(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>, partial_ok: bool, max_nodes: Option<usize>, wire: bool) -> PyResult<Py<PyDict>> {
+    fn run(
+        &mut self,
+        py: Python<'_>,
+        value: &Bound<'_, PyAny>,
+        partial_ok: bool,
+        max_nodes: Option<usize>,
+        wire: bool,
+    ) -> PyResult<Py<PyDict>> {
+        self.delegations.clear();
         let mut tasks = std::mem::take(&mut self.tasks);
         tasks.push(Task::Value(value.as_ptr(), 0));
         let mut active = std::mem::take(&mut self.active);
@@ -166,7 +188,10 @@ impl ReaderCore {
                         }
                         if item.is_null() {
                             visited += 1;
-if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); break; }
+                            if max_nodes.is_some_and(|limit| visited > limit) {
+                                status = "unknown".into();
+                                break;
+                            }
                             self.buffers[target].push(b'u')
                         } else {
                             self.buffers[target].push(b'v');
@@ -220,7 +245,8 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                                     .contains(&k);
                                 if !simple {
                                     if delegated_controls.insert(obj as usize, ()).is_none() {
-                                        delegated += 1
+                                        delegated += 1;
+                                        self.record_delegation(py, ffi::Py_TYPE(obj), 1);
                                     }
                                     for address in active.keys() {
                                         keepers.push(Py::from_borrowed_ptr(
@@ -262,7 +288,11 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                             tasks.push(Task::Value(key, target));
                         }
                     }
-                    Task::Set(obj, mut pos, mut parts, target, frozen) => {
+                    Task::Set(obj, mut pos, mut parts, target, frozen, expected) => {
+                        if ffi::PySet_Size(obj) != expected {
+                            status = "failed".into();
+                            break;
+                        }
                         let mut key = std::ptr::null_mut();
                         let mut hash = 0;
                         if _PySet_NextEntry(obj, &mut pos, &mut key, &mut hash) != 0 {
@@ -272,7 +302,7 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                                 self.buffers.push(Vec::new())
                             }
                             parts.push(child);
-                            tasks.push(Task::Set(obj, pos, parts, target, frozen));
+                            tasks.push(Task::Set(obj, pos, parts, target, frozen, expected));
                             tasks.push(Task::Value(key, child));
                         } else {
                             let mut hashes: Vec<_> =
@@ -308,6 +338,8 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                             &mut immutable,
                             &mut status,
                             &mut normalized,
+                            &mut delegated,
+                            std::ptr::addr_of_mut!(ffi::PyBaseObject_Type),
                         )?;
                         if status != "complete" {
                             break;
@@ -315,7 +347,10 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                     }
                     Task::Value(obj, target) => {
                         visited += 1;
-if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); break; }
+                        if max_nodes.is_some_and(|limit| visited > limit) {
+                            status = "unknown".into();
+                            break;
+                        }
                         let kind = ffi::Py_TYPE(obj);
                         if obj == ffi::Py_None() {
                             self.buffers[target].push(b'N')
@@ -373,19 +408,67 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                                 if !tuple && !frozen {
                                     immutable = false
                                 }
-                                let count = if list { ffi::PyList_Size(obj) } else if tuple { ffi::PyTuple_Size(obj) } else { 0 };
-                                let first = if count > 0 { if list { ffi::PyList_GetItem(obj, 0) } else { ffi::PyTuple_GetItem(obj, 0) } } else { std::ptr::null_mut() };
-                                let numeric_bulk = count as usize >= self.fast_min && !first.is_null()
-                                    && [std::ptr::addr_of_mut!(ffi::PyLong_Type), std::ptr::addr_of_mut!(ffi::PyFloat_Type), std::ptr::addr_of_mut!(ffi::PyBool_Type)].contains(&ffi::Py_TYPE(first))
-                                    && (0..count).all(|i| ffi::Py_TYPE(if list { ffi::PyList_GetItem(obj,i) } else { ffi::PyTuple_GetItem(obj,i) }) == ffi::Py_TYPE(first));
-                                if numeric_bulk {
-                                    protect(py, &tasks, &active, &mut keepers);
-                                    let snapshot = PyDict::new(py);
-                                    for (key, depth) in &active { snapshot.set_item(*key, *depth)?; }
-                                    delegated += 1;
-                                    let result = self.fallback.bind(py).call_method1("start", (Bound::from_borrowed_ptr(py,obj), snapshot, visited, partial_ok, max_nodes))?;
-                                    self.apply(py,result.downcast::<PyTuple>()?,target,&mut tasks,&mut active,&mut keepers,&mut visited,&mut partial,&mut immutable,&mut status,&mut normalized)?;
-                                    if status != "complete" { break; }
+                                let count = if list {
+                                    ffi::PyList_Size(obj)
+                                } else if tuple {
+                                    ffi::PyTuple_Size(obj)
+                                } else {
+                                    0
+                                };
+                                let first = if count > 0 {
+                                    if list {
+                                        ffi::PyList_GetItem(obj, 0)
+                                    } else {
+                                        ffi::PyTuple_GetItem(obj, 0)
+                                    }
+                                } else {
+                                    std::ptr::null_mut()
+                                };
+                                let numeric_bulk = count as usize >= self.fast_min
+                                    && !first.is_null()
+                                    && [
+                                        std::ptr::addr_of_mut!(ffi::PyLong_Type),
+                                        std::ptr::addr_of_mut!(ffi::PyFloat_Type),
+                                        std::ptr::addr_of_mut!(ffi::PyBool_Type),
+                                    ]
+                                    .contains(&ffi::Py_TYPE(first))
+                                    && (0..count).all(|i| {
+                                        ffi::Py_TYPE(if list {
+                                            ffi::PyList_GetItem(obj, i)
+                                        } else {
+                                            ffi::PyTuple_GetItem(obj, i)
+                                        }) == ffi::Py_TYPE(first)
+                                    });
+                                let string_bulk = count as usize >= self.fast_min
+                                    && !first.is_null()
+                                    && ffi::Py_TYPE(first)
+                                        == std::ptr::addr_of_mut!(ffi::PyUnicode_Type)
+                                    && (0..count).all(|i| {
+                                        ffi::Py_TYPE(if list {
+                                            ffi::PyList_GetItem(obj, i)
+                                        } else {
+                                            ffi::PyTuple_GetItem(obj, i)
+                                        }) == std::ptr::addr_of_mut!(ffi::PyUnicode_Type)
+                                    });
+                                if numeric_bulk || string_bulk {
+                                    self.bulk(
+                                        py,
+                                        obj,
+                                        tuple,
+                                        ffi::Py_TYPE(first),
+                                        target,
+                                        &tasks,
+                                        &active,
+                                        &mut keepers,
+                                        &mut visited,
+                                        &mut delegated,
+                                        &mut normalized,
+                                        &mut status,
+                                        max_nodes,
+                                    )?;
+                                    if status != "complete" {
+                                        break;
+                                    }
                                     continue;
                                 }
                                 let address = obj as usize;
@@ -397,7 +480,14 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                                 active.insert(address, active.len());
                                 tasks.push(Task::Leave(address));
                                 if set || frozen {
-                                    tasks.push(Task::Set(obj, 0, Vec::new(), target, frozen));
+                                    tasks.push(Task::Set(
+                                        obj,
+                                        0,
+                                        Vec::new(),
+                                        target,
+                                        frozen,
+                                        ffi::PySet_Size(obj),
+                                    ));
                                 } else if dict {
                                     self.buffers[target].push(b'd');
                                     size(&mut self.buffers[target], ffi::PyDict_Size(obj) as usize);
@@ -416,90 +506,7 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                                     };
                                     self.buffers[target].push(if tuple { b't' } else { b'l' });
                                     size(&mut self.buffers[target], count as usize);
-                                    let string_run = count as usize >= self.fast_min
-                                        && (0..count).all(|i| {
-                                            ffi::Py_TYPE(if tuple {
-                                                ffi::PyTuple_GetItem(obj, i)
-                                            } else {
-                                                ffi::PyList_GetItem(obj, i)
-                                            }) == std::ptr::addr_of_mut!(ffi::PyUnicode_Type)
-                                        });
-                                    if string_run {
-                                        self.string_buffer.clear();
-                                        let mut secret = false;
-                                        let mut string_delegated = 0;
-                                        let mut string_normalized = 0;
-                                        for i in 0..count {
-                                            let item = if tuple {
-                                                ffi::PyTuple_GetItem(obj, i)
-                                            } else {
-                                                ffi::PyList_GetItem(obj, i)
-                                            };
-                                            if item.is_null() {
-                                                ffi::PyErr_Clear();
-                                                status = "failed".into();
-                                                break;
-                                            }
-                                            let object = Bound::from_borrowed_ptr(py, item);
-                                            let data = unicode::payload(py, &object)?;
-                                            let found = match self.policy.secret(&data) {
-                                                Some(found) => found,
-                                                None => {
-                                                    for address in active.keys() {
-                                                        keepers.push(Py::from_borrowed_ptr(
-                                                            py,
-                                                            *address as *mut ffi::PyObject,
-                                                        ));
-                                                    }
-                                                    for pending in &tasks {
-                                                        match pending {
-                                                            Task::Value(p, _)
-                                                            | Task::Field(_, p, _)
-                                                                if !p.is_null() =>
-                                                            {
-                                                                keepers.push(Py::from_borrowed_ptr(
-                                                                    py, *p,
-                                                                ))
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                    string_delegated += 1;
-                                                    self.fallback
-                                                        .bind(py)
-                                                        .call_method1(
-                                                            "secret_text",
-                                                            (object.clone(),),
-                                                        )?
-                                                        .extract()?
-                                                }
-                                            };
-                                            if found {
-                                                secret = true;
-                                                break;
-                                            }
-                                            let (bytes, number) = self.policy.normalize(&data);
-                                            string_normalized += number;
-                                            text(&mut self.string_buffer, b's', &bytes);
-                                        }
-                                        normalized += string_normalized;
-                                        if status != "complete" {
-                                            break;
-                                        }
-                                        if secret {
-                                            if string_delegated > 0 {
-                                                delegated += 1
-                                            }
-                                            status = "redacted".into();
-                                            break;
-                                        }
-                                        delegated += string_delegated;
-                                        visited += count as usize;
-if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); break; }
-                                        self.buffers[target].extend_from_slice(&self.string_buffer);
-                                    } else {
-                                        tasks.push(Task::Sequence(obj, 0, count, tuple, target));
-                                    }
+                                    tasks.push(Task::Sequence(obj, 0, count, tuple, target));
                                 }
                             } else if let Some(layout) = layout::get(
                                 py,
@@ -604,6 +611,7 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                 }
                 if let Some((obj, target)) = delegate {
                     delegated += 1;
+                    self.record_delegation(py, ffi::Py_TYPE(obj), 1);
                     protect(py, &tasks, &active, &mut keepers);
                     for address in active.keys() {
                         keepers.push(Py::from_borrowed_ptr(py, *address as *mut ffi::PyObject));
@@ -621,10 +629,10 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                         snapshot.set_item(*key, *depth)?;
                     }
                     let object = Bound::from_borrowed_ptr(py, obj);
-                    let result = self
-                        .fallback
-                        .bind(py)
-                        .call_method1("start", (object, snapshot, visited, partial_ok, max_nodes))?;
+                    let result = self.fallback.bind(py).call_method1(
+                        "start",
+                        (object, snapshot, visited, partial_ok, max_nodes),
+                    )?;
                     self.apply(
                         py,
                         result.downcast::<PyTuple>()?,
@@ -637,6 +645,8 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
                         &mut immutable,
                         &mut status,
                         &mut normalized,
+                        &mut delegated,
+                        std::ptr::addr_of_mut!(ffi::PyBaseObject_Type),
                     )?;
                     if status != "complete" {
                         break;
@@ -651,11 +661,21 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
         let hash = digest(&self.buffers[0]);
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         let result = PyDict::new(py);
-        if wire { result.set_item("bytes", PyBytes::new(py, &self.buffers[0]))?; }
-        result.set_item("over_ceiling", max_nodes.is_some_and(|limit| visited > limit))?;
+        if wire {
+            result.set_item("bytes", PyBytes::new(py, &self.buffers[0]))?;
+        }
+        result.set_item(
+            "over_ceiling",
+            max_nodes.is_some_and(|limit| visited > limit),
+        )?;
         result.set_item("digest", hex)?;
         result.set_item("visited", visited)?;
         result.set_item("delegated", delegated)?;
+        let types = PyDict::new(py);
+        for (kind, count) in self.delegations.values() {
+            types.set_item(kind.bind(py), count)?;
+        }
+        result.set_item("delegated_by_type", types)?;
         result.set_item("status", status)?;
         result.set_item("partial", partial)?;
         result.set_item("immutable", immutable)?;
@@ -664,6 +684,142 @@ if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); b
     }
 }
 impl ReaderCore {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bulk(
+        &mut self,
+        py: Python<'_>,
+        obj: *mut ffi::PyObject,
+        tuple: bool,
+        expected: *mut ffi::PyTypeObject,
+        target: usize,
+        tasks: &[Task],
+        active: &HashMap<usize, usize>,
+        keepers: &mut Vec<Py<PyAny>>,
+        visited: &mut usize,
+        delegated: &mut usize,
+        normalized: &mut usize,
+        status: &mut String,
+        max_nodes: Option<usize>,
+    ) -> PyResult<()> {
+        keepers.push(Py::from_borrowed_ptr(py, obj));
+        let length = |obj| {
+            if tuple {
+                ffi::PyTuple_Size(obj)
+            } else {
+                ffi::PyList_Size(obj)
+            }
+        };
+        self.buffers[target].push(if tuple { b't' } else { b'l' });
+        size(&mut self.buffers[target], length(obj) as usize);
+        self.string_buffer.clear();
+        let mut pending: HashMap<usize, (Py<PyAny>, usize)> = HashMap::default();
+        let mut index = 0;
+        while index < length(obj) {
+            let item = if tuple {
+                ffi::PyTuple_GetItem(obj, index)
+            } else {
+                ffi::PyList_GetItem(obj, index)
+            };
+            let kind = ffi::Py_TYPE(item);
+            let mut native = false;
+            if expected == std::ptr::addr_of_mut!(ffi::PyLong_Type)
+                && (kind == expected || kind == std::ptr::addr_of_mut!(ffi::PyBool_Type))
+            {
+                let number = ffi::PyLong_AsLongLong(item);
+                if ffi::PyErr_Occurred().is_null() {
+                    self.string_buffer.push(b'i');
+                    self.string_buffer.extend_from_slice(&number.to_le_bytes());
+                    native = true;
+                } else {
+                    ffi::PyErr_Clear();
+                }
+            } else if expected == std::ptr::addr_of_mut!(ffi::PyFloat_Type) && kind == expected {
+                let number = ffi::PyFloat_AsDouble(item);
+                self.string_buffer.push(b'f');
+                self.string_buffer.extend_from_slice(
+                    &(if number.is_nan() {
+                        0x7ff8000000000000
+                    } else {
+                        number.to_bits()
+                    })
+                    .to_le_bytes(),
+                );
+                native = true;
+            } else if expected == std::ptr::addr_of_mut!(ffi::PyBool_Type) && kind == expected {
+                self.string_buffer
+                    .push(if item == ffi::Py_True() { b'T' } else { b'F' });
+                native = true;
+            } else if expected == std::ptr::addr_of_mut!(ffi::PyUnicode_Type) && kind == expected {
+                let object = Bound::from_borrowed_ptr(py, item);
+                let data = unicode::payload(py, &object)?;
+                match self.policy.secret(&data) {
+                    Some(true) => {
+                        *status = "redacted".into();
+                        break;
+                    }
+                    Some(false) => {
+                        text(&mut self.string_buffer, b's', &data);
+                        native = true;
+                    }
+                    None => {}
+                }
+            }
+            if !native {
+                protect(py, tasks, active, keepers);
+                let object = Bound::from_borrowed_ptr(py, item);
+                pending
+                    .entry(kind as usize)
+                    .and_modify(|row| row.1 += 1)
+                    .or_insert_with(|| (Py::from_borrowed_ptr(py, kind.cast()), 1));
+                let result = self.fallback.bind(py).call_method1(
+                    "bulk_leaf",
+                    (object, Bound::from_borrowed_ptr(py, expected.cast())),
+                )?;
+                let row = result.downcast::<PyTuple>()?;
+                *normalized += row.get_item(2)?.extract::<usize>()?;
+                *status = row.get_item(1)?.extract()?;
+                if status != "complete" {
+                    break;
+                }
+                self.string_buffer
+                    .extend_from_slice(row.get_item(0)?.downcast::<PyBytes>()?.as_bytes());
+            }
+            index += 1;
+        }
+        if status != "complete" {
+            // Python's atomic bulk path charges only its container on failure.
+            if !pending.is_empty() {
+                *delegated += 1;
+                self.record_delegation(py, ffi::Py_TYPE(obj), 1);
+            }
+            return Ok(());
+        }
+        *visited += length(obj) as usize;
+        for (kind, count) in pending.into_values() {
+            *delegated += count;
+            self.record_delegation(py, kind.as_ptr().cast(), count);
+        }
+        if max_nodes.is_some_and(|limit| *visited > limit) {
+            *status = "unknown".into();
+            return Ok(());
+        }
+        self.buffers[target].extend_from_slice(&self.string_buffer);
+        Ok(())
+    }
+    unsafe fn record_delegation(
+        &mut self,
+        py: Python<'_>,
+        kind: *mut ffi::PyTypeObject,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.delegations
+            .entry(kind as usize)
+            .and_modify(|row| row.1 += count)
+            .or_insert_with(|| (Py::from_borrowed_ptr(py, kind.cast()), count));
+    }
     #[allow(clippy::too_many_arguments)]
     fn apply(
         &mut self,
@@ -678,10 +834,18 @@ impl ReaderCore {
         immutable: &mut bool,
         status: &mut String,
         normalized: &mut usize,
+        delegated: &mut usize,
+        extra_kind: *mut ffi::PyTypeObject,
     ) -> PyResult<()> {
         let bytes = row.get_item(0)?;
         self.buffers[target].extend_from_slice(bytes.downcast::<PyBytes>()?.as_bytes());
-        *visited = row.get_item(4)?.extract()?;
+        let next: usize = row.get_item(4)?.extract()?;
+        let extra = next.saturating_sub(*visited);
+        *delegated += extra;
+        unsafe {
+            self.record_delegation(py, extra_kind, extra);
+        }
+        *visited = next;
         *active = row.get_item(5)?.extract()?;
         *partial |= row.get_item(6)?.extract::<bool>()?;
         *immutable &= row.get_item(7)?.extract::<bool>()?;
@@ -704,13 +868,26 @@ impl ReaderCore {
 }
 
 // Every borrowed container and pending child must survive a Python callback.
-unsafe fn protect(py: Python<'_>, tasks: &[Task], active: &HashMap<usize,usize>, keepers: &mut Vec<Py<PyAny>>) {
-    for address in active.keys() { keepers.push(Py::from_borrowed_ptr(py,*address as *mut ffi::PyObject)); }
+unsafe fn protect(
+    py: Python<'_>,
+    tasks: &[Task],
+    active: &HashMap<usize, usize>,
+    keepers: &mut Vec<Py<PyAny>>,
+) {
+    for address in active.keys() {
+        keepers.push(Py::from_borrowed_ptr(py, *address as *mut ffi::PyObject));
+    }
     for task in tasks {
         let object = match task {
-            Task::Value(p,_) | Task::Field(_,p,_) | Task::Sequence(p,..) | Task::Dict(p,..) | Task::Set(p,..) => *p,
+            Task::Value(p, _)
+            | Task::Field(_, p, _)
+            | Task::Sequence(p, ..)
+            | Task::Dict(p, ..)
+            | Task::Set(p, ..) => *p,
             _ => std::ptr::null_mut(),
         };
-        if !object.is_null() { keepers.push(Py::from_borrowed_ptr(py,object)); }
+        if !object.is_null() {
+            keepers.push(Py::from_borrowed_ptr(py, object));
+        }
     }
 }

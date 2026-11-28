@@ -93,7 +93,9 @@ pub unsafe fn get<P: FnMut()>(
         let retired = if cache.0 != epoch {
             cache.0 = epoch;
             Some(std::mem::take(&mut cache.1))
-        } else { None };
+        } else {
+            None
+        };
         (retired, cache.1.get(&(kind as usize)).cloned())
     };
     drop(retired);
@@ -105,11 +107,15 @@ pub unsafe fn get<P: FnMut()>(
                     let current = ffi::PyList_GetItem(list, i as isize);
                     match old {
                         Some(old) => old.as_ptr() == current,
-                        None => ffi::Py_TYPE(current) != std::ptr::addr_of_mut!(ffi::PyUnicode_Type),
+                        None => {
+                            ffi::Py_TYPE(current) != std::ptr::addr_of_mut!(ffi::PyUnicode_Type)
+                        }
                     }
                 })
         });
-        if valid { return Ok(Some(layout)); }
+        if valid {
+            return Ok(Some(layout));
+        }
         let removed = { c.lock().unwrap().1.remove(&(kind as usize)) };
         drop(removed);
     }
@@ -348,7 +354,9 @@ pub unsafe fn get<P: FnMut()>(
     // outside the mutex. The GIL serializes all walkers and callbacks here.
     let mut entries = { std::mem::take(&mut c.lock().unwrap().1) };
     let removed = entries.insert(kind as usize, layout.clone());
-    { c.lock().unwrap().1 = entries; }
+    {
+        c.lock().unwrap().1 = entries;
+    }
     drop(removed);
     Ok(Some(layout))
 }
@@ -454,7 +462,9 @@ unsafe fn dict_items(
 pub fn initialize(py: Python<'_>) -> PyResult<()> {
     if WATCHER.load(Ordering::Relaxed) < 0 {
         let id = unsafe { PyType_AddWatcher(changed) };
-        if id < 0 { return Err(PyErr::fetch(py)); }
+        if id < 0 {
+            return Err(PyErr::fetch(py));
+        }
         WATCHER.store(id, Ordering::Relaxed);
     }
     Ok(())

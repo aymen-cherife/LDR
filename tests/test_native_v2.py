@@ -1,6 +1,7 @@
 """Parity tests for the standalone native walk core, before runtime integration."""
 import hashlib
 import importlib.util
+import importlib
 from pathlib import Path
 import random
 import sys
@@ -10,6 +11,15 @@ from ldr import fingerprint as fp
 
 
 def native():
+    # Prefer the importable extension so runtime and tests share one watcher.
+    try:
+        module = importlib.import_module('ldr._native')
+    except ModuleNotFoundError as error:
+        if error.name != 'ldr._native':
+            raise
+        module = None
+    if hasattr(module, 'ReaderCore'):
+        return module
     path = Path(__file__).parents[1] / 'ldr/_native/target' / f'py{sys.version_info.major}{sys.version_info.minor}' / 'release/lib_native.so'
     if not path.exists():
         pytest.skip('native module not built')

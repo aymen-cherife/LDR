@@ -1,0 +1,572 @@
+{
+  "batch": "C3 part 3",
+  "status": "incomplete: Gate 2 attrs Python reference killed; step 4 not run",
+  "base_commit": "53b155cab540f683781ee673bd2500e84312f29f",
+  "commits": {
+    "step_0": "1ee22d6",
+    "step_1": "ca95d20",
+    "step_2": "b5415da",
+    "partial_step_3": "this commit"
+  },
+  "elapsed_seconds_since_ci_log_fetch": 5162,
+  "conditions": {
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "architecture": "x86_64",
+    "hash_seed": "0",
+    "machine_check": "machine: ok - 0 run(s) alive, disk 58.0 GB free (92.1%), runs stored 0 / keep_runs 2, CPU 0% busy, python start 0.02 s, Python 3.12.14, reader native, LDR 0.6.0, native 0.1.0, Python build normal, venv yes, check 1.029 s wall, 0.006 s CPU",
+    "build": {
+      "profile": "release",
+      "lto": "fat",
+      "codegen_units": 1,
+      "panic": "unwind",
+      "abi3": false,
+      "cpu_specific_flags": false
+    },
+    "rich": "15.0.0, real nine-file subset",
+    "pytest": "8.4.2 for the live Rich corpus",
+    "source_sha256": {
+      "ldr/fingerprint.py": "db9006fae90c13f06d44f826ddcc6415cc02b53e3adffe36920a813da22a57de",
+      "ldr/native_bridge.py": "10d76e987a7ffd84ffa2cc9a4da78fcf3ccb123906837682f740ab4dd6a55a93",
+      "ldr/_native/src/reader.rs": "5e97f8a411fb238e9f88b8addd68af099ee02b952c819604801eac01922ae0ab",
+      "ldr/_native/src/layout.rs": "dfc8b5dc25915136b1a23b6639693a4ecf46a14f2b5df64bb048527b6a5cde7b",
+      "ldr/_native/src/policy.rs": "8dd0786ab070962ef1bd12cbb4a562660515fb09243583cb238fb232153dcfef",
+      "ldr/_native/src/unicode.rs": "ca72224147c6fdd9fc4c7e42526824af7dca1f070551037d9f13da5bcc40b6d8",
+      "ldr/_native/src/lib.rs": "36e0e96ec2245f18decb020cd6de44350d3e24934e66c26046460cf296e9a24e",
+      "ldr/_native/Cargo.toml": "694c88ce9048250fff93f9afae24336530c7a8ca5f5ca6b6ecc7e14e67ac7d23",
+      "ldr/_native/Cargo.lock": "9b87f1b3ac6160917e9439c6de8a5e1ee82288b2a924cf9e7519c21633d76799"
+    }
+  },
+  "previous_ci": {
+    "run": 46044017503,
+    "ubuntu": "Missing historical commit 3976cd4 in shallow checkout",
+    "windows": "Same shallow-history failure, plus Unix-only resource import in signature_bench peak_memory",
+    "fix_validation": "11 passed, 1 skipped; no CI wait or workflow change"
+  },
+  "gate_1": {
+    "targeted": {
+      "3.12.14": {
+        "passed": 149,
+        "skipped": 1
+      },
+      "3.13.5": {
+        "passed": 149,
+        "skipped": 1
+      }
+    },
+    "skip": "existing Windows-only process-helper test on Linux; no native skips with the module built",
+    "seeds": [
+      "0",
+      "1",
+      "random"
+    ],
+    "hypothesis": "6.170.17; default generated-example count, deadline disabled",
+    "fingerprint_positions_each_version": {
+      "values": 23245,
+      "positions": 2617850,
+      "missing": 0
+    },
+    "fingerprint_subprocesses_each_version": {
+      "values": 180,
+      "nodes": 10825,
+      "mismatches": 0
+    },
+    "unbuilt_module_targeted": {
+      "passed": 10,
+      "skipped": 67,
+      "skip_reason": "native module not built"
+    },
+    "live_corpus": {
+      "3.12.14": {
+        "fixture": "rich-15.0.0-nine-files",
+        "pythonhashseed": "0",
+        "python": "3.12.14",
+        "platform": "linux",
+        "normal_exit": 0,
+        "retained_exit": 0,
+        "result_differences": [],
+        "normal_wall_seconds": 21.03469866800151,
+        "retained_wall_seconds": 88.08803078100027,
+        "benchmark": {
+          "reader": "python-v2",
+          "values": 300848,
+          "nodes": 12219504,
+          "seconds": 27.31764673,
+          "ns_per_node": 2235.5773794091806,
+          "statuses": {
+            "complete": 265071,
+            "unsupported": 35777
+          },
+          "top_types": [
+            {
+              "type": "rich.theme.ThemeStack",
+              "values": 2357,
+              "nodes": 6710379,
+              "seconds": 15.401987574
+            },
+            {
+              "type": "rich.theme.Theme",
+              "values": 408,
+              "nodes": 1160760,
+              "seconds": 2.591348007
+            },
+            {
+              "type": "builtins.list",
+              "values": 21027,
+              "nodes": 635029,
+              "seconds": 1.476435353
+            },
+            {
+              "type": "rich.style.Style",
+              "values": 50360,
+              "nodes": 711200,
+              "seconds": 1.462675168
+            },
+            {
+              "type": "rich.console.Console",
+              "values": 25189,
+              "nodes": 732189,
+              "seconds": 1.412101338
+            },
+            {
+              "type": "rich.text.Text",
+              "values": 44738,
+              "nodes": 569673,
+              "seconds": 1.327915556
+            },
+            {
+              "type": "rich.containers.Lines",
+              "values": 19324,
+              "nodes": 333602,
+              "seconds": 0.798546407
+            },
+            {
+              "type": "rich.console.ConsoleOptions",
+              "values": 22556,
+              "nodes": 360896,
+              "seconds": 0.654271235
+            },
+            {
+              "type": "rich.segment.Segment",
+              "values": 14219,
+              "nodes": 166126,
+              "seconds": 0.424063213
+            },
+            {
+              "type": "rich.table.Table",
+              "values": 911,
+              "nodes": 160839,
+              "seconds": 0.324457324
+            }
+          ],
+          "peak_rss_bytes": 82391040
+        },
+        "native_benchmark": {
+          "reader": "native-v2",
+          "values": 300848,
+          "nodes": 12219504,
+          "seconds": 2.804049514,
+          "ns_per_node": 229.47326781839917,
+          "delegated_nodes": 213050,
+          "native_nodes": 12006454,
+          "delegated_by_type": {
+            "builtins.str": 57758,
+            "_thread.RLock": 37919,
+            "builtins.builtin_function_or_method": 27137,
+            "_io.StringIO": 19818,
+            "builtins.type": 17174,
+            "rich.highlighter.ReprHighlighter": 13677,
+            "builtins.list_iterator": 13660,
+            "rich.console.ConsoleThreadLocals": 12392,
+            "builtins.generator": 3426,
+            "builtins.builtin_method": 2296,
+            "abc.ABCMeta": 2010,
+            "builtins.str_iterator": 1682,
+            "re.Pattern": 901,
+            "builtins.function": 830,
+            "_pytest.capture.EncodedFile": 716,
+            "builtins.bytes": 552,
+            "collections.deque": 230,
+            "builtins.zip": 100,
+            "builtins.enumerate": 98,
+            "builtins.tuple_iterator": 76,
+            "unittest.mock._Call": 68,
+            "builtins.dict_itemiterator": 42,
+            "unittest.mock._CallList": 36,
+            "tests.test_pretty.test_user_dict.<locals>.D2": 36,
+            "tests.test_pretty.test_user_dict.<locals>.D1": 34,
+            "builtins.callable_iterator": 32,
+            "tests.test_pretty.test_broken_getattr.<locals>.BrokenAttr": 28,
+            "collections.defaultdict": 26,
+            "_io.BytesIO": 25,
+            "re.Match": 24,
+            "rich.pager.SystemPager": 24,
+            "array.array": 24,
+            "tests.test_pretty.test_lying_attribute.<locals>.Foo": 24,
+            "_io.TextIOWrapper": 23,
+            "_pytest.capture.CaptureIO": 20,
+            "builtins.dict_items": 16,
+            "builtins.slice": 12,
+            "unittest.mock.MagicMock": 12,
+            "builtins.AttributeError": 12,
+            "builtins.mappingproxy": 11,
+            "rich.highlighter.JSONHighlighter": 10,
+            "typing._ProtocolMeta": 10,
+            "builtins.NotImplementedType": 7,
+            "itertools.filterfalse": 7,
+            "datetime.datetime": 7,
+            "rich.live.Live": 5,
+            "builtins.str_ascii_iterator": 4,
+            "_thread.lock": 4,
+            "builtins.dict": 4,
+            "_pytest.fixtures.SubRequest": 4,
+            "_pytest.python.Function": 4,
+            "rich.highlighter.NullHighlighter": 2,
+            "builtins.filter": 1
+          },
+          "native_share": 0.9825647587659859,
+          "statuses": {
+            "complete": 265071,
+            "unsupported": 35777
+          },
+          "top_types": [
+            {
+              "type": "rich.console.Console",
+              "values": 25189,
+              "nodes": 732189,
+              "seconds": 0.792054553
+            },
+            {
+              "type": "rich.theme.ThemeStack",
+              "values": 2357,
+              "nodes": 6710379,
+              "seconds": 0.68111563
+            },
+            {
+              "type": "rich.text.Text",
+              "values": 44738,
+              "nodes": 569673,
+              "seconds": 0.144399161
+            },
+            {
+              "type": "rich.style.Style",
+              "values": 50360,
+              "nodes": 711200,
+              "seconds": 0.13884435
+            },
+            {
+              "type": "rich.theme.Theme",
+              "values": 408,
+              "nodes": 1160760,
+              "seconds": 0.113032305
+            },
+            {
+              "type": "builtins.list",
+              "values": 21027,
+              "nodes": 635029,
+              "seconds": 0.105491983
+            },
+            {
+              "type": "builtins.list_iterator",
+              "values": 13660,
+              "nodes": 13660,
+              "seconds": 0.099616215
+            },
+            {
+              "type": "rich.containers.Lines",
+              "values": 19324,
+              "nodes": 333602,
+              "seconds": 0.076620797
+            },
+            {
+              "type": "rich.table.Table",
+              "values": 911,
+              "nodes": 160839,
+              "seconds": 0.071785545
+            },
+            {
+              "type": "rich.console.ConsoleOptions",
+              "values": 22556,
+              "nodes": 360896,
+              "seconds": 0.068967366
+            }
+          ],
+          "peak_rss_bytes": 82391040
+        },
+        "parity_values": 300848,
+        "total_wall_seconds": 109.16141906099801
+      },
+      "3.13.5": {
+        "fixture": "rich-15.0.0-nine-files",
+        "pythonhashseed": "0",
+        "python": "3.13.5",
+        "platform": "linux",
+        "normal_exit": 0,
+        "retained_exit": 0,
+        "result_differences": [],
+        "normal_wall_seconds": 22.190874637999514,
+        "retained_wall_seconds": 89.90640479300055,
+        "benchmark": {
+          "reader": "python-v2",
+          "values": 300581,
+          "nodes": 12209728,
+          "seconds": 29.016693235,
+          "ns_per_node": 2376.522493785283,
+          "statuses": {
+            "complete": 264901,
+            "unsupported": 35680
+          },
+          "top_types": [
+            {
+              "type": "rich.theme.ThemeStack",
+              "values": 2357,
+              "nodes": 6710379,
+              "seconds": 16.319632018
+            },
+            {
+              "type": "rich.theme.Theme",
+              "values": 408,
+              "nodes": 1160760,
+              "seconds": 2.833571855
+            },
+            {
+              "type": "rich.style.Style",
+              "values": 50359,
+              "nodes": 711188,
+              "seconds": 1.577512352
+            },
+            {
+              "type": "builtins.list",
+              "values": 20950,
+              "nodes": 630148,
+              "seconds": 1.56003634
+            },
+            {
+              "type": "rich.text.Text",
+              "values": 44738,
+              "nodes": 569673,
+              "seconds": 1.446958225
+            },
+            {
+              "type": "rich.console.Console",
+              "values": 25095,
+              "nodes": 730439,
+              "seconds": 1.445561079
+            },
+            {
+              "type": "rich.containers.Lines",
+              "values": 19324,
+              "nodes": 333602,
+              "seconds": 0.881031137
+            },
+            {
+              "type": "rich.console.ConsoleOptions",
+              "values": 22556,
+              "nodes": 360896,
+              "seconds": 0.674341191
+            },
+            {
+              "type": "rich.segment.Segment",
+              "values": 14219,
+              "nodes": 166126,
+              "seconds": 0.453705169
+            },
+            {
+              "type": "rich.table.Table",
+              "values": 911,
+              "nodes": 160839,
+              "seconds": 0.320229787
+            }
+          ],
+          "peak_rss_bytes": 88236032
+        },
+        "native_benchmark": {
+          "reader": "native-v2",
+          "values": 300581,
+          "nodes": 12209728,
+          "seconds": 2.859864833,
+          "ns_per_node": 234.22838190990004,
+          "delegated_nodes": 212882,
+          "native_nodes": 11996846,
+          "delegated_by_type": {
+            "builtins.str": 57762,
+            "_thread.RLock": 37823,
+            "builtins.builtin_function_or_method": 27137,
+            "_io.StringIO": 19746,
+            "builtins.type": 17172,
+            "rich.highlighter.ReprHighlighter": 13677,
+            "builtins.list_iterator": 13660,
+            "rich.console.ConsoleThreadLocals": 12392,
+            "builtins.generator": 3424,
+            "builtins.builtin_method": 2296,
+            "abc.ABCMeta": 2010,
+            "builtins.str_iterator": 1682,
+            "re.Pattern": 901,
+            "builtins.function": 829,
+            "_pytest.capture.EncodedFile": 716,
+            "builtins.bytes": 552,
+            "collections.deque": 230,
+            "builtins.zip": 100,
+            "builtins.enumerate": 98,
+            "builtins.tuple_iterator": 75,
+            "unittest.mock._Call": 68,
+            "builtins.dict_itemiterator": 42,
+            "unittest.mock._CallList": 36,
+            "tests.test_pretty.test_user_dict.<locals>.D2": 36,
+            "tests.test_pretty.test_user_dict.<locals>.D1": 34,
+            "builtins.callable_iterator": 32,
+            "tests.test_pretty.test_broken_getattr.<locals>.BrokenAttr": 28,
+            "collections.defaultdict": 26,
+            "_io.BytesIO": 25,
+            "re.Match": 24,
+            "rich.pager.SystemPager": 24,
+            "array.array": 24,
+            "tests.test_pretty.test_lying_attribute.<locals>.Foo": 24,
+            "_io.TextIOWrapper": 23,
+            "_pytest.capture.CaptureIO": 20,
+            "builtins.dict_items": 16,
+            "builtins.slice": 12,
+            "unittest.mock.MagicMock": 12,
+            "builtins.AttributeError": 12,
+            "builtins.mappingproxy": 11,
+            "rich.highlighter.JSONHighlighter": 10,
+            "typing._ProtocolMeta": 10,
+            "builtins.NotImplementedType": 7,
+            "itertools.filterfalse": 7,
+            "datetime.datetime": 7,
+            "rich.live.Live": 5,
+            "builtins.str_ascii_iterator": 4,
+            "builtins.dict": 4,
+            "_thread.lock": 4,
+            "_pytest.fixtures.SubRequest": 4,
+            "_pytest.python.Function": 4,
+            "builtins.FrameLocalsProxy": 2,
+            "rich.highlighter.NullHighlighter": 2,
+            "builtins.filter": 1
+          },
+          "native_share": 0.982564558358712,
+          "statuses": {
+            "complete": 264901,
+            "unsupported": 35680
+          },
+          "top_types": [
+            {
+              "type": "rich.console.Console",
+              "values": 25095,
+              "nodes": 730439,
+              "seconds": 0.859047184
+            },
+            {
+              "type": "rich.theme.ThemeStack",
+              "values": 2357,
+              "nodes": 6710379,
+              "seconds": 0.655989337
+            },
+            {
+              "type": "rich.text.Text",
+              "values": 44738,
+              "nodes": 569673,
+              "seconds": 0.142737557
+            },
+            {
+              "type": "rich.style.Style",
+              "values": 50359,
+              "nodes": 711188,
+              "seconds": 0.137843653
+            },
+            {
+              "type": "rich.theme.Theme",
+              "values": 408,
+              "nodes": 1160760,
+              "seconds": 0.108806591
+            },
+            {
+              "type": "builtins.list",
+              "values": 20950,
+              "nodes": 630148,
+              "seconds": 0.105734823
+            },
+            {
+              "type": "builtins.list_iterator",
+              "values": 13660,
+              "nodes": 13660,
+              "seconds": 0.105518744
+            },
+            {
+              "type": "rich.containers.Lines",
+              "values": 19324,
+              "nodes": 333602,
+              "seconds": 0.076812106
+            },
+            {
+              "type": "rich.table.Table",
+              "values": 911,
+              "nodes": 160839,
+              "seconds": 0.073573841
+            },
+            {
+              "type": "rich.console.ConsoleOptions",
+              "values": 22556,
+              "nodes": 360896,
+              "seconds": 0.068565624
+            }
+          ],
+          "peak_rss_bytes": 88236032
+        },
+        "parity_values": 300581,
+        "total_wall_seconds": 112.1805366799963
+      }
+    }
+  },
+  "gate_2": {
+    "toolz": {
+      "first_and_second_runs_each_reader": true,
+      "identical_stored_evidence": true,
+      "comparison": "Raw dump_run evidence equal after explicitly separating the three required reader-disclosure fields",
+      "verdicts_each_reader": {
+        "same": 6,
+        "changed": 1,
+        "new": 1,
+        "missing": 1,
+        "not compared": 4
+      }
+    },
+    "attrs": {
+      "status": "incomplete before native attrs was attempted",
+      "reader": "Python, sys.modules[ldr._native] blocked by sitecustomize",
+      "first_attempt": "existing 300-second LDR timeout fired; invalid gate attempt",
+      "corrected_attempt": {
+        "timeout": 0,
+        "exit_code": -9,
+        "signal": "SIGKILL",
+        "last_reported_elapsed_seconds": 802,
+        "last_reported_calls": 53,
+        "program_pid": 82739,
+        "stored_run": "49cae8b027ac4777a3fb45e252bfb168",
+        "last_reported_function": "src/attr/_make.py:_ClassBuilder._eval_snippets / _generate_unique_filename"
+      },
+      "cgroup_evidence": {
+        "memory_max_bytes": 34359738368,
+        "memory_peak_bytes": 34359738368,
+        "oom": 8,
+        "oom_kill": 1
+      },
+      "inference": "Strongly consistent with OOM. Kernel log access denied; no PID-specific kernel confirmation or allocating-function proof. Other targeted checks/builds occurred during this correctness attempt, so this is not an isolated memory attribution.",
+      "scope": "No change to Python detail capture, signature format, tracer/call_stream hot paths, storage or schema to work around the failure."
+    }
+  },
+  "step_4": {
+    "status": "not run",
+    "reason": "Supplied blueprint makes record equivalence a gate; attrs reference could not complete.",
+    "four_run_table": null,
+    "rich_stored_signature_table_equivalence": null,
+    "production_speedup_claim": null
+  },
+  "not_done_as_written": [
+    "Gate 2 attrs and the four-run recording proof remain incomplete.",
+    "The first attrs attempt inherited the existing timeout. The harness was fixed to use the existing --timeout=0 option; no new production flag was added.",
+    "An added natural-GC scheduling test stalled on 3.13 and was interrupted after 191 seconds, then replaced by deterministic test-only GC scheduling. No recording cap or threshold was added.",
+    "Several additional safety/coverage tests were added after the relevant implementation; not every added test was demonstrated red on the old code.",
+    "The actual result file is .ldr/last.json; no second result.json file was introduced.",
+    "No full suite, CI wait, wheel rollout, Windows native build or perf use, as instructed."
+  ]
+}

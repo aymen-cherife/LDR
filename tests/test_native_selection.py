@@ -84,3 +84,58 @@ def test_result_and_machine_disclose_same_three_fields(tmp_path):
     assert expected['signature_reader']['name'] in text
     assert expected['reader_versions']['ldr'] in text
     assert expected['python_build'] in text
+
+
+def test_self_check_exercises_inline_dicts_before_python_materializes_them(monkeypatch):
+    import gc
+    from test_native_v2 import native
+    original=bridge.Reader.capture
+    checked=[]
+    def capture(self,value,*args,**kwargs):
+        if type(value).__name__ in ('DictValue','Both'):
+            # 3.13 eagerly allocates the mixed-slot class's dictionary; the
+            # plain managed-dict instance must exercise the inline path first.
+            if type(value).__name__=='DictValue' or sys.version_info[:2]==(3,12):
+                assert not any(type(item) is dict for item in gc.get_referents(value))
+            checked.append(type(value).__name__)
+        return original(self,value,*args,**kwargs)
+    monkeypatch.setattr(bridge.Reader,'capture',capture)
+    engine,reason=bridge.select_reader(native())
+    assert engine is not None,reason
+    assert checked==['DictValue','Both']
+
+
+def test_python_fallback_can_fingerprint_another_value(monkeypatch):
+    from test_native_v2 import native
+    monkeypatch.setattr(fp,'_native_reader',None)
+    expected=fp._fingerprint_details([1],fp.DEFAULT_BUDGET,True)[0]
+    engine,reason=bridge.select_reader(native())
+    assert engine is not None,reason
+    monkeypatch.setattr(fp,'_native_reader',engine)
+    class Key:
+        @property
+        def __class__(self):
+            self.nested=fp._fingerprint_details([1],fp.DEFAULT_BUDGET,True)[0]
+            return Key
+    key=Key()
+    assert fp._fingerprint_details({key:1},fp.DEFAULT_BUDGET,True)[0] not in fp.STATUSES
+    assert key.nested==expected
+
+
+def test_self_check_panic_disables_native(monkeypatch):
+    from test_native_v2 import native
+    module=native()
+    def panic(*args,**kwargs): module._test_panic()
+    monkeypatch.setattr(bridge.Reader,'capture',panic)
+    engine,reason=bridge.select_reader(module)
+    assert engine is None and 'PanicException' in reason
+
+
+@pytest.mark.parametrize('value,partial',[(iter([1]),False)])
+def test_native_status_uses_the_python_status_constant(monkeypatch,value,partial):
+    from test_native_v2 import native
+    engine,reason=bridge.select_reader(native())
+    assert engine is not None,reason
+    monkeypatch.setattr(fp,'_native_reader',engine)
+    token,_=fp._fingerprint_details(value,fp.DEFAULT_BUDGET,partial)
+    assert token is fp.UNSUPPORTED
