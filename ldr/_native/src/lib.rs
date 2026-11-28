@@ -128,8 +128,18 @@ fn numeric_walk(
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    layout::initialize(module.py())?;
+    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add_function(wrap_pyfunction!(watcher_count, module)?)?;
+    module.add_function(wrap_pyfunction!(_test_panic, module)?)?;
     module.add_class::<reader::ReaderCore>()?;
     module.add_function(wrap_pyfunction!(numeric_walk, module)?)?;
     module.add_function(wrap_pyfunction!(unicode::unicode_payload, module)?)?;
     Ok(())
 }
+
+#[pyfunction]
+fn watcher_count() -> i32 { layout::watcher_count() }
+
+#[pyfunction]
+fn _test_panic() { panic!("injected native panic"); }

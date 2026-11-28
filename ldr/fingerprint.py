@@ -639,3 +639,8 @@ def _fingerprint_details(
             STATS.walks += 1
             STATS.walked = walk.visited
             STATS.walked_type = type(value)
+
+
+# The Python oracle is fully defined before the bridge's load-time self-check.
+from .native_bridge import select_reader as _select_reader
+_native_reader, _native_reason = _select_reader()

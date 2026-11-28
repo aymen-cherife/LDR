@@ -870,6 +870,8 @@ def _write_result(
     os.makedirs(ldr_dir, exist_ok=True)
     text_path = os.path.join(ldr_dir, f"{name}.txt")
     json_path = os.path.join(ldr_dir, f"{name}.json")
+    from .native_bridge import reader_metadata
+    payload = {**payload, **reader_metadata()}
     short, sections = summarize(payload)
     if sections:
         stored = False

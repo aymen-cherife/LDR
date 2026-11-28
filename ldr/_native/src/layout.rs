@@ -29,7 +29,8 @@ struct Gone {
 impl Gone {
     fn __call__(&self, _weak: &Bound<'_, PyAny>) {
         if let Some(c) = CACHE.get() {
-            c.lock().unwrap().1.remove(&self.address);
+            let removed = { c.lock().unwrap().1.remove(&self.address) };
+            drop(removed); // Py decrefs, including callbacks, happen after unlocking.
         }
     }
 }
@@ -84,40 +85,33 @@ pub unsafe fn get<P: FnMut()>(
     dict_getter: usize,
     mut protect: P,
 ) -> PyResult<Option<Arc<Layout>>> {
-    if WATCHER.load(Ordering::Relaxed) < 0 {
-        let id = PyType_AddWatcher(changed);
-        if id < 0 {
-            return Err(PyErr::fetch(py));
-        }
-        WATCHER.store(id, Ordering::Relaxed);
-    }
+    initialize(py)?;
     let c = CACHE.get_or_init(|| Mutex::new((0, HashMap::new())));
-    {
+    let epoch = EPOCH.load(Ordering::Relaxed);
+    let (retired, cached) = {
         let mut cache = c.lock().unwrap();
-        let epoch = EPOCH.load(Ordering::Relaxed);
-        if cache.0 != epoch {
-            cache.1.clear();
+        let retired = if cache.0 != epoch {
             cache.0 = epoch;
-        }
-        if let Some(layout) = cache.1.get(&(kind as usize)) {
-            let valid = layout.declarations.iter().all(|(pointer, items)| {
-                let list = *pointer as *mut ffi::PyObject;
-                ffi::PyList_Size(list) as usize == items.len()
-                    && items.iter().enumerate().all(|(i, old)| {
-                        let current = ffi::PyList_GetItem(list, i as isize);
-                        match old {
-                            Some(old) => old.as_ptr() == current,
-                            None => {
-                                ffi::Py_TYPE(current) != std::ptr::addr_of_mut!(ffi::PyUnicode_Type)
-                            }
-                        }
-                    })
-            });
-            if valid {
-                return Ok(Some(layout.clone()));
-            }
-        }
-        cache.1.remove(&(kind as usize));
+            Some(std::mem::take(&mut cache.1))
+        } else { None };
+        (retired, cache.1.get(&(kind as usize)).cloned())
+    };
+    drop(retired);
+    if let Some(layout) = cached {
+        let valid = layout.declarations.iter().all(|(pointer, items)| {
+            let list = *pointer as *mut ffi::PyObject;
+            ffi::PyList_Size(list) as usize == items.len()
+                && items.iter().enumerate().all(|(i, old)| {
+                    let current = ffi::PyList_GetItem(list, i as isize);
+                    match old {
+                        Some(old) => old.as_ptr() == current,
+                        None => ffi::Py_TYPE(current) != std::ptr::addr_of_mut!(ffi::PyUnicode_Type),
+                    }
+                })
+        });
+        if valid { return Ok(Some(layout)); }
+        let removed = { c.lock().unwrap().1.remove(&(kind as usize)) };
+        drop(removed);
     }
     protect();
     let meta_object = kind == enum_meta;
@@ -350,7 +344,12 @@ pub unsafe fn get<P: FnMut()>(
         _weak: Py::from_owned_ptr(py, weak),
         declarations,
     });
-    c.lock().unwrap().1.insert(kind as usize, layout.clone());
+    // Hash table growth (an allocation) and Python-owned entry destruction are
+    // outside the mutex. The GIL serializes all walkers and callbacks here.
+    let mut entries = { std::mem::take(&mut c.lock().unwrap().1) };
+    let removed = entries.insert(kind as usize, layout.clone());
+    { c.lock().unwrap().1 = entries; }
+    drop(removed);
     Ok(Some(layout))
 }
 // Borrow the instance's actual dictionary or its split values and shared keys.
@@ -450,4 +449,13 @@ unsafe fn dict_items(
         rows.push((key, value))
     }
     rows
+}
+
+pub fn initialize(py: Python<'_>) -> PyResult<()> {
+    if WATCHER.load(Ordering::Relaxed) < 0 {
+        let id = unsafe { PyType_AddWatcher(changed) };
+        if id < 0 { return Err(PyErr::fetch(py)); }
+        WATCHER.store(id, Ordering::Relaxed);
+    }
+    Ok(())
 }

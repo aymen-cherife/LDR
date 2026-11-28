@@ -100,6 +100,12 @@ class Report:
             parts.append(f"first call {facts['first_call_s']} s" if "first_call_s" in facts else "first call: none")
         python = facts["python"]
         parts.append(f"Python {python['version']}")
+        if 'signature_reader' in facts:
+            reader=facts['signature_reader'];versions=facts['reader_versions']
+            reason=f" ({reader['reason']})" if reader.get('reason') else ''
+            parts.append(f"reader {reader['name']}{reason}")
+            parts.append(f"LDR {versions['ldr']}, native {versions['native'] or 'absent'}")
+            parts.append(f"Python build {facts['python_build']}")
         parts.append("venv " + ("yes" if python["venv"] else "no"))
         parts.append(f"check {self.cost.get('wall_s', 0)} s wall, {self.cost.get('cpu_s', 0)} s CPU")
         return head + " - " + ", ".join(parts)
@@ -538,6 +544,9 @@ def check(ldr_dir: str, *, keep: int, context: str = "alone", fix: bool = True, 
     if sample:
         report.sample = sample_cpu()
         facts["cpu_percent"] = report.sample["percent"]
+    # The same three reader facts are saved in the run result.
+    from .native_bridge import reader_metadata
+    facts.update(reader_metadata())
     # Python
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
     facts["python"] = {"version": sys.version.split()[0], "venv": sys.prefix if in_venv else None, "executable": sys.executable}

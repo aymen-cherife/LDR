@@ -273,6 +273,9 @@ def test_fallback_protects_pending_values_and_detects_dict_resize():
     class Cached: pass
     cached=[Cached]
     engine.walk(Cached())
+    import weakref
+    reference=weakref.ref(Cached)
+    del Cached
     class Key:
         @property
         def __class__(self):
@@ -282,7 +285,7 @@ def test_fallback_protects_pending_values_and_detects_dict_resize():
     key=Key();mapping={key:[], 'last':[]}
     result=engine.capture(mapping)
     assert result['status']==fp.FAILED
-    assert not cached
+    assert not cached and reference() is None
     assert engine.capture([1,2])['status']=='complete'
 
 @pytest.mark.parametrize('partial_ok',[False,True])
