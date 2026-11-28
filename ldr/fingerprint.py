@@ -584,16 +584,37 @@ def fingerprint_details(
     return _fingerprint_details(value, budget, partial_ok, sketch=sketch)
 
 
+# Python keeps the top-level caches, sketch, status mapping and size rows.
+_native_reader = None
+
+
+class _NativeWalkResult:
+    __slots__ = ("visited", "partial", "immutable")
+    def __init__(self, result):
+        self.visited = result["visited"]
+        self.partial = result["partial"]
+        self.immutable = result["immutable"]
+
+
 def _fingerprint_details(
     value: Any, budget: Budget, partial_ok: bool, sketch: bool = False
 ) -> tuple[str, bool]:
     walk = None
     try:
-        out = hashlib.blake2b(digest_size=DIGEST_BYTES)
-        walk = _Walk(budget, partial_ok)
-        walk.encode(value, out)
+        if _native_reader is None:
+            out = hashlib.blake2b(digest_size=DIGEST_BYTES)
+            walk = _Walk(budget, partial_ok)
+            walk.encode(value, out)
+            token = out.hexdigest()
+        else:
+            result = _native_reader.capture(value, budget, partial_ok)
+            walk = _NativeWalkResult(result)
+            STATS.tmp_normalized += result["normalized"]
+            if result["status"] != "complete":
+                raise _Stop(result["status"])
+            token = result["digest"]
         STATS.last_visited = walk.visited
-        return out.hexdigest() + (PARTIAL_MARK if walk.partial else ""), (
+        return token + (PARTIAL_MARK if walk.partial else ""), (
             walk.immutable and not walk.partial
         )
     except _Stop as stop:

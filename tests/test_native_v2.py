@@ -250,3 +250,67 @@ def test_reader_bulk_redaction_normalization_counts_and_fast_mode(monkeypatch):
     expected,count,status=python_wire(value)
     actual=engine.walk(value)
     assert (actual['bytes'],actual['visited'],actual['status'])==(expected,count,status)
+
+@pytest.mark.parametrize('ceiling',[31,32,33,None])
+@pytest.mark.parametrize('value',[[0]*32, ['x']*32, [0,'x']*16, {'a':list(range(40))}])
+def test_recording_contract_ceiling(value,ceiling):
+    import importlib.util
+    spec=importlib.util.spec_from_file_location('signature_bench',Path(__file__).parents[1]/'evaluation/signature_bench.py')
+    bench=importlib.util.module_from_spec(spec);spec.loader.exec_module(bench)
+    budget=fp.Budget(ceiling)
+    expected=bench.python_wire(value,budget,True)
+    result=reader().capture(value,budget=budget,partial_ok=True)
+    assert 'bytes' not in result
+    for key in ('visited','status','partial','immutable','normalized'):
+        assert result[key]==expected[key],key
+    assert result['digest']==hashlib.blake2b(expected['bytes'],digest_size=16).hexdigest()
+    assert result['over_ceiling']==(ceiling is not None and result['visited']>ceiling)
+
+
+def test_fallback_protects_pending_values_and_detects_dict_resize():
+    import gc
+    engine=reader()
+    class Cached: pass
+    cached=[Cached]
+    engine.walk(Cached())
+    class Key:
+        @property
+        def __class__(self):
+            cached.clear();gc.collect()
+            mapping['new']=[]
+            return Key
+    key=Key();mapping={key:[], 'last':[]}
+    result=engine.capture(mapping)
+    assert result['status']==fp.FAILED
+    assert not cached
+    assert engine.capture([1,2])['status']=='complete'
+
+@pytest.mark.parametrize('partial_ok',[False,True])
+def test_recording_contract_preserves_partial_token_and_stats(monkeypatch,partial_ok):
+    import threading
+    engine=reader()
+    value=[threading.Lock(),{'a':[1,2]}]
+    monkeypatch.setattr(fp,'_native_reader',None,raising=False)
+    before=fp._fingerprint_details(value,fp.Budget(20000),partial_ok)
+    expected=(fp.STATS.walked,fp.STATS.walked_type,fp.STATS.last_visited)
+    calls=[]
+    capture=engine.capture
+    def once(*args,**kwargs):
+        calls.append(args[0]);return capture(*args,**kwargs)
+    monkeypatch.setattr(engine,'capture',once)
+    monkeypatch.setattr(fp,'_native_reader',engine)
+    actual=fp._fingerprint_details(value,fp.Budget(20000),partial_ok)
+    assert len(calls)==1 and calls[0] is value
+    assert actual==before
+    assert (fp.STATS.walked,fp.STATS.walked_type,fp.STATS.last_visited)==expected
+    assert actual[0].endswith('+')==partial_ok
+
+
+def test_recording_contract_preserves_sketch_and_size_count(monkeypatch):
+    value=list(range(20001))
+    monkeypatch.setattr(fp,'_native_reader',None,raising=False)
+    expected=fp._fingerprint_details(value,fp.Budget(20000),True,sketch=True)
+    count=fp.STATS.walked
+    monkeypatch.setattr(fp,'_native_reader',reader())
+    assert fp._fingerprint_details(value,fp.Budget(20000),True,sketch=True)==expected
+    assert fp.STATS.walked==count==20002

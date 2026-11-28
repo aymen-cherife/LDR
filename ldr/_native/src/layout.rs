@@ -119,6 +119,7 @@ pub unsafe fn get<P: FnMut()>(
         }
         cache.1.remove(&(kind as usize));
     }
+    protect();
     let meta_object = kind == enum_meta;
     let meta = ffi::Py_TYPE(kind.cast());
     if (*kind).tp_flags & 512 == 0

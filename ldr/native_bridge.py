@@ -21,7 +21,8 @@ class Fallback:
         return fp.is_secret_name(value)
     def secret_text(self,value):
         return fp._looks_secret(value)
-    def start(self,value,active,visited,partial_ok):
+    def start(self,value,active,visited,partial_ok,max_nodes=None):
+        self.walk.budget=fp.Budget(max_nodes)
         self.normalized_before=fp.STATS.tmp_normalized
         self.walk.active=active;self.walk.visited=visited-1;self.walk.partial_ok=partial_ok
         self.walk.partial=False;self.walk.immutable=True
@@ -66,7 +67,14 @@ class Reader:
         self.refresh()
         normalized=fp.STATS.tmp_normalized
         try:
-            return self.core.walk(value,partial_ok)
+            return self.core.walk(value,partial_ok,(budget or fp.DEFAULT_BUDGET).max_nodes)
+        finally:
+            fp.STATS.tmp_normalized=normalized
+    def capture(self,value,budget=None,partial_ok=True):
+        self.refresh()
+        normalized=fp.STATS.tmp_normalized
+        try:
+            return self.core.capture(value,partial_ok,(budget or fp.DEFAULT_BUDGET).max_nodes)
         finally:
             fp.STATS.tmp_normalized=normalized
     def stats(self):

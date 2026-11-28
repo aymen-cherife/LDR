@@ -108,12 +108,17 @@ impl ReaderCore {
         d.set_item("watchers", layout::watcher_count())?;
         Ok(d.unbind())
     }
-    fn walk(
-        &mut self,
-        py: Python<'_>,
-        value: &Bound<'_, PyAny>,
-        partial_ok: bool,
-    ) -> PyResult<Py<PyDict>> {
+    #[pyo3(signature = (value, partial_ok, max_nodes=None))]
+    fn walk(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>, partial_ok: bool, max_nodes: Option<usize>) -> PyResult<Py<PyDict>> {
+        self.run(py, value, partial_ok, max_nodes, true)
+    }
+    #[pyo3(signature = (value, partial_ok, max_nodes=None))]
+    fn capture(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>, partial_ok: bool, max_nodes: Option<usize>) -> PyResult<Py<PyDict>> {
+        self.run(py, value, partial_ok, max_nodes, false)
+    }
+}
+impl ReaderCore {
+    fn run(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>, partial_ok: bool, max_nodes: Option<usize>, wire: bool) -> PyResult<Py<PyDict>> {
         let mut tasks = std::mem::take(&mut self.tasks);
         tasks.push(Task::Value(value.as_ptr(), 0));
         let mut active = std::mem::take(&mut self.active);
@@ -161,6 +166,7 @@ impl ReaderCore {
                         }
                         if item.is_null() {
                             visited += 1;
+if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); break; }
                             self.buffers[target].push(b'u')
                         } else {
                             self.buffers[target].push(b'v');
@@ -280,6 +286,7 @@ impl ReaderCore {
                         }
                     }
                     Task::Resume(iterator, target) => {
+                        protect(py, &tasks, &active, &mut keepers);
                         let snapshot = PyDict::new(py);
                         for (key, depth) in &active {
                             snapshot.set_item(*key, *depth)?;
@@ -308,6 +315,7 @@ impl ReaderCore {
                     }
                     Task::Value(obj, target) => {
                         visited += 1;
+if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); break; }
                         let kind = ffi::Py_TYPE(obj);
                         if obj == ffi::Py_None() {
                             self.buffers[target].push(b'N')
@@ -364,6 +372,21 @@ impl ReaderCore {
                             if list || tuple || dict || set || frozen {
                                 if !tuple && !frozen {
                                     immutable = false
+                                }
+                                let count = if list { ffi::PyList_Size(obj) } else if tuple { ffi::PyTuple_Size(obj) } else { 0 };
+                                let first = if count > 0 { if list { ffi::PyList_GetItem(obj, 0) } else { ffi::PyTuple_GetItem(obj, 0) } } else { std::ptr::null_mut() };
+                                let numeric_bulk = count as usize >= self.fast_min && !first.is_null()
+                                    && [std::ptr::addr_of_mut!(ffi::PyLong_Type), std::ptr::addr_of_mut!(ffi::PyFloat_Type), std::ptr::addr_of_mut!(ffi::PyBool_Type)].contains(&ffi::Py_TYPE(first))
+                                    && (0..count).all(|i| ffi::Py_TYPE(if list { ffi::PyList_GetItem(obj,i) } else { ffi::PyTuple_GetItem(obj,i) }) == ffi::Py_TYPE(first));
+                                if numeric_bulk {
+                                    protect(py, &tasks, &active, &mut keepers);
+                                    let snapshot = PyDict::new(py);
+                                    for (key, depth) in &active { snapshot.set_item(*key, *depth)?; }
+                                    delegated += 1;
+                                    let result = self.fallback.bind(py).call_method1("start", (Bound::from_borrowed_ptr(py,obj), snapshot, visited, partial_ok, max_nodes))?;
+                                    self.apply(py,result.downcast::<PyTuple>()?,target,&mut tasks,&mut active,&mut keepers,&mut visited,&mut partial,&mut immutable,&mut status,&mut normalized)?;
+                                    if status != "complete" { break; }
+                                    continue;
                                 }
                                 let address = obj as usize;
                                 if let Some(depth) = active.get(&address) {
@@ -472,6 +495,7 @@ impl ReaderCore {
                                         }
                                         delegated += string_delegated;
                                         visited += count as usize;
+if max_nodes.is_some_and(|limit| visited > limit) { status = "unknown".into(); break; }
                                         self.buffers[target].extend_from_slice(&self.string_buffer);
                                     } else {
                                         tasks.push(Task::Sequence(obj, 0, count, tuple, target));
@@ -580,6 +604,7 @@ impl ReaderCore {
                 }
                 if let Some((obj, target)) = delegate {
                     delegated += 1;
+                    protect(py, &tasks, &active, &mut keepers);
                     for address in active.keys() {
                         keepers.push(Py::from_borrowed_ptr(py, *address as *mut ffi::PyObject));
                     }
@@ -599,7 +624,7 @@ impl ReaderCore {
                     let result = self
                         .fallback
                         .bind(py)
-                        .call_method1("start", (object, snapshot, visited, partial_ok))?;
+                        .call_method1("start", (object, snapshot, visited, partial_ok, max_nodes))?;
                     self.apply(
                         py,
                         result.downcast::<PyTuple>()?,
@@ -626,7 +651,8 @@ impl ReaderCore {
         let hash = digest(&self.buffers[0]);
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         let result = PyDict::new(py);
-        result.set_item("bytes", PyBytes::new(py, &self.buffers[0]))?;
+        if wire { result.set_item("bytes", PyBytes::new(py, &self.buffers[0]))?; }
+        result.set_item("over_ceiling", max_nodes.is_some_and(|limit| visited > limit))?;
         result.set_item("digest", hex)?;
         result.set_item("visited", visited)?;
         result.set_item("delegated", delegated)?;
@@ -674,5 +700,17 @@ impl ReaderCore {
         }
         let _ = py;
         Ok(())
+    }
+}
+
+// Every borrowed container and pending child must survive a Python callback.
+unsafe fn protect(py: Python<'_>, tasks: &[Task], active: &HashMap<usize,usize>, keepers: &mut Vec<Py<PyAny>>) {
+    for address in active.keys() { keepers.push(Py::from_borrowed_ptr(py,*address as *mut ffi::PyObject)); }
+    for task in tasks {
+        let object = match task {
+            Task::Value(p,_) | Task::Field(_,p,_) | Task::Sequence(p,..) | Task::Dict(p,..) | Task::Set(p,..) => *p,
+            _ => std::ptr::null_mut(),
+        };
+        if !object.is_null() { keepers.push(Py::from_borrowed_ptr(py,object)); }
     }
 }
