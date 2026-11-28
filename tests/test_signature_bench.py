@@ -59,3 +59,27 @@ def test_compare_rejects_different_bytes():
             result=actual.walk(*args,**kwargs);result['bytes']+=b'?';return result
     samples=module().Samples();samples.capture([1],fp.Budget(),True)
     with pytest.raises(AssertionError): samples.compare(Broken())
+
+
+def test_peak_memory_on_windows_without_resource(monkeypatch):
+    import builtins
+    import ctypes
+    import types
+    bench = module()
+    original_import = builtins.__import__
+    def without_resource(name, *args, **kwargs):
+        if name == "resource":
+            raise ModuleNotFoundError("No module named 'resource'")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", without_resource)
+    monkeypatch.setattr(bench.os, "name", "nt")
+    def current():
+        return 7
+    def memory(handle, counters, size):
+        assert handle == 7
+        counters._obj.PeakWorkingSetSize = 123456
+        return 1
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kw: (
+        types.SimpleNamespace(GetCurrentProcess=current) if name == "kernel32"
+        else types.SimpleNamespace(GetProcessMemoryInfo=memory)), raising=False)
+    assert bench.peak_memory() == 123456

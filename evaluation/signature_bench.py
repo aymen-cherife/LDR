@@ -161,9 +161,34 @@ def native_reader():
 
 
 def peak_memory():
-    import resource
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return rss if sys.platform == 'darwin' else rss * 1024
+    if os.name != "nt":
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak if sys.platform == "darwin" else peak * 1024
+
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    info = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+    info.argtypes = (wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD)
+    info.restype = wintypes.BOOL
+    counters = MemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    if not info(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return counters.PeakWorkingSetSize
 
 
 def result_differences(normal, kept):
